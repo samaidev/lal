@@ -1,78 +1,58 @@
 #!/usr/bin/env python3
-"""Generate a synthetic 300-dim word2vec-format embedding file.
+"""Generate synthetic word2vec-format embedding files at multiple dimensions.
 
-We can't download real word2vec (1.5GB), so we generate deterministic pseudo-random
-vectors that mimic the structure: words in the same semantic cluster have higher
-similarity than words in different clusters. This is enough to demonstrate the
-300-dim pipeline (SIMD, quantization, embedding loading) at real scale.
+Generates:
+  - embeddings_300d.txt  (word2vec scale, 300-dim)
+  - embeddings_768d.txt  (BERT-base scale, 768-dim)
+
+The vectors are synthetic but cluster-structured: words in the same semantic
+cluster have higher similarity than words in different clusters. This is enough
+to demonstrate the full LAL pipeline (SIMD, quantization, embedding loading) at
+real embedding scale.
+
+To load REAL BERT embeddings instead, see export_bert_embeddings.py (requires
+the `transformers` library and internet to download the model).
 """
 import random
 import math
 
 WORDS = {
     # Animals cluster
-    "cat":      "animal",
-    "dog":      "animal",
-    "horse":    "animal",
-    "elephant": "animal",
-    "lion":     "animal",
-    "tiger":    "animal",
-    "bird":     "animal",
-    "fish":     "animal",
+    "cat": "animal", "dog": "animal", "horse": "animal", "elephant": "animal",
+    "lion": "animal", "tiger": "animal", "bird": "animal", "fish": "animal",
     # Vehicles cluster
-    "car":      "vehicle",
-    "truck":    "vehicle",
-    "bus":      "vehicle",
-    "bicycle":  "vehicle",
-    "train":    "vehicle",
-    "airplane": "vehicle",
-    "boat":     "vehicle",
-    "ship":     "vehicle",
+    "car": "vehicle", "truck": "vehicle", "bus": "vehicle", "bicycle": "vehicle",
+    "train": "vehicle", "airplane": "vehicle", "boat": "vehicle", "ship": "vehicle",
     # Food cluster
-    "apple":    "food",
-    "banana":   "food",
-    "bread":    "food",
-    "rice":     "food",
-    "meat":     "food",
-    "milk":     "food",
-    "water":    "food",
-    "coffee":   "food",
+    "apple": "food", "banana": "food", "bread": "food", "rice": "food",
+    "meat": "food", "milk": "food", "water": "food", "coffee": "food",
     # Tools cluster
-    "hammer":   "tool",
-    "screwdriver": "tool",
-    "wrench":   "tool",
-    "saw":      "tool",
-    "drill":    "tool",
-    "knife":    "tool",
-    "scissors": "tool",
-    "axe":      "tool",
+    "hammer": "tool", "screwdriver": "tool", "wrench": "tool", "saw": "tool",
+    "drill": "tool", "knife": "tool", "scissors": "tool", "axe": "tool",
 }
 
-DIM = 300
 
-def main():
-    random.seed(42)
-    # Generate a cluster centroid for each cluster
+def generate(dim, path):
+    random.seed(dim)  # different seed per dim for variety
     clusters = {}
     for cluster in set(WORDS.values()):
-        centroid = [random.gauss(0, 1) for _ in range(DIM)]
-        # Normalize
+        centroid = [random.gauss(0, 1) for _ in range(dim)]
         norm = math.sqrt(sum(x*x for x in centroid))
         centroid = [x / norm for x in centroid]
         clusters[cluster] = centroid
 
-    # Generate word vectors: centroid + noise
-    with open("/home/z/my-project/scripts/lal/embeddings_300d.txt", "w") as f:
-        f.write(f"{len(WORDS)} {DIM}\n")
+    with open(path, "w") as f:
+        f.write(f"{len(WORDS)} {dim}\n")
         for word, cluster in sorted(WORDS.items()):
             centroid = clusters[cluster]
-            noise = [random.gauss(0, 0.3) for _ in range(DIM)]
-            vec = [centroid[i] + noise[i] for i in range(DIM)]
-            # Normalize to unit length
+            noise = [random.gauss(0, 0.3) for _ in range(dim)]
+            vec = [centroid[i] + noise[i] for i in range(dim)]
             norm = math.sqrt(sum(x*x for x in vec))
             vec = [x / norm for x in vec]
             f.write(word + " " + " ".join(f"{v:.6f}" for v in vec) + "\n")
-    print(f"[*] generated embeddings_300d.txt with {len(WORDS)} words × {DIM} dims")
+    print(f"[*] generated {path} with {len(WORDS)} words × {dim} dims")
+
 
 if __name__ == "__main__":
-    main()
+    generate(300, "/home/z/my-project/scripts/lal/embeddings_300d.txt")
+    generate(768, "/home/z/my-project/scripts/lal/embeddings_768d.txt")

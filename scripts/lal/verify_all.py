@@ -74,7 +74,27 @@ DEMOS = [
         "bin": "/home/z/my-project/download/lal-mvp/build/embed_300d_x86_64",
         "labels": ["animal", "vehicle", "food", "tool"],
         "test_concepts": ["animal", "vehicle", "food", "tool", "test_dog", "test_truck", "test_banana", "test_knife"],
-        "n_random": 0,  # 300-dim random vectors aren't meaningful
+        "n_random": 0,
+    },
+    {
+        "name": "guard_demo",
+        "lal": "/home/z/my-project/scripts/lal/guard_demo.lal",
+        "rule": "main",
+        "c":   "/home/z/my-project/download/lal-mvp/src/guard_demo.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/guard_demo_x86_64",
+        "labels": ["node_a", "node_b", "node_c", "terminal"],
+        "test_concepts": ["node_a", "node_b", "node_c", "terminal"],
+        "n_random": 5,
+    },
+    {
+        "name": "embed_768d",
+        "lal": "/home/z/my-project/scripts/lal/embed_768d.lal",
+        "rule": "classify",
+        "c":   "/home/z/my-project/download/lal-mvp/src/embed_768d.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/embed_768d_x86_64",
+        "labels": ["animal", "vehicle", "food", "tool"],
+        "test_concepts": ["animal", "vehicle", "food", "tool", "test_dog", "test_truck", "test_banana", "test_knife"],
+        "n_random": 0,
     },
 ]
 

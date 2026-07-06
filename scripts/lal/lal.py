@@ -83,6 +83,8 @@ class Rule:
     params: List[str]
     body: List["Stmt"]
     outputs: List[str]
+    guard: Optional["Expr"] = None  # v0.5: if present, body only runs when guard is truthy;
+                                    #       otherwise rule returns the input vector unchanged.
 
 @dataclass
 class Stmt:
@@ -568,11 +570,14 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
-        # rule name(params):
-        m = re.match(r"rule\s+(\w+)\s*\(([^)]*)\)\s*:\s*$", line)
+        # rule name(params):                    (no guard)
+        # rule name(params) | guard_expr:       (with guard — v0.5)
+        m = re.match(r"rule\s+(\w+)\s*\(([^)]*)\)\s*(?:\|\s*(.+?)\s*)?:\s*$", line)
         if m:
             name = m.group(1)
             params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+            guard_str = m.group(3)
+            guard_expr = _parse_expr(guard_str) if guard_str else None
             body: List[Stmt] = []
             outputs: List[str] = []
             i += 1
@@ -615,18 +620,20 @@ def parse(source: str, source_path: Optional[str] = None):
 
                 raise ParseError(f"can't parse rule body line: {bline!r}")
 
-            rules.append(Rule(name, params, body, outputs))
+            rules.append(Rule(name, params, body, outputs, guard_expr))
             continue
 
         raise ParseError(f"can't parse line: {line!r}")
 
     # Post-process: convert ECall(func=relate_name, ...) to ERelateCall,
-    # and ECall(func=rule_name, ...) to ERuleCall.
+    # and ECall(func=rule_name, ...) to ERuleCall. Also process rule guards.
     relate_names = {r.name for r in relates}
     rule_names = {r.name for r in rules}
     for rule in rules:
         for stmt in rule.body:
             stmt.expr = _rewrite_calls(stmt.expr, relate_names, rule_names)
+        if rule.guard is not None:
+            rule.guard = _rewrite_calls(rule.guard, relate_names, rule_names)
 
     return concepts, bounds, memories, relates, rules
 
@@ -777,6 +784,16 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
             return best[0]
         raise RuntimeError(f"can't eval: {e}")
 
+    # v0.5: If the rule has a guard, check it first. If the guard is falsy,
+    # skip the body and return the input vector unchanged (base case for recursion).
+    if rule.guard is not None:
+        guard_val = ev(rule.guard)
+        if float(guard_val) == 0.0:
+            # Guard failed: set the first output to the input vector (passthrough).
+            if rule.outputs:
+                env[rule.outputs[0]] = input_vec
+            return env
+
     for stmt in rule.body:
         env[stmt.var] = ev(stmt.expr)
 
@@ -873,7 +890,16 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
                 lines.append(f"static const int8_t concept_{c.name}_q[{len(c.vec)}] = {{{arr}}};")
                 lines.append(f"static const float concept_{c.name}_scale = {scale:.8f}f;")
                 # Also emit a float version for VSA ops / recall (which need float vectors).
-                # This doubles storage for concepts used by VSA/recall, but keeps dots fast.
+                arr_f = ", ".join(f"{v:.6f}f" for v in c.vec)
+                lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr_f}}};")
+            elif _QUANTIZE_MODE == "int4":
+                q, scale = _quantize_int4(c.vec)
+                packed = _pack_nibbles(q)
+                n_packed = len(packed)
+                arr = ", ".join(str(x) for x in packed)
+                lines.append(f"static const uint8_t concept_{c.name}_q4[{n_packed}] = {{{arr}}};")
+                lines.append(f"static const float concept_{c.name}_scale = {scale:.8f}f;")
+                # Also emit a float version for VSA ops / recall (which need float vectors).
                 arr_f = ", ".join(f"{v:.6f}f" for v in c.vec)
                 lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr_f}}};")
             else:
@@ -899,17 +925,25 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
                 arr = ", ".join(str(x) for x in q)
                 lines.append(f"static const int8_t {cname}__{bname}_q[{len(dims)}] = {{{arr}}};")
                 lines.append(f"static const float {cname}__{bname}_scale = {scale:.8f}f;")
+            elif _QUANTIZE_MODE == "int4":
+                q, scale = _quantize_int4(vals)
+                packed = _pack_nibbles(q)
+                n_packed = len(packed)
+                arr = ", ".join(str(x) for x in packed)
+                lines.append(f"static const uint8_t {cname}__{bname}_q4[{n_packed}] = {{{arr}}};")
+                lines.append(f"static const float {cname}__{bname}_scale = {scale:.8f}f;")
             else:
                 arr = ", ".join(f"{v:.6f}f" for v in vals)
                 lines.append(f"static const float {cname}__{bname}[{len(dims)}] = {{{arr}}};")
         lines.append("")
 
-    # Pre-scan all rule bodies to collect SIMD dot widths needed.
-    # (We do this before emitting rules so we can emit the helpers first.)
+    # Pre-scan all rule bodies AND guards to collect SIMD dot widths needed.
     for rn in rules_to_emit:
         r = rule_map[rn]
         for stmt in r.body:
             _collect_simd_widths(stmt.expr, relate_map, concept_names, bound_map, concept_map, _SIMD_HELPERS_NEEDED)
+        if r.guard is not None:
+            _collect_simd_widths(r.guard, relate_map, concept_names, bound_map, concept_map, _SIMD_HELPERS_NEEDED)
 
     # Emit SIMD dot-product helpers (only for widths that were used).
     if _SIMD_HELPERS_NEEDED:
@@ -919,6 +953,8 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             lines.extend(_emit_simd_dot_helper(width))
             if _QUANTIZE_MODE == "int8":
                 lines.extend(_emit_simd_qdot_helper(width))
+            elif _QUANTIZE_MODE == "int4":
+                lines.extend(_emit_simd_q4dot_helper(width))
         lines.append("")
 
     # Forward-declare all rules being emitted.
@@ -1270,6 +1306,36 @@ def _emit_simd_qdot_helper(width: int) -> List[str]:
     return lines
 
 
+def _emit_simd_q4dot_helper(width: int) -> List[str]:
+    """Emit a SIMD dot-product helper: float[N] × int4[N](packed)+scale → float.
+
+    Used when quantize='int4'. The concept is stored as packed nibbles (2 per byte)
+    + scale. The helper unpacks each nibble, converts to float (subtracting 8 to
+    get signed), scales, and does the dot.
+
+    Packing: byte[i] = (val[2i+1] + 8) << 4 | (val[2i] + 8).
+    Unpack: low = (byte & 0xF) - 8; high = (byte >> 4) - 8.
+    """
+    n_packed = (width + 1) // 2  # bytes needed
+    lines = []
+    lines.append(f"/* quantized dot: float[{width}] × int4[{width}](packed,{n_packed}B)+scale */")
+    lines.append(f"static inline float _lal_dot_q4simd_{width}(const float* a, const uint8_t* b_q4, float b_scale) {{")
+    lines.append(f"    float result = 0.0f;")
+    # Scalar path is simplest and correct everywhere; SIMD for int4 unpack is
+    # complex and target-specific. We use scalar here for portability — the 2x
+    # space savings vs int8 still apply. (A future version can add VNNI/SVE paths.)
+    lines.append(f"    /* unpack nibbles and dot — scalar (portable, 2x smaller than int8) */")
+    for i in range(0, width, 2):
+        byte_idx = i // 2
+        lines.append(f"    {{ float lo = (float)((b_q4[{byte_idx}] & 0xF) - 8);")
+        lines.append(f"      result += a[{i}] * (lo * b_scale);")
+        if i + 1 < width:
+            lines.append(f"      float hi = (float)((b_q4[{byte_idx}] >> 4) - 8);")
+            lines.append(f"      result += a[{i+1}] * (hi * b_scale);")
+        lines.append(f"    }}")
+    lines.append(f"    return result;")
+    lines.append(f"}}")
+    return lines
 def _quantize_int8(vec: List[float]) -> Tuple[List[int], float]:
     """Quantize a float vector to int8 with a per-vector scale.
     Returns (int8_values, scale) where dequantized[i] = int8[i] * scale.
@@ -1282,6 +1348,38 @@ def _quantize_int8(vec: List[float]) -> Tuple[List[int], float]:
     # Clamp to int8 range
     q = [max(-128, min(127, x)) for x in q]
     return q, scale
+
+
+def _quantize_int4(vec: List[float]) -> Tuple[List[int], float]:
+    """Quantize a float vector to int4 with a per-vector scale.
+    Returns (int4_values_in_range_-8..7, scale) where dequantized[i] = int4[i] * scale.
+    int4 range: -8 to 7 (8 distinct negative values, 8 non-negative).
+    """
+    max_abs = max(abs(v) for v in vec) if vec else 0.0
+    if max_abs < 1e-9:
+        return [0] * len(vec), 0.0
+    scale = max_abs / 7.0  # use 7 as max to match int4 positive range
+    q = [int(round(v / scale)) for v in vec]
+    # Clamp to int4 range
+    q = [max(-8, min(7, x)) for x in q]
+    return q, scale
+
+
+def _pack_nibbles(int4_values: List[int]) -> List[int]:
+    """Pack a list of int4 values (-8..7) into bytes, two per byte.
+    Low nibble = first value, high nibble = second value.
+    Returns a list of byte values (0..255).
+    """
+    # Convert to unsigned 4-bit (0..15) by adding 8: -8→0, 0→8, 7→15
+    unsigned = [x + 8 for x in int4_values]
+    # Pad to even length
+    if len(unsigned) % 2 != 0:
+        unsigned.append(8)  # pad with 0 (which is -8 in signed)
+    packed = []
+    for i in range(0, len(unsigned), 2):
+        byte = (unsigned[i+1] << 4) | unsigned[i]
+        packed.append(byte)
+    return packed
 
 
 def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth):
@@ -1301,16 +1399,38 @@ def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, c
 
     lines = []
     lines.append(f"/* rule {rule.name} */")
+    if rule.guard is not None:
+        lines.append(f"/* guard: {rule.guard} */")
     lines.append(f"void rule_{rule.name}({param_sig}) {{")
 
-    # Find which (param, bound) pairs are used in this rule's body, and emit masked arrays.
+    # Find which (param, bound) pairs are used in this rule's body AND guard.
     param_bound_pairs = set()
     for stmt in rule.body:
         _collect_param_bound_pairs(stmt.expr, relate_map, concept_names, rule.params, param_bound_pairs)
+    if rule.guard is not None:
+        _collect_param_bound_pairs(rule.guard, relate_map, concept_names, rule.params, param_bound_pairs)
     for (pname, bname) in sorted(param_bound_pairs):
         dims = bound_map[bname]
         idx_str = ", ".join(f"{pname}[{d}]" for d in dims)
         lines.append(f"    float {pname}__{bname}[{len(dims)}] = {{{idx_str}}};")
+
+    # v0.5: If the rule has a guard, check it first. If falsy, copy the input
+    # to the first output and return (base case for recursion).
+    if rule.guard is not None:
+        var_types_for_guard: Dict[str, str] = {}
+        _, guard_c_expr = _emit_scalar_expr(rule.guard, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule.params, var_types_for_guard, max_recursion_depth)
+        lines.append(f"    if (!({guard_c_expr})) {{")
+        lines.append(f"        /* guard failed: passthrough input as output (base case) */")
+        if rule.outputs:
+            first_out = rule.outputs[0]
+            matching = [s for s in rule.body if s.var == first_out]
+            if matching and isinstance(matching[0].expr, EArgMax):
+                lines.append(f"        *out_{first_out}_idx = 0;  /* argmax default */")
+            else:
+                pname = rule.params[0]
+                lines.append(f"        for (int i = 0; i < {vec_dim}; i++) out_{first_out}[i] = {pname}[i];")
+        lines.append(f"        return;")
+        lines.append(f"    }}")
 
     # Emit body statements.
     # Vars can be: float (scalar), float[N] (vector), or int (argmax index).
@@ -1425,52 +1545,63 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
             if r.bound_name:
                 dims = bound_map[r.bound_name]
                 width = len(dims)
+                # Helper to build the scalar dequant term for element k of a masked array.
+                def _masked_q_term(a_elem, k):
+                    if _QUANTIZE_MODE == "int8":
+                        return f"{a_elem} * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)"
+                    elif _QUANTIZE_MODE == "int4":
+                        byte_idx = k // 2
+                        nibble = f"({concept_name}__{r.bound_name}_q4[{byte_idx}] >> {(k%2)*4}) & 0xF"
+                        return f"{a_elem} * ((float)({nibble} - 8) * {concept_name}__{r.bound_name}_scale)"
+                    else:
+                        return f"{a_elem} * {concept_name}__{r.bound_name}[{k}]"
                 if width >= 8:
                     if is_param:
                         a_expr = f"{var_name}__{r.bound_name}"
                     elif is_local_vec:
                         # Local vector indexed at bound dims — fall back to scalar
-                        if _QUANTIZE_MODE == "int8":
-                            terms = [f"{var_name}[{d}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
-                        else:
-                            terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        terms = [_masked_q_term(f"{var_name}[{d}]", k) for k, d in enumerate(dims)]
                         return "float", "(" + " + ".join(terms) + ")"
                     else:
                         raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
                     _SIMD_HELPERS_NEEDED.add(width)
                     if _QUANTIZE_MODE == "int8":
                         return "float", f"_lal_dot_qsimd_{width}({a_expr}, {concept_name}__{r.bound_name}_q, {concept_name}__{r.bound_name}_scale)"
+                    elif _QUANTIZE_MODE == "int4":
+                        return "float", f"_lal_dot_q4simd_{width}({a_expr}, {concept_name}__{r.bound_name}_q4, {concept_name}__{r.bound_name}_scale)"
                     else:
                         b_expr = f"{concept_name}__{r.bound_name}"
                         return "float", f"_lal_dot_simd_{width}({a_expr}, {b_expr})"
                 else:
                     if is_param:
-                        if _QUANTIZE_MODE == "int8":
-                            terms = [f"{var_name}__{r.bound_name}[{k}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
-                        else:
-                            terms = [f"{var_name}__{r.bound_name}[{k}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        terms = [_masked_q_term(f"{var_name}__{r.bound_name}[{k}]", k) for k, d in enumerate(dims)]
                     elif is_local_vec:
-                        if _QUANTIZE_MODE == "int8":
-                            terms = [f"{var_name}[{d}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
-                        else:
-                            terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        terms = [_masked_q_term(f"{var_name}[{d}]", k) for k, d in enumerate(dims)]
                     else:
                         raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
                     return "float", "(" + " + ".join(terms) + ")"
             else:
                 # Full-dim dot
                 width = len(concept_map[concept_name])
+                def _full_q_term(d):
+                    if _QUANTIZE_MODE == "int8":
+                        return f"{var_name}[{d}] * ((float)concept_{concept_name}_q[{d}] * concept_{concept_name}_scale)"
+                    elif _QUANTIZE_MODE == "int4":
+                        byte_idx = d // 2
+                        nibble = f"(concept_{concept_name}_q4[{byte_idx}] >> {(d%2)*4}) & 0xF"
+                        return f"{var_name}[{d}] * ((float)({nibble} - 8) * concept_{concept_name}_scale)"
+                    else:
+                        return f"{var_name}[{d}] * concept_{concept_name}[{d}]"
                 if width >= 8:
                     _SIMD_HELPERS_NEEDED.add(width)
                     if _QUANTIZE_MODE == "int8":
                         return "float", f"_lal_dot_qsimd_{width}({var_name}, concept_{concept_name}_q, concept_{concept_name}_scale)"
+                    elif _QUANTIZE_MODE == "int4":
+                        return "float", f"_lal_dot_q4simd_{width}({var_name}, concept_{concept_name}_q4, concept_{concept_name}_scale)"
                     else:
                         return "float", f"_lal_dot_simd_{width}({var_name}, concept_{concept_name})"
                 else:
-                    if _QUANTIZE_MODE == "int8":
-                        terms = [f"{var_name}[{d}] * ((float)concept_{concept_name}_q[{d}] * concept_{concept_name}_scale)" for d in range(width)]
-                    else:
-                        terms = [f"{var_name}[{d}] * concept_{concept_name}[{d}]" for d in range(width)]
+                    terms = [_full_q_term(d) for d in range(width)]
                     return "float", "(" + " + ".join(terms) + ")"
         raise RuntimeError(f"relate op {r.op} is not scalar")
     raise RuntimeError(f"can't emit scalar: {e}")
@@ -1617,8 +1748,8 @@ def main():
     ap.add_argument("input", help="input .lal file")
     ap.add_argument("rule", help="entry rule name")
     ap.add_argument("output", nargs="?", help="output .c file (default: stdout)")
-    ap.add_argument("--quantize", choices=["int8"], default=None,
-                    help="quantize concept vectors to int8 (4x smaller .rodata)")
+    ap.add_argument("--quantize", choices=["int8", "int4"], default=None,
+                    help="quantize concept vectors to int8 (4x smaller) or int4 (8x smaller)")
     args = ap.parse_args()
 
     with open(args.input) as f:
