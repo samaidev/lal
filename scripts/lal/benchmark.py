@@ -130,7 +130,7 @@ def write_and_run_compute_bench():
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-extern void classify(const float* q, int* out_best);
+extern void rule_classify(const float* q, int* out_best_idx);
 int main() {
     float q[8] = {1.0f, 0.1f, 0.2f, 0.7f, 0.3f, 0.5f, 0.8f, 0.2f};
     int out;
@@ -138,7 +138,7 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     long N = 100000000L;
     for (long i = 0; i < N; i++) {
-        classify(q, &out);
+        rule_classify(q, &out);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
