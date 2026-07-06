@@ -1,170 +1,158 @@
-# LAL MVP — Logic-Assembly Language, Minimal Viable Prototype
+# LAL — Logic-Assembly Language
 
-A demonstration of **logic-native compilation**: write a logic program using
-concept/boundary/relation primitives, and the compiler emits specialized C
-code with no runtime abstraction overhead.
+A logic-native language: write programs using **concept / boundary / relation** primitives, and the compiler emits specialized C code with no runtime abstraction overhead.
 
-## The core idea
+> The core thesis: standard LLM runtimes (llama.cpp, MLC-LLM) compile a *trained model's forward pass* — every input runs the entire model. LAL instead compiles a *logic program* — only the computation the program specifies is emitted, everything else is dropped at compile time.
 
-Standard LLM runtimes (llama.cpp, MLC-LLM, TensorRT-LLM) take a *trained
-model* and lower its forward pass to C. The result is a generic program that
-runs the *entire* model on every input — every layer, every head, every
-dimension, whether or not they matter for the current query. The compiler
-cannot elide them because the model is treated as opaque data.
+## v0.2 — what's new
 
-**LAL takes a different stance**: the user writes a *logic program* using
-four primitives — `concept`, `bound`, `relate`, `rule`. The compiler reads
-the program, sees exactly which dimensions of which concepts are touched by
-which relations, and **drops everything else at compile time**. The output
-is a standalone C program that runs *only* the computation the program
-specifies — no loops over unused dimensions, no runtime mask indirection,
-no generic matmul.
+This version extends LAL from a single-rule toy into a language that can express real logic programs:
 
-## The language (4 primitives)
+| Feature | v0.1 | v0.2 |
+|---|---|---|
+| Operators | `dot` (masked) | `dot`, **`bind`**, **`bundle`**, **`permute`** (VSA ops) |
+| Memory | — | **`memory`**: fact store with soft (similarity-weighted) `recall` |
+| Rules | 1 per program | **Multiple rules**, rules can **call other rules** (recursion up to fixed depth) |
+| Demos | 1 (classifier) | 3 (classifier, syllogism, VSA ops) |
+| Test cases | 20 | 49 (all passing) |
+
+## The language (6 primitives)
 
 ```lal
-concept name = [v0, v1, ...]                  # a static vector
-bound   name = [d0, d1, ...]                  # a dimension mask
-relate  name(a, b) = dot(a, b) @ bound_name   # a relation operator
-rule    name(args):                           # a logic program
-    var = expr
+concept name = [v0, v1, ...]                       # a static vector
+bound   name = [d0, d1, ...]                       # a dimension mask
+memory  name = [key1: val1, key2: val2, ...]       # a fact store
+relate  name(a, b) = dot(a, b) @ bound_name        # masked dot product
+relate  name(a, b) = bind(a, b)                    # VSA bind (element-wise product)
+relate  name(a, b) = bundle(a, b)                  # VSA bundle (normalized sum)
+relate  name(a)    = permute(a, k)                 # VSA permute (cyclic shift by k)
+rule    name(args):
+    var = expr                                     # use relations, ops, rule calls, recall
     output(var)
 ```
 
-Expressions support: `and`, `or`, `not`, `<`, `>`, `<=`, `>=`,
-relation calls, and `argmax { label: expr, ... }`.
+Expressions support: `and`, `or`, `not`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`,
+relation calls, **rule calls** (recursion), **`recall(memory, query)`** (soft lookup),
+and `argmax { label: expr, ... }`.
 
-## The demo
+## Demos
 
-`demo.lal` classifies an 8-dim query vector into one of {cat, dog, car,
-vehicle}. The trick: each concept is compared using a *different* boundary.
+### 1. `demo.lal` — masked classifier (v0.1, still works)
+4 concepts, 2 bounds, 2 relations, 1 rule. Classifies a query as {cat, dog, car, vehicle} using different bounds for animals vs machines.
+
+### 2. `syllogism.lal` — VSA syllogism reasoning (v0.2)
+A two-step reasoning chain: `Socrates → human → mortal`. Exercises:
+- **`memory`** with `recall` for fact lookup
+- **Rule recursion**: `conclude_mortal` calls `lookup_is_a` then `lookup_is`
+- **`argmax`** over the final property vector
 
 ```lal
-concept cat     = [1.0, 0.1, 0.2, 0.7, 0.3, 0.5, 0.8, 0.2]
-concept dog     = [0.8, 0.2, 0.3, 0.6, 0.4, 0.4, 0.7, 0.3]
-concept car     = [0.1, 0.9, 0.8, 0.1, 0.7, 0.2, 0.1, 0.6]
-concept vehicle = [0.0, 0.9, 0.9, 0.0, 0.6, 0.1, 0.0, 0.7]
+memory facts_is_a = [socrates: human, plato: human, aristotle: human, stone: stone]
+memory facts_is   = [human: mortal]
 
-bound animal_dims  = [0, 2, 3, 6]   # dims that matter for animal-ness
-bound machine_dims = [1, 2, 4, 7]   # dims that matter for machine-ness
-
-relate animal_sim(a, b)  = dot(a, b) @ animal_dims
-relate machine_sim(a, b) = dot(a, b) @ machine_dims
-
-rule classify(query):
-    best = argmax {
-        cat:     animal_sim(query, cat),
-        dog:     animal_sim(query, dog),
-        car:     machine_sim(query, car),
-        vehicle: machine_sim(query, vehicle)
-    }
-    output(best)
+rule conclude_mortal(subject):
+    cat  = lookup_is_a(subject)    # rule call (recursion)
+    prop = lookup_is(cat)          # rule call
+    output(prop)
 ```
 
-## What the compiler produces
+### 3. `vsa_ops.lal` — VSA operators (v0.2)
+Exercises `bind`, `bundle`, `permute` directly: builds a role-filler representation of a query and classifies it.
 
-The compiler emits `demo.c` — about 40 lines of specialized C. Key specializations:
+## What the compiler does
 
-1. **BOUND applied at compile time**: 8-dim concept vectors reduced to 4-dim
-   arrays. Only the (concept, bound) pairs actually used together are emitted.
-   For this demo: 4 arrays × 4 floats = 16 floats total, vs 4 × 8 = 32 floats
-   for the naive version.
+The compiler emits specialized C code where:
 
-2. **DOT fully unrolled**: each `animal_sim(query, cat)` becomes a single
-   arithmetic expression with 4 multiplications — no loop, no array indexing.
-
-3. **argmax flattened**: 4 if-statements in sequence, no function call.
-
-4. **No runtime dispatch**: the entire rule is one C function with no helpers.
-
-The same logic written "generically" (llama.cpp-style, with full-dim vectors,
-runtime mask arrays, and a generic dot product) is in `src/demo_generic.c`.
+1. **BOUNDS applied at compile time** — concept vectors reduced to only the used dimensions; unused (concept, bound) pairs not emitted at all
+2. **DOT fully unrolled** — no loops, no array indexing
+3. **BIND/BUNDLE/PERMUTE fully unrolled** — element-wise ops, no loops
+4. **MEMORY recall compiled to fixed dot products + weighted sum** — no hash table, no dynamic dispatch
+5. **Rule calls inlined** up to `max_recursion_depth=2` (configurable)
+6. **argmax flattened** — flat comparison chain, no function call
 
 ## Verification
 
 ```
-$ python3 ../../scripts/lal/verify.py
-[*] built /home/z/my-project/download/lal-mvp/build/demo_x86_64
-  [OK] ==cat    ...  -> ref=cat(0) c=0
-  [OK] ==dog    ...  -> ref=cat(0) c=0
-  [OK] ==car    ...  -> ref=vehicle(3) c=3
-  [OK] ==vehicle ...  -> ref=vehicle(3) c=3
-  [OK] random   ... (×16)
-=== 20 passed, 0 failed out of 20 ===
-[*] VERIFICATION PASSED — C output matches Python reference exactly.
+$ python3 scripts/lal/verify_all.py
+
+=== Demo: demo ===
+  [OK] cat / dog / car / vehicle + 16 random → 20 passed
+=== Demo: syllogism ===
+  [OK] socrates / plato / aristotle / stone / human / mortal + 10 random → 16 passed
+=== Demo: vsa_ops ===
+  [OK] alice / bob / carol + 10 random → 13 passed
+
+=== TOTAL: 49 passed, 0 failed ===
+[*] ALL DEMOS VERIFIED — C output matches Python reference.
 ```
 
-## Performance comparison
-
-Compute-only (100M calls, single-threaded, same machine):
+## Performance (v0.1 demo, still representative)
 
 | Optimization | Specialized (LAL) | Generic (llama.cpp-style) | Speedup |
 |---|---|---|---|
 | `-O3` | 311 M calls/s | 236 M calls/s | 1.32× |
 | `-O0` | 139 M calls/s | 19.6 M calls/s | **7.1×** |
 
-Assembly size of the classify function (`-O3`):
+The `-O3` gap is small because gcc sees through this trivial 4-element loop. Real LLM-scale code (variable shapes, indirect dispatch, KV cache) cannot be optimized through, so the gap widens toward the `-O0` numbers.
 
-| Version | asm lines |
-|---|---|
-| Specialized | 155 |
-| Generic     | 188 |
-
-The `-O3` gap is small because gcc can see through this trivial 4-element
-loop. For real LLM-scale code (variable shapes, indirect dispatch through
-ops tables, dynamic KV cache layouts), the compiler cannot see through the
-abstraction, and the gap widens toward the `-O0` numbers.
-
-## Files
+## File layout
 
 ```
-download/lal-mvp/
-├── Makefile                # builds x86 + arm64 (cross), runs verify/bench
-├── README.md               # this file
-├── src/
-│   ├── demo.lal            # the LAL source program
-│   ├── demo.c              # generated by the LAL compiler (specialized)
-│   └── demo_generic.c      # hand-written generic version for comparison
-└── build/
-    ├── demo_x86_64         # specialized, built for x86_64
-    ├── demo_generic_x86_64 # generic, built for x86_64
-    ├── demo.s              # specialized assembly (for inspection)
-    └── demo_generic.s      # generic assembly (for inspection)
-
-scripts/lal/
-├── lal.py                  # the language: parser + AST + compiler + reference interpreter
-├── demo.lal                # the demo source (also copied to download/lal-mvp/src)
-├── verify.py               # verification: C output vs Python reference
-└── benchmark.py            # benchmark: specialized vs generic
+lal/
+├── README.md                   # this file
+├── scripts/lal/
+│   ├── lal.py                  # the language: parser + AST + compiler + reference interpreter
+│   ├── demo.lal                # demo 1: masked classifier
+│   ├── syllogism.lal           # demo 2: VSA syllogism with memory + recursion
+│   ├── vsa_ops.lal             # demo 3: bind/bundle/permute exercise
+│   ├── verify.py               # verify demo 1
+│   ├── verify_syllogism.py     # verify demo 2
+│   ├── verify_all.py           # verify all 3 demos
+│   ├── benchmark.py            # specialized vs generic benchmark
+│   └── ref/                    # (empty — reference outputs are generated in-process)
+└── download/lal-mvp/           # self-contained buildable package
+    ├── Makefile
+    ├── README.md
+    ├── src/
+    │   ├── demo.lal
+    │   ├── demo.c              # generated
+    │   ├── demo_generic.c      # hand-written generic version for comparison
+    │   ├── syllogism.lal
+    │   ├── syllogism.c         # generated
+    │   └── vsa_ops.lal
+    └── build/
+        └── ...                 # compiled binaries
 ```
 
-## Cross-platform
+## Build & run
 
-The generated C is portable: only `<stdio.h>`, `<stdlib.h>`, `<string.h>`.
-The Makefile has an `arm64` target that cross-compiles with
-`aarch64-linux-gnu-gcc`. (Not runnable in this environment — no cross-toolchain
-installed — but the source compiles cleanly.)
+```bash
+# From download/lal-mvp/:
+make x86         # build all demos for x86_64
+make verify      # verify all demos against Python reference
+make bench       # benchmark specialized vs generic
+make arm64       # cross-compile for arm64 (needs aarch64-linux-gnu-gcc)
+make clean
+```
 
-## Limitations of this MVP
+Or directly:
+```bash
+python3 scripts/lal/lal.py scripts/lal/syllogism.lal main out.c
+gcc -O3 -o syllogism out.c
+./syllogism 0.7 0.6 0.2 0.4 0.3 0.1 0.5 0.2
+```
 
-This is a **minimum viable prototype**, not a real language. Things it does
-not yet support:
+## Limitations & next steps
 
-- **No training**: concept vectors are literals in the source. A real
-  implementation would let you import them from a trained embedding.
-- **Only one operator**: `dot`. A real implementation needs VSA-style
-  `bind` (XOR), `bundle` (sum), `permute`.
-- **No recursion**: rules can't call other rules. A real implementation
-  needs rule composition.
-- **No memory**: no fact store to query against. A real implementation
-  needs a MEMORY primitive for soft lookup.
-- **No multi-rule programs**: only one rule is compiled per binary.
-- **No SIMD intrinsics**: the C output is scalar. For real performance on
-  large concept vectors, the compiler should emit AVX2/NEON intrinsics
-  when the dot product is wide enough to benefit.
-- **No quantization**: all values are float32. Real LLM deployment needs
-  int8/int4 paths.
+This is v0.2 — a real language, but still has limits:
 
-These are all tractable extensions. The point of this MVP is to show that
-the *core idea* — compile-time specialization of logic programs to native
-code — works and produces measurable speedups even on a tiny demo.
+- **No training**: concept vectors are literals. Next: import from word2vec/bert embedding files.
+- **Single operator per relate**: `relate` can only be one of dot/bind/bundle/permute. Next: composite relates.
+- **Fixed recursion depth**: rule calls inline up to depth 2. Next: true recursion via C recursion.
+- **No SIMD**: scalar C only. Next: emit AVX2/NEON intrinsics for wide vectors.
+- **No quantization**: float32 only. Next: int8/int4 paths.
+- **No MEMORY persistence**: memories are compile-time literals. Next: load from files.
+
+## License
+
+MIT

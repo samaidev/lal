@@ -1,0 +1,90 @@
+# syllogism.lal — a VSA-based syllogism reasoning demo
+#
+# Task: given a query "Socrates", conclude "Socrates is mortal" via:
+#   1. Socrates is a human.        (fact, stored in MEMORY)
+#   2. Humans are mortal.          (fact, stored in MEMORY)
+#   3. Therefore Socrates is mortal. (chain via rule calls)
+#
+# This demo exercises:
+#   - VSA bind:       bind(subject, "is_a") creates a role-filler pair
+#   - VSA bundle:     bundle multiple facts into one memory vector
+#   - VSA permute:    shift vectors for positional encoding
+#   - MEMORY recall:  soft lookup of facts
+#   - Rule recursion: rule calls another rule
+
+# === Concepts (8-dim, hand-crafted for reproducibility) ===
+# Roles (relations as vectors)
+concept role_is_a     = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept role_is       = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept role_property = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Subjects
+concept socrates = [0.7, 0.6, 0.2, 0.4, 0.3, 0.1, 0.5, 0.2]
+concept plato    = [0.6, 0.5, 0.3, 0.5, 0.2, 0.2, 0.4, 0.3]
+concept aristotle= [0.5, 0.7, 0.4, 0.3, 0.4, 0.3, 0.6, 0.4]
+
+# Categories
+concept human   = [0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.5, 0.3]
+concept mortal  = [0.6, 0.5, 0.4, 0.5, 0.4, 0.3, 0.4, 0.5]
+concept stone   = [0.1, 0.2, 0.1, 0.7, 0.8, 0.6, 0.1, 0.2]
+
+# === Bounds ===
+# For classification: which dims distinguish animacy
+bound animacy_dims = [0, 1, 2, 6]
+
+# === Memories (fact stores) ===
+# "X is_a Y" facts: key=X, value=Y
+memory facts_is_a = [
+    socrates: human,
+    plato: human,
+    aristotle: human,
+    stone: stone
+]
+
+# "X is Y" facts: key=X, value=Y (e.g. human is mortal)
+memory facts_is = [
+    human: mortal
+]
+
+# === Relations ===
+# VSA operators
+relate bind_role(subj, role)  = bind(subj, role)
+relate bundle_facts(a, b)     = bundle(a, b)
+relate shift_one(v)           = permute(v, 1)
+
+# Masked dot for similarity
+relate sim_anim(a, b) = dot(a, b) @ animacy_dims
+
+# === Rules ===
+# Rule 1: given a subject, look up what it "is_a"
+rule lookup_is_a(subject):
+    # Recall the category the subject belongs to
+    category = recall(facts_is_a, subject)
+    output(category)
+
+# Rule 2: given a category, look up what property it "is"
+rule lookup_is(category):
+    property = recall(facts_is, category)
+    output(property)
+
+# Rule 3: COMPOSE — given a subject, find its category, then find that category's property.
+# This is the syllogism: Socrates is_a human; human is mortal; therefore Socrates is mortal.
+rule conclude_mortal(subject):
+    # Call lookup_is_a with subject → returns the category vector
+    cat = lookup_is_a(subject)
+    # Call lookup_is with cat → returns the property vector
+    prop = lookup_is(cat)
+    output(prop)
+
+# Rule 4 (entry point): given a query subject, conclude its property AND classify it.
+rule main(query):
+    # Use the composed rule to get the property
+    property = conclude_mortal(query)
+    # Use argmax to identify which concept the property is closest to
+    best = argmax {
+        mortal:   sim_anim(property, mortal),
+        human:    sim_anim(property, human),
+        stone:    sim_anim(property, stone),
+        socrates: sim_anim(property, socrates)
+    }
+    output(best)

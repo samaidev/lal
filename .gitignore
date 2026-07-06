@@ -1,2 +1,26 @@
+# Build artifacts
+download/lal-mvp/build/
+*.o
+*.so
+*.exe
+
+# Generated C files (regenerated from .lal by lalc)
+download/lal-mvp/src/demo.c
+download/lal-mvp/src/syllogism.c
+download/lal-mvp/src/vsa_ops.c
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Skills system (not part of this project)
 skills/
+
+# Upload dir
+upload/
+
+# Node
 node_modules/

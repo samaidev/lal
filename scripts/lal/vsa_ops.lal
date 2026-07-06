@@ -1,0 +1,39 @@
+# vsa_ops.lal — exercises bind / bundle / permute to verify they compile and run.
+#
+# Task: given a query, build a "role-filler" representation and classify it.
+#
+# bind(subj, role)         = element-wise product
+# bundle(bind1, bind2)     = normalized sum
+# permute(v, k)            = cyclic shift by k
+
+concept alice  = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept bob    = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept carol  = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+concept role_agent = [0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]
+concept role_action = [0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5]
+
+bound identity = [0, 1, 2, 3, 4, 5, 6, 7]
+
+relate bind_agent(s, r)  = bind(s, r)
+relate bind_action(s, r) = bind(s, r)
+relate bundle_pair(a, b) = bundle(a, b)
+relate shift_one(v) = permute(v, 1)
+relate sim(a, b) = dot(a, b) @ identity
+
+rule encode(query):
+    ag = bind_agent(query, role_agent)
+    ac = bind_action(query, role_action)
+    paired = bundle_pair(ag, ac)
+    shifted = shift_one(paired)
+    output(shifted)
+
+rule main(query):
+    enc = encode(query)
+    # Compare against each person's encoding
+    best = argmax {
+        alice: sim(enc, alice),
+        bob:   sim(enc, bob),
+        carol: sim(enc, carol)
+    }
+    output(best)
