@@ -8,6 +8,8 @@ download/lal-mvp/build/
 download/lal-mvp/src/demo.c
 download/lal-mvp/src/syllogism.c
 download/lal-mvp/src/vsa_ops.c
+download/lal-mvp/src/embed_demo.c
+download/lal-mvp/src/recursion_demo.c
 
 # Python
 __pycache__/

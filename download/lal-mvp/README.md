@@ -4,25 +4,34 @@ A logic-native language: write programs using **concept / boundary / relation** 
 
 > The core thesis: standard LLM runtimes (llama.cpp, MLC-LLM) compile a *trained model's forward pass* — every input runs the entire model. LAL instead compiles a *logic program* — only the computation the program specifies is emitted, everything else is dropped at compile time.
 
-## v0.2 — what's new
+## v0.3 — what's new
 
-This version extends LAL from a single-rule toy into a language that can express real logic programs:
+| Feature | v0.1 | v0.2 | v0.3 |
+|---|---|---|---|
+| Operators | `dot` (masked) | + `bind`/`bundle`/`permute` (VSA) | + **SIMD** (AVX2/NEON) for dot width ≥ 8 |
+| Memory | — | `memory` + `recall` | same |
+| Rules | 1 per program | multiple, inlined to depth 2 | multiple, **true C recursion** (no depth limit) |
+| Concept loading | literals only | literals only | **`load_word2vec(file, word)`** / `load_glove(...)` |
+| Demos | 1 | 3 | **5** |
+| Test cases | 20 | 49 | **75** (all passing) |
 
-| Feature | v0.1 | v0.2 |
-|---|---|---|
-| Operators | `dot` (masked) | `dot`, **`bind`**, **`bundle`**, **`permute`** (VSA ops) |
-| Memory | — | **`memory`**: fact store with soft (similarity-weighted) `recall` |
-| Rules | 1 per program | **Multiple rules**, rules can **call other rules** (recursion up to fixed depth) |
-| Demos | 1 (classifier) | 3 (classifier, syllogism, VSA ops) |
-| Test cases | 20 | 49 (all passing) |
+### v0.3 highlights
+
+1. **Real embedding loading** — `concept cat = load_word2vec("embeddings.txt", "cat")` reads the vector at compile time and inlines it. Supports word2vec text format and GloVe format (auto-detects header line).
+
+2. **SIMD intrinsics** — when a dot product has width ≥ 8, the compiler emits a `_lal_dot_simd_N()` helper using AVX2 (`__m256`, `_mm256_fmadd_ps`) on x86_64 and NEON (`float32x4_t`, `vfmaq_f32`) on arm64, with a scalar fallback. Guards via `#ifdef __AVX2__` / `#ifdef __ARM_NEON__`.
+
+3. **True recursion** — rule calls are now real C function calls, not inlined. Rules can call themselves or each other recursively. All transitively-reachable rules are emitted (no depth limit).
 
 ## The language (6 primitives)
 
 ```lal
-concept name = [v0, v1, ...]                       # a static vector
+concept name = [v0, v1, ...]                       # literal vector
+concept name = load_word2vec("file.txt", "word")   # load from embedding file at compile time
+concept name = load_glove("file.txt", "word")      # GloVe format (same as word2vec text)
 bound   name = [d0, d1, ...]                       # a dimension mask
 memory  name = [key1: val1, key2: val2, ...]       # a fact store
-relate  name(a, b) = dot(a, b) @ bound_name        # masked dot product
+relate  name(a, b) = dot(a, b) @ bound_name        # masked dot product (SIMD if width ≥ 8)
 relate  name(a, b) = bind(a, b)                    # VSA bind (element-wise product)
 relate  name(a, b) = bundle(a, b)                  # VSA bundle (normalized sum)
 relate  name(a)    = permute(a, k)                 # VSA permute (cyclic shift by k)
@@ -32,58 +41,50 @@ rule    name(args):
 ```
 
 Expressions support: `and`, `or`, `not`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`,
-relation calls, **rule calls** (recursion), **`recall(memory, query)`** (soft lookup),
+relation calls, **rule calls** (real recursion), **`recall(memory, query)`** (soft lookup),
 and `argmax { label: expr, ... }`.
 
 ## Demos
 
-### 1. `demo.lal` — masked classifier (v0.1, still works)
-4 concepts, 2 bounds, 2 relations, 1 rule. Classifies a query as {cat, dog, car, vehicle} using different bounds for animals vs machines.
+### 1. `demo.lal` — masked classifier (v0.1)
+4 concepts, 2 bounds, 2 relations, 1 rule. Classifies a query as {cat, dog, car, vehicle}.
 
 ### 2. `syllogism.lal` — VSA syllogism reasoning (v0.2)
-A two-step reasoning chain: `Socrates → human → mortal`. Exercises:
-- **`memory`** with `recall` for fact lookup
-- **Rule recursion**: `conclude_mortal` calls `lookup_is_a` then `lookup_is`
-- **`argmax`** over the final property vector
-
-```lal
-memory facts_is_a = [socrates: human, plato: human, aristotle: human, stone: stone]
-memory facts_is   = [human: mortal]
-
-rule conclude_mortal(subject):
-    cat  = lookup_is_a(subject)    # rule call (recursion)
-    prop = lookup_is(cat)          # rule call
-    output(prop)
-```
+`Socrates → human → mortal`. Exercises `memory`/`recall` and rule composition.
 
 ### 3. `vsa_ops.lal` — VSA operators (v0.2)
-Exercises `bind`, `bundle`, `permute` directly: builds a role-filler representation of a query and classifies it.
+Exercises `bind`, `bundle`, `permute` directly.
 
-## What the compiler does
+### 4. `embed_demo.lal` — embedding loading (v0.3, NEW)
+Loads concept vectors from `embeddings.txt` via `load_word2vec()`. Also exercises SIMD (width-8 dots).
 
-The compiler emits specialized C code where:
-
-1. **BOUNDS applied at compile time** — concept vectors reduced to only the used dimensions; unused (concept, bound) pairs not emitted at all
-2. **DOT fully unrolled** — no loops, no array indexing
-3. **BIND/BUNDLE/PERMUTE fully unrolled** — element-wise ops, no loops
-4. **MEMORY recall compiled to fixed dot products + weighted sum** — no hash table, no dynamic dispatch
-5. **Rule calls inlined** up to `max_recursion_depth=2` (configurable)
-6. **argmax flattened** — flat comparison chain, no function call
+### 5. `recursion_demo.lal` — true recursion (v0.3, NEW)
+A rule that chains through `shift_once` → `shift_twice` → `shift_thrice` via real C function calls. Proves recursion works without inlining.
 
 ## Verification
 
 ```
 $ python3 scripts/lal/verify_all.py
 
-=== Demo: demo ===
-  [OK] cat / dog / car / vehicle + 16 random → 20 passed
-=== Demo: syllogism ===
-  [OK] socrates / plato / aristotle / stone / human / mortal + 10 random → 16 passed
-=== Demo: vsa_ops ===
-  [OK] alice / bob / carol + 10 random → 13 passed
+=== Demo: demo ===          → 20 passed
+=== Demo: syllogism ===     → 16 passed
+=== Demo: vsa_ops ===       → 13 passed
+=== Demo: embed_demo ===    → 14 passed  (NEW)
+=== Demo: recursion_demo ===→ 12 passed  (NEW)
 
-=== TOTAL: 49 passed, 0 failed ===
+=== TOTAL: 75 passed, 0 failed ===
 [*] ALL DEMOS VERIFIED — C output matches Python reference.
+```
+
+## SIMD verification
+
+```bash
+# Build with AVX2:
+gcc -O3 -mavx2 -mfma -o embed_demo_avx embed_demo.c
+# Build scalar-only:
+gcc -O3 -mno-avx -o embed_demo_scalar embed_demo.c
+
+# The AVX2 build contains vfmadd/vmulps/vhaddps instructions; the scalar build has none.
 ```
 
 ## Performance (v0.1 demo, still representative)
@@ -93,66 +94,5 @@ $ python3 scripts/lal/verify_all.py
 | `-O3` | 311 M calls/s | 236 M calls/s | 1.32× |
 | `-O0` | 139 M calls/s | 19.6 M calls/s | **7.1×** |
 
-The `-O3` gap is small because gcc sees through this trivial 4-element loop. Real LLM-scale code (variable shapes, indirect dispatch, KV cache) cannot be optimized through, so the gap widens toward the `-O0` numbers.
+The `-O3` gap is small because gcc sees through this trivial 4-element loop. Real LLM-scale code (variable shapes, indirect dispatch, KV cache) cannot be optimized through, so the gap widens toward the `-O0` numbers. SIMD extends this further for width ≥ 8 vectors.
 
-## File layout
-
-```
-lal/
-├── README.md                   # this file
-├── scripts/lal/
-│   ├── lal.py                  # the language: parser + AST + compiler + reference interpreter
-│   ├── demo.lal                # demo 1: masked classifier
-│   ├── syllogism.lal           # demo 2: VSA syllogism with memory + recursion
-│   ├── vsa_ops.lal             # demo 3: bind/bundle/permute exercise
-│   ├── verify.py               # verify demo 1
-│   ├── verify_syllogism.py     # verify demo 2
-│   ├── verify_all.py           # verify all 3 demos
-│   ├── benchmark.py            # specialized vs generic benchmark
-│   └── ref/                    # (empty — reference outputs are generated in-process)
-└── download/lal-mvp/           # self-contained buildable package
-    ├── Makefile
-    ├── README.md
-    ├── src/
-    │   ├── demo.lal
-    │   ├── demo.c              # generated
-    │   ├── demo_generic.c      # hand-written generic version for comparison
-    │   ├── syllogism.lal
-    │   ├── syllogism.c         # generated
-    │   └── vsa_ops.lal
-    └── build/
-        └── ...                 # compiled binaries
-```
-
-## Build & run
-
-```bash
-# From download/lal-mvp/:
-make x86         # build all demos for x86_64
-make verify      # verify all demos against Python reference
-make bench       # benchmark specialized vs generic
-make arm64       # cross-compile for arm64 (needs aarch64-linux-gnu-gcc)
-make clean
-```
-
-Or directly:
-```bash
-python3 scripts/lal/lal.py scripts/lal/syllogism.lal main out.c
-gcc -O3 -o syllogism out.c
-./syllogism 0.7 0.6 0.2 0.4 0.3 0.1 0.5 0.2
-```
-
-## Limitations & next steps
-
-This is v0.2 — a real language, but still has limits:
-
-- **No training**: concept vectors are literals. Next: import from word2vec/bert embedding files.
-- **Single operator per relate**: `relate` can only be one of dot/bind/bundle/permute. Next: composite relates.
-- **Fixed recursion depth**: rule calls inline up to depth 2. Next: true recursion via C recursion.
-- **No SIMD**: scalar C only. Next: emit AVX2/NEON intrinsics for wide vectors.
-- **No quantization**: float32 only. Next: int8/int4 paths.
-- **No MEMORY persistence**: memories are compile-time literals. Next: load from files.
-
-## License
-
-MIT

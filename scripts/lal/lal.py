@@ -148,6 +148,62 @@ def _parse_int_list(s: str) -> List[int]:
         return []
     return [int(x.strip()) for x in s.split(",")]
 
+
+# Embedding file cache — avoid re-reading the same file for multiple concepts.
+_EMBEDDING_CACHE: Dict[str, Dict[str, List[float]]] = {}
+# Directory of the .lal source file being parsed (for resolving relative embedding paths).
+_CURRENT_SOURCE_DIR: Optional[str] = None
+
+def _load_word2vec(path: str, word: str, dim_hint: Optional[int] = None) -> Optional[List[float]]:
+    """Load a word vector from a word2vec/GloVe text-format embedding file.
+
+    Format: one line per word, "word v1 v2 v3 ... vN".
+    The first line may be a header "vocab_size dim" (word2vec format) — we detect
+    and skip it. Returns the vector as a list of floats, or None if not found.
+    """
+    # Resolve path: try as-is, then relative to the .lal source dir, then abspath.
+    if not os.path.isabs(path):
+        candidates = [path]
+        if _CURRENT_SOURCE_DIR:
+            candidates.append(os.path.join(_CURRENT_SOURCE_DIR, path))
+        resolved = None
+        for c in candidates:
+            if os.path.exists(c):
+                resolved = c
+                break
+        if resolved is None:
+            # Fall back to abspath for a clear error message
+            resolved = os.path.abspath(path)
+        path = resolved
+
+    if path not in _EMBEDDING_CACHE:
+        emap: Dict[str, List[float]] = {}
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            first = True
+            for line in f:
+                parts = line.rstrip("\n").split(" ")
+                # Skip word2vec header line: "vocab_size dim"
+                if first:
+                    first = False
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        continue
+                if len(parts) < 2:
+                    continue
+                w = parts[0]
+                try:
+                    v = [float(x) for x in parts[1:] if x != ""]
+                except ValueError:
+                    continue
+                emap[w] = v
+        _EMBEDDING_CACHE[path] = emap
+    emap = _EMBEDDING_CACHE[path]
+    if word not in emap:
+        return None
+    vec = emap[word]
+    if dim_hint is not None and len(vec) != dim_hint:
+        raise ParseError(f"word {word!r} in {path} has dim {len(vec)}, expected {dim_hint}")
+    return vec
+
 def _parse_memory_entries(s: str) -> List[Tuple[str, str]]:
     """Parse '[key1: val1, key2: val2, ...]' into a list of (key, val) tuples."""
     s = s.strip().strip("[]")
@@ -353,8 +409,16 @@ def _parse_argmax_special(s: str) -> Expr:
 
 # ----- top-level parser -----
 
-def parse(source: str):
-    """Parse LAL source into (concepts, bounds, memories, relates, rules)."""
+def parse(source: str, source_path: Optional[str] = None):
+    """Parse LAL source into (concepts, bounds, memories, relates, rules).
+
+    source_path: the path to the .lal file (used to resolve relative embedding paths).
+                 If None, relative paths are resolved against the current working directory.
+    """
+    # Stash the source directory for embedding path resolution.
+    global _CURRENT_SOURCE_DIR
+    _CURRENT_SOURCE_DIR = os.path.dirname(os.path.abspath(source_path)) if source_path else None
+
     concepts: List[Concept] = []
     bounds: List[Bound] = []
     memories: List[Memory] = []
@@ -369,10 +433,38 @@ def parse(source: str):
             i += 1
             continue
 
-        # concept name = [...]
+        # concept name = [...]   (literal vector)
         m = re.match(r"concept\s+(\w+)\s*=\s*(\[.*\])\s*$", line)
         if m:
             concepts.append(Concept(m.group(1), _parse_float_list(m.group(2))))
+            i += 1
+            continue
+
+        # concept name = load_word2vec("path", "word")   (load from embedding file at compile time)
+        m = re.match(r'concept\s+(\w+)\s*=\s*load_word2vec\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*(?:,\s*dim\s*=\s*(\d+))?\s*\)\s*$', line)
+        if m:
+            cname = m.group(1)
+            path = m.group(2)
+            word = m.group(3)
+            dim_hint = int(m.group(4)) if m.group(4) else None
+            vec = _load_word2vec(path, word, dim_hint)
+            if vec is None:
+                raise ParseError(f"word {word!r} not found in embedding file {path}")
+            concepts.append(Concept(cname, vec))
+            i += 1
+            continue
+
+        # concept name = load_glove("path", "word")   (GloVe format: same as word2vec text)
+        m = re.match(r'concept\s+(\w+)\s*=\s*load_glove\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*(?:,\s*dim\s*=\s*(\d+))?\s*\)\s*$', line)
+        if m:
+            cname = m.group(1)
+            path = m.group(2)
+            word = m.group(3)
+            dim_hint = int(m.group(4)) if m.group(4) else None
+            vec = _load_word2vec(path, word, dim_hint)  # same format
+            if vec is None:
+                raise ParseError(f"word {word!r} not found in embedding file {path}")
+            concepts.append(Concept(cname, vec))
             i += 1
             continue
 
@@ -674,8 +766,14 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
 # Compiler — AST → specialized C
 # =============================================================================
 
+# Global set of SIMD dot-product widths needed in the current compilation.
+# Reset at the start of each compile_to_c() call.
+_SIMD_HELPERS_NEEDED: Set[int] = set()
 def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2) -> str:
     """Compile a rule (and any rules it calls, up to max_recursion_depth) to specialized C."""
+    global _SIMD_HELPERS_NEEDED
+    _SIMD_HELPERS_NEEDED = set()  # reset for this compilation
+
     concept_map = {c.name: c.vec for c in concepts}
     bound_map = {b.name: b.dims for b in bounds}
     memory_map = {m.name: m for m in memories}
@@ -683,7 +781,9 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     rule_map = {r.name: r for r in rules}
     concept_names = set(concept_map.keys())
 
-    # Find which rules we need to emit (transitively, up to max_recursion_depth).
+    # Find which rules we need to emit (all transitively-reachable rules).
+    # In v0.3, rule calls are real C function calls, so we emit ALL reachable
+    # rules — no depth limit. This supports true recursion.
     rules_to_emit = _collect_called_rules(rule_map[rule_name], rule_map, relate_map, max_recursion_depth)
     rules_to_emit.add(rule_name)
 
@@ -692,25 +792,30 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
 
     lines = []
     lines.append("/*")
-    lines.append(" * Generated by lalc v0.2 — the LAL compiler.")
+    lines.append(" * Generated by lalc v0.3 — the LAL compiler.")
     lines.append(" *")
     lines.append(f" * Entry rule: {rule_name}")
     lines.append(" * Vector dim: " + str(vec_dim))
-    lines.append(" * Rules emitted (transitive closure up to depth " + str(max_recursion_depth) + "):")
+    lines.append(" * Rules emitted (all transitively-reachable; rule calls are real C calls):")
     for rn in sorted(rules_to_emit):
         lines.append(f" *   - {rn}")
     lines.append(" *")
     lines.append(" * Specializations applied at compile time:")
     lines.append(" *   - BOUND: only used dimensions retained in concept vectors")
-    lines.append(" *   - DOT: fully unrolled, no loops")
+    lines.append(" *   - DOT: fully unrolled (scalar) or SIMD (AVX2/NEON) when width >= 8")
     lines.append(" *   - BIND/BUNDLE/PERMUTE: element-wise, fully unrolled")
     lines.append(" *   - MEMORY recall: compiled to fixed dot products + weighted sum")
-    lines.append(" *   - Rule calls: inlined up to max_recursion_depth")
+    lines.append(" *   - Rule calls: real C function calls (supports true recursion)")
     lines.append(" *   - argmax: flat comparison chain, no dispatch")
     lines.append(" */")
     lines.append("#include <stdio.h>")
     lines.append("#include <stdlib.h>")
     lines.append("#include <string.h>")
+    lines.append("#if defined(__AVX2__) || defined(__AVX__)")
+    lines.append("#include <immintrin.h>")
+    lines.append("#elif defined(__ARM_NEON) || defined(__ARM_NEON__)")
+    lines.append("#include <arm_neon.h>")
+    lines.append("#endif")
     lines.append("")
 
     # Emit full-dim concept arrays — but ONLY for concepts that are actually used
@@ -752,6 +857,21 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             vals = [cvec[d] for d in dims]
             arr = ", ".join(f"{v:.6f}f" for v in vals)
             lines.append(f"static const float {cname}__{bname}[{len(dims)}] = {{{arr}}};")
+        lines.append("")
+
+    # Pre-scan all rule bodies to collect SIMD dot widths needed.
+    # (We do this before emitting rules so we can emit the helpers first.)
+    for rn in rules_to_emit:
+        r = rule_map[rn]
+        for stmt in r.body:
+            _collect_simd_widths(stmt.expr, relate_map, concept_names, bound_map, concept_map, _SIMD_HELPERS_NEEDED)
+
+    # Emit SIMD dot-product helpers (only for widths that were used).
+    if _SIMD_HELPERS_NEEDED:
+        lines.append("/* === SIMD dot-product helpers (AVX2 on x86_64, NEON on arm64) ===")
+        lines.append(" * Compiled in only when the target supports them; scalar fallback otherwise. */")
+        for width in sorted(_SIMD_HELPERS_NEEDED):
+            lines.extend(_emit_simd_dot_helper(width))
         lines.append("")
 
     # Forward-declare all rules being emitted.
@@ -818,12 +938,15 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     return "\n".join(lines)
 
 
-def _collect_called_rules(rule, rule_map, relate_map, max_depth, seen=None, depth=0):
-    """Find all rules transitively called from this rule, up to max_depth."""
+def _collect_called_rules(rule, rule_map, relate_map, max_depth=None, seen=None, depth=0):
+    """Find all rules transitively called from this rule.
+
+    In v0.3, rule calls are real C function calls (not inlined), so we emit ALL
+    transitively-reachable rules with no depth limit. The max_depth parameter is
+    kept for API compatibility but ignored.
+    """
     if seen is None:
         seen = set()
-    if depth >= max_depth:
-        return seen
     for stmt in rule.body:
         for er in _find_rule_calls(stmt.expr, relate_map):
             if er not in seen:
@@ -914,14 +1037,113 @@ def _collect_concepts_needing_full(expr, relate_map, concept_names, needed, memo
         for _, e in expr.items:
             _collect_concepts_needing_full(e, relate_map, concept_names, needed, memory_map)
     if isinstance(expr, ERecall):
-        # The query might be a concept
         _collect_concepts_needing_full(expr.query, relate_map, concept_names, needed, memory_map)
-        # The memory's keys and values are concepts — they need full arrays.
-        # (These are also added at the top level via the memory_map loop, but be safe.)
         if expr.memory_name in memory_map:
             for key_name, val_name in memory_map[expr.memory_name].entries:
                 needed.add(key_name)
                 needed.add(val_name)
+
+
+def _collect_simd_widths(expr, relate_map, concept_names, bound_map, concept_map, needed):
+    """Pre-scan an expression to find dot-product widths that will need SIMD helpers."""
+    if isinstance(expr, ERelateCall):
+        r = relate_map[expr.name]
+        if r.op == "dot":
+            # Find the concept to determine width
+            for a in expr.args:
+                if isinstance(a, EVar) and a.name in concept_names:
+                    if r.bound_name:
+                        width = len(bound_map[r.bound_name])
+                    else:
+                        width = len(concept_map[a.name])
+                    if width >= 8:
+                        needed.add(width)
+                    break
+        for a in expr.args:
+            _collect_simd_widths(a, relate_map, concept_names, bound_map, concept_map, needed)
+    if isinstance(expr, ECall):
+        for a in expr.args:
+            _collect_simd_widths(a, relate_map, concept_names, bound_map, concept_map, needed)
+    if isinstance(expr, EArgMax):
+        for _, e in expr.items:
+            _collect_simd_widths(e, relate_map, concept_names, bound_map, concept_map, needed)
+    if isinstance(expr, ERecall):
+        _collect_simd_widths(expr.query, relate_map, concept_names, bound_map, concept_map, needed)
+
+
+def _emit_simd_dot_helper(width: int) -> List[str]:
+    """Emit a SIMD dot-product helper for vectors of the given width.
+
+    Uses AVX2 on x86_64 (8 floats per __m256), NEON on arm64 (4 floats per float32x4_t).
+    Falls back to scalar unrolled on unsupported targets.
+    Width must be >= 8 and a multiple of 4 (we only call this for width >= 8).
+    """
+    lines = []
+    lines.append(f"/* dot product of two float[{width}] — SIMD-accelerated */")
+    lines.append(f"static inline float _lal_dot_simd_{width}(const float* a, const float* b) {{")
+    lines.append(f"    float result = 0.0f;")
+
+    n_avx = width // 8
+    rem_after_avx = width % 8
+    n_neon = rem_after_avx // 4
+    n_scalar = rem_after_avx % 4
+
+    # AVX path (preferred on x86_64)
+    lines.append(f"#if defined(__AVX2__) || defined(__AVX__)")
+    if n_avx > 0:
+        lines.append(f"    {{")
+        lines.append(f"        __m256 acc = _mm256_setzero_ps();")
+        for k in range(n_avx):
+            lines.append(f"        __m256 va = _mm256_loadu_ps(a + {k*8});")
+            lines.append(f"        __m256 vb = _mm256_loadu_ps(b + {k*8});")
+            lines.append(f"        acc = _mm256_fmadd_ps(va, vb, acc);")
+        lines.append(f"        __m128 lo = _mm256_castps256_ps128(acc);")
+        lines.append(f"        __m128 hi = _mm256_extractf128_ps(acc, 1);")
+        lines.append(f"        __m128 s = _mm_add_ps(lo, hi);")
+        lines.append(f"        s = _mm_hadd_ps(s, s);")
+        lines.append(f"        s = _mm_hadd_ps(s, s);")
+        lines.append(f"        result = _mm_cvtss_f32(s);")
+        # Scalar tail (remainder after 8-float blocks)
+        offset = n_avx * 8
+        for k in range(rem_after_avx):
+            lines.append(f"        result += a[{offset+k}] * b[{offset+k}];")
+        lines.append(f"    }}")
+    else:
+        # width is 4..7 — no AVX block, just scalar
+        for k in range(width):
+            lines.append(f"    result += a[{k}] * b[{k}];")
+
+    # NEON path (preferred on arm64)
+    lines.append(f"#elif defined(__ARM_NEON) || defined(__ARM_NEON__)")
+    if n_neon > 0 or n_avx > 0:
+        # Total NEON blocks: cover the whole width in 4-float chunks
+        total_neon = width // 4
+        rem = width % 4
+        lines.append(f"    {{")
+        lines.append(f"        float32x4_t acc = vdupq_n_f32(0.0f);")
+        for k in range(total_neon):
+            lines.append(f"        float32x4_t va = vld1q_f32(a + {k*4});")
+            lines.append(f"        float32x4_t vb = vld1q_f32(b + {k*4});")
+            lines.append(f"        acc = vfmaq_f32(acc, va, vb);")
+        lines.append(f"        float tmp[4]; vst1q_f32(tmp, acc);")
+        lines.append(f"        result = tmp[0] + tmp[1] + tmp[2] + tmp[3];")
+        offset = total_neon * 4
+        for k in range(rem):
+            lines.append(f"        result += a[{offset+k}] * b[{offset+k}];")
+        lines.append(f"    }}")
+    else:
+        for k in range(width):
+            lines.append(f"    result += a[{k}] * b[{k}];")
+
+    # Scalar fallback
+    lines.append(f"#else")
+    for k in range(width):
+        lines.append(f"    result += a[{k}] * b[{k}];")
+    lines.append(f"#endif")
+
+    lines.append(f"    return result;")
+    lines.append(f"}}")
+    return lines
 
 
 def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth):
@@ -1043,27 +1265,48 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
             if not isinstance(var, EVar):
                 raise RuntimeError("relate dot's non-concept arg must be a variable")
             var_name = var.name
-            # Determine the C expression for accessing the var's elements.
-            # - If the var is a rule param (input), we have a masked array `q__bound[k]`.
-            # - If the var is a local vector, we index into the full vector: `var[d]`.
-            # - If the var is a concept... shouldn't happen (both args are concepts?).
             is_param = var_name in rule_params
             is_local_vec = var_types.get(var_name) == "vector"
             if r.bound_name:
                 dims = bound_map[r.bound_name]
-                if is_param:
-                    # Param: we have a masked array `q__bound[k]` (emitted at function entry).
-                    terms = [f"{var_name}__{r.bound_name}[{k}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
-                elif is_local_vec:
-                    # Local vector: index into the full vector at the bound dims.
-                    terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                width = len(dims)
+                # Use SIMD only if width >= 8 AND dims are contiguous (start at 0, step 1).
+                # For non-contiguous bounds, the masked arrays aren't contiguous in the
+                # original vector, so SIMD on them is still valid (they're their own arrays).
+                # Actually the masked arrays ARE contiguous (we extract them into separate arrays).
+                # So we can SIMD on masked arrays too, as long as width >= 8.
+                if width >= 8:
+                    # Emit a call to the SIMD dot helper.
+                    if is_param:
+                        a_expr = f"{var_name}__{r.bound_name}"
+                        b_expr = f"{concept_name}__{r.bound_name}"
+                    elif is_local_vec:
+                        # Local vector indexed at bound dims — need a temp contiguous array.
+                        # Fall back to scalar for local vectors with bounds (rare case).
+                        terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        return "float", "(" + " + ".join(terms) + ")"
+                    else:
+                        raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
+                    # Register that we need a SIMD helper of this width.
+                    _SIMD_HELPERS_NEEDED.add(width)
+                    return "float", f"_lal_dot_simd_{width}({a_expr}, {b_expr})"
                 else:
-                    raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
-                return "float", "(" + " + ".join(terms) + ")"
+                    if is_param:
+                        terms = [f"{var_name}__{r.bound_name}[{k}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                    elif is_local_vec:
+                        terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                    else:
+                        raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
+                    return "float", "(" + " + ".join(terms) + ")"
             else:
                 # Full-dim dot
-                terms = [f"{var_name}[{d}] * concept_{concept_name}[{d}]" for d in range(len(concept_map[concept_name]))]
-                return "float", "(" + " + ".join(terms) + ")"
+                width = len(concept_map[concept_name])
+                if width >= 8:
+                    _SIMD_HELPERS_NEEDED.add(width)
+                    return "float", f"_lal_dot_simd_{width}({var_name}, concept_{concept_name})"
+                else:
+                    terms = [f"{var_name}[{d}] * concept_{concept_name}[{d}]" for d in range(width)]
+                    return "float", "(" + " + ".join(terms) + ")"
         raise RuntimeError(f"relate op {r.op} is not scalar")
     raise RuntimeError(f"can't emit scalar: {e}")
 
@@ -1199,7 +1442,7 @@ def main():
     with open(src_path) as f:
         source = f.read()
 
-    concepts, bounds, memories, relates, rules = parse(source)
+    concepts, bounds, memories, relates, rules = parse(source, src_path)
     c_code = compile_to_c(concepts, bounds, memories, relates, rules, rule_name)
 
     if out_path:

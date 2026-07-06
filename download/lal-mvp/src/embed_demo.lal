@@ -1,0 +1,23 @@
+# embed_demo.lal — demonstrates loading concepts from a word2vec-format file.
+#
+# This demo uses load_word2vec() to pull concept vectors from embeddings.txt
+# at compile time. The resulting C binary has the vectors inlined — no file
+# I/O at runtime.
+
+concept cat     = load_word2vec("embeddings.txt", "cat")
+concept dog     = load_word2vec("embeddings.txt", "dog")
+concept car     = load_word2vec("embeddings.txt", "car")
+concept vehicle = load_word2vec("embeddings.txt", "vehicle")
+
+bound all_dims = [0, 1, 2, 3, 4, 5, 6, 7]
+
+relate sim(a, b) = dot(a, b) @ all_dims
+
+rule classify(query):
+    best = argmax {
+        cat:     sim(query, cat),
+        dog:     sim(query, dog),
+        car:     sim(query, car),
+        vehicle: sim(query, vehicle)
+    }
+    output(best)

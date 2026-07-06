@@ -36,6 +36,26 @@ DEMOS = [
         "test_concepts": ["alice", "bob", "carol"],
         "n_random": 10,
     },
+    {
+        "name": "embed_demo",
+        "lal": "/home/z/my-project/scripts/lal/embed_demo.lal",
+        "rule": "classify",
+        "c":   "/home/z/my-project/download/lal-mvp/src/embed_demo.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/embed_demo_x86_64",
+        "labels": ["cat", "dog", "car", "vehicle"],
+        "test_concepts": ["cat", "dog", "car", "vehicle"],
+        "n_random": 10,
+    },
+    {
+        "name": "recursion_demo",
+        "lal": "/home/z/my-project/scripts/lal/recursion_demo.lal",
+        "rule": "main",
+        "c":   "/home/z/my-project/download/lal-mvp/src/recursion_demo.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/recursion_demo_x86_64",
+        "labels": ["target", "base"],
+        "test_concepts": ["base", "target"],
+        "n_random": 10,
+    },
 ]
 
 def main():
@@ -45,7 +65,7 @@ def main():
         print(f"\n=== Demo: {demo['name']} ===")
         with open(demo["lal"]) as f:
             src = f.read()
-        concepts, bounds, memories, relates, rules = parse(src)
+        concepts, bounds, memories, relates, rules = parse(src, demo["lal"])
         cm = {c.name: c.vec for c in concepts}
         # Build
         os.makedirs(os.path.dirname(demo["bin"]), exist_ok=True)
