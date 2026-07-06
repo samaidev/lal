@@ -4,25 +4,26 @@ A logic-native language: write programs using **concept / boundary / relation** 
 
 > The core thesis: standard LLM runtimes (llama.cpp, MLC-LLM) compile a *trained model's forward pass* — every input runs the entire model. LAL instead compiles a *logic program* — only the computation the program specifies is emitted, everything else is dropped at compile time.
 
-## v0.5 — what's new
+## v0.6 — what's new
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5 |
-|---|---|---|---|---|---|
-| Operators | `dot` | + VSA | + SIMD | + if/else | + **rule guards** |
-| Rules | 1 | multiple | true recursion | + base cases | + **cleaner base cases** via guards |
-| Concept loading | literals | literals | `load_word2vec` | same | same |
-| Quantization | — | — | — | int8 | + **int4** (nibble-packed) |
-| Embedding scale | 8-dim | 8-dim | 8-dim | 300-dim | **768-dim** (BERT scale) |
-| Demos | 1 | 3 | 5 | 7 | **9** |
-| Test cases | 20 | 49 | 75 | 92 | **109** (all passing) |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5 | v0.6 |
+|---|---|---|---|---|---|---|
+| Operators | `dot` | + VSA | + SIMD | + if/else | + guards | + **pattern matching** |
+| Quantization | — | — | — | int8 | int4 | + **SIMD int4** unpack |
+| NLP | — | — | — | — | 768-dim | + **sentiment classification** |
+| Demos | 1 | 3 | 5 | 7 | 9 | **11** |
+| Test cases | 20 | 49 | 75 | 92 | 109 | **132** (all passing) |
+| Interface | CLI | CLI | CLI | CLI | CLI | + **Web playground** |
 
-### v0.5 highlights
+### v0.6 highlights
 
-1. **Rule guards** — `rule foo(x) | guard_expr:` syntax. When the guard is falsy, the rule returns the input vector unchanged (passthrough). This is cleaner than inline `if/else` ternaries for recursive base cases. The guard is checked before the body runs; if it fails, the body is skipped and the input is returned directly.
+1. **SIMD int4 unpack** — int4 quantization now uses real SIMD nibble unpacking on AVX2 (`_mm_unpacklo_epi8` + `_mm256_cvtepi8_epi32`) and NEON (`vzipq_u16` + `vmovl_s16`). Previously int4 used scalar unpack (slow). Now int4 binaries are competitive with int8 in both size and speed at 768 dims.
 
-2. **int4 quantization** — `--quantize int4` packs two int4 values per byte (nibble packing), 2x smaller than int8. The dot helper unpacks nibbles on the fly: `low = (byte & 0xF) - 8; high = (byte >> 4) - 8`. Currently uses scalar unpack (portable); SIMD nibble unpack (VNNI/SVE) is a future optimization. int4's data savings are offset by larger unpack code at small scales — best for embedded deployment with many concepts.
+2. **Multi-rule pattern matching** — define multiple rules with the same name and different guards; the compiler emits a dispatcher that tries each in order (Prolog-style). First matching guard wins. The fallback variant (no guard) always matches. Enables clean expression of multi-case logic.
 
-3. **768-dim BERT-scale demo** — `embed_768d.lal` loads 768-dimensional vectors (BERT-base hidden size). `export_bert_embeddings.py` can export real BERT embeddings (requires `transformers` library). At 768 dims, int8 quantization gives **2.1x smaller binaries** than float (data savings dominate code overhead).
+3. **Sentiment classification (real NLP)** — `sentiment_768d.lal` does binary sentiment classification at BERT scale: classifies words as positive/negative by similarity to positive/negative centroids. 14/14 test words classified correctly, including unseen test words.
+
+4. **Web playground** — a Next.js app that lets you edit .lal source in the browser, click "Compile", and see the generated C code instantly. Supports quantization mode selection (float32/int8/int4). Runs lalc in a sandboxed API route.
 
 ## The language (6 primitives)
 
@@ -90,10 +91,12 @@ $ python3 scripts/lal/verify_all.py
 === Demo: recursion_demo ===  → 12 passed
 === Demo: graph_traversal === →  9 passed
 === Demo: embed_300d ===      →  8 passed
-=== Demo: guard_demo ===      →  9 passed  (NEW: rule guards)
-=== Demo: embed_768d ===      →  8 passed  (NEW: BERT scale)
+=== Demo: guard_demo ===      →  9 passed
+=== Demo: embed_768d ===      →  8 passed
+=== Demo: pattern_match ===   →  9 passed  (NEW: multi-rule matching)
+=== Demo: sentiment_768d ===  → 14 passed  (NEW: NLP sentiment)
 
-=== TOTAL: 109 passed, 0 failed ===
+=== TOTAL: 132 passed, 0 failed ===
 [*] ALL DEMOS VERIFIED — C output matches Python reference.
 ```
 

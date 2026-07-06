@@ -1,0 +1,47 @@
+# pattern_match_demo.lal — multi-rule pattern matching (v0.6).
+#
+# Two rules with the same name "classify", each with a different guard.
+# When classify(x) is called, the dispatcher tries the first variant's guard;
+# if it matches, that variant runs. Otherwise it tries the next variant.
+# The last variant has no guard (catch-all fallback).
+#
+# This is Prolog-style pattern matching: rules are tried in definition order,
+# first match wins.
+
+concept node_a = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept node_b = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept node_c = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept terminal = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+concept start = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+
+bound all_dims = [0, 1, 2, 3, 4, 5, 6, 7]
+
+memory graph = [
+    node_a: node_b,
+    node_b: node_c,
+    node_c: terminal,
+    terminal: terminal
+]
+
+relate sim(a, b) = dot(a, b) @ all_dims
+
+# Variant 0: base case — if current is terminal, stop (return it).
+rule follow(current) | sim(current, terminal) > 0.5:
+    result = current
+    output(result)
+
+# Variant 1: recursive case — follow the edge.
+rule follow(current):
+    next = recall(graph, current)
+    result = follow(next)
+    output(result)
+
+rule main(query):
+    dest = follow(query)
+    best = argmax {
+        node_a:   sim(dest, node_a),
+        node_b:   sim(dest, node_b),
+        node_c:   sim(dest, node_c),
+        terminal: sim(dest, terminal)
+    }
+    output(best)

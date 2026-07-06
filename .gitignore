@@ -13,6 +13,8 @@ download/lal-mvp/src/embed_demo_q8.c
 download/lal-mvp/src/recursion_demo.c
 download/lal-mvp/src/graph_traversal.c
 download/lal-mvp/src/guard_demo.c
+download/lal-mvp/src/pattern_match_demo.c
+download/lal-mvp/src/sentiment_768d.c
 download/lal-mvp/src/embed_300d.c
 download/lal-mvp/src/embed_300d_q8.c
 download/lal-mvp/src/embed_300d_q4.c
@@ -33,5 +35,13 @@ skills/
 # Upload dir
 upload/
 
-# Node
+# Node / Next.js
 node_modules/
+.next/
+dev.log
+*.log
+.zscripts/
+
+# OS
+.DS_Store
+Thumbs.db

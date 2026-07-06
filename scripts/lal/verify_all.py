@@ -96,6 +96,28 @@ DEMOS = [
         "test_concepts": ["animal", "vehicle", "food", "tool", "test_dog", "test_truck", "test_banana", "test_knife"],
         "n_random": 0,
     },
+    {
+        "name": "pattern_match",
+        "lal": "/home/z/my-project/scripts/lal/pattern_match_demo.lal",
+        "rule": "main",
+        "c":   "/home/z/my-project/download/lal-mvp/src/pattern_match_demo.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/pattern_match_demo_x86_64",
+        "labels": ["node_a", "node_b", "node_c", "terminal"],
+        "test_concepts": ["node_a", "node_b", "node_c", "terminal"],
+        "n_random": 5,
+    },
+    {
+        "name": "sentiment_768d",
+        "lal": "/home/z/my-project/scripts/lal/sentiment_768d.lal",
+        "rule": "classify",
+        "c":   "/home/z/my-project/download/lal-mvp/src/sentiment_768d.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/sentiment_768d_x86_64",
+        "labels": ["positive", "negative"],
+        "test_concepts": ["pos_good", "pos_great", "pos_excellent", "pos_amazing", "pos_love",
+                          "neg_bad", "neg_terrible", "neg_awful", "neg_hate", "neg_horrible",
+                          "test_happy", "test_perfect", "test_sad", "test_worst"],
+        "n_random": 0,
+    },
 ]
 
 def main():
