@@ -5,11 +5,11 @@
 #   make arm64      — cross-compile all demos for arm64 (requires aarch64-linux-gnu-gcc)
 #   make verify     — verify all demos match Python reference
 #   make bench      — run compute-only benchmark (specialized vs generic)
+#   make quantize   — build int8-quantized versions of embed demos
 #   make clean      — remove build artifacts
 
 CC_X86      ?= gcc
 CC_ARM64    ?= aarch64-linux-gnu-gcc
-# Enable AVX2+FMA on x86 if the host supports it; fall back gracefully.
 CFLAGS_X86  ?= -O3 -Wall -Wextra -mavx2 -mfma
 CFLAGS_ARM  ?= -O3 -Wall -Wextra
 LALC        ?= python3 ../../scripts/lal/lal.py
@@ -17,7 +17,7 @@ LALC        ?= python3 ../../scripts/lal/lal.py
 SRC_DIR     := src
 BUILD_DIR   := build
 
-.PHONY: all x86 arm64 verify bench clean
+.PHONY: all x86 arm64 verify bench quantize clean
 
 all: x86
 
@@ -32,9 +32,15 @@ src/embed_demo.c: src/embed_demo.lal src/embeddings.txt
 	$(LALC) src/embed_demo.lal classify src/embed_demo.c
 src/recursion_demo.c: src/recursion_demo.lal
 	$(LALC) src/recursion_demo.lal main src/recursion_demo.c
+src/graph_traversal.c: src/graph_traversal.lal
+	$(LALC) src/graph_traversal.lal main src/graph_traversal.c
+src/embed_300d.c: src/embed_300d.lal src/embeddings_300d.txt
+	$(LALC) src/embed_300d.lal classify src/embed_300d.c
+src/embed_300d_q8.c: src/embed_300d.lal src/embeddings_300d.txt
+	$(LALC) src/embed_300d.lal classify src/embed_300d_q8.c --quantize int8
 
 # x86_64 targets
-x86: build/demo_x86_64 build/syllogism_x86_64 build/vsa_ops_x86_64 build/embed_demo_x86_64 build/recursion_demo_x86_64 build/demo_generic_x86_64
+x86: build/demo_x86_64 build/syllogism_x86_64 build/vsa_ops_x86_64 build/embed_demo_x86_64 build/recursion_demo_x86_64 build/graph_traversal_x86_64 build/embed_300d_x86_64 build/demo_generic_x86_64
 
 build/%_x86_64: src/%.c
 	@mkdir -p $(BUILD_DIR)
@@ -43,12 +49,22 @@ build/demo_generic_x86_64: src/demo_generic.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC_X86) $(CFLAGS_X86) -o $@ $<
 
-# arm64 targets (cross-compile; can't run without qemu-aarch64-static)
-arm64: build/demo_arm64 build/syllogism_arm64 build/vsa_ops_arm64 build/embed_demo_arm64 build/recursion_demo_arm64
+# arm64 targets
+arm64: build/demo_arm64 build/syllogism_arm64 build/vsa_ops_arm64 build/embed_demo_arm64 build/recursion_demo_arm64 build/graph_traversal_arm64 build/embed_300d_arm64
 
 build/%_arm64: src/%.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC_ARM64) $(CFLAGS_ARM) -o $@ $<
+
+# Quantized builds
+quantize: build/embed_300d_q8_x86_64 build/embed_demo_q8_x86_64
+
+build/embed_300d_q8_x86_64: src/embed_300d_q8.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC_X86) $(CFLAGS_X86) -o $@ $<
+build/embed_demo_q8_x86_64: src/embed_demo.lal src/embeddings.txt
+	$(LALC) src/embed_demo.lal classify src/embed_demo_q8.c --quantize int8
+	$(CC_X86) $(CFLAGS_X86) -o $@ src/embed_demo_q8.c
 
 # Verify all demos match Python reference
 verify:
@@ -59,4 +75,4 @@ bench:
 	python3 ../../scripts/lal/benchmark.py
 
 clean:
-	rm -rf $(BUILD_DIR) src/demo.c src/syllogism.c src/vsa_ops.c src/embed_demo.c src/recursion_demo.c
+	rm -rf $(BUILD_DIR) src/demo.c src/syllogism.c src/vsa_ops.c src/embed_demo.c src/embed_demo_q8.c src/recursion_demo.c src/graph_traversal.c src/embed_300d.c src/embed_300d_q8.c

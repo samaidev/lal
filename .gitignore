@@ -9,7 +9,11 @@ download/lal-mvp/src/demo.c
 download/lal-mvp/src/syllogism.c
 download/lal-mvp/src/vsa_ops.c
 download/lal-mvp/src/embed_demo.c
+download/lal-mvp/src/embed_demo_q8.c
 download/lal-mvp/src/recursion_demo.c
+download/lal-mvp/src/graph_traversal.c
+download/lal-mvp/src/embed_300d.c
+download/lal-mvp/src/embed_300d_q8.c
 
 # Python
 __pycache__/

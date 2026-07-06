@@ -4,24 +4,26 @@ A logic-native language: write programs using **concept / boundary / relation** 
 
 > The core thesis: standard LLM runtimes (llama.cpp, MLC-LLM) compile a *trained model's forward pass* — every input runs the entire model. LAL instead compiles a *logic program* — only the computation the program specifies is emitted, everything else is dropped at compile time.
 
-## v0.3 — what's new
+## v0.4 — what's new
 
-| Feature | v0.1 | v0.2 | v0.3 |
-|---|---|---|---|
-| Operators | `dot` (masked) | + `bind`/`bundle`/`permute` (VSA) | + **SIMD** (AVX2/NEON) for dot width ≥ 8 |
-| Memory | — | `memory` + `recall` | same |
-| Rules | 1 per program | multiple, inlined to depth 2 | multiple, **true C recursion** (no depth limit) |
-| Concept loading | literals only | literals only | **`load_word2vec(file, word)`** / `load_glove(...)` |
-| Demos | 1 | 3 | **5** |
-| Test cases | 20 | 49 | **75** (all passing) |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 |
+|---|---|---|---|---|
+| Operators | `dot` (masked) | + VSA ops | + SIMD | + **if/else ternary** (`cond ? a : b`) |
+| Memory | — | `memory`+`recall` | same | same |
+| Rules | 1 | multiple, inlined | true C recursion | + **recursive base cases** via if/else |
+| Concept loading | literals | literals | `load_word2vec`/`load_glove` | same |
+| Quantization | — | — | — | **`--quantize int8`** (4x smaller concept data) |
+| Embedding scale | 8-dim | 8-dim | 8-dim | **300-dim** (real word2vec scale) |
+| Demos | 1 | 3 | 5 | **7** |
+| Test cases | 20 | 49 | 75 | **92** (all passing) |
 
-### v0.3 highlights
+### v0.4 highlights
 
-1. **Real embedding loading** — `concept cat = load_word2vec("embeddings.txt", "cat")` reads the vector at compile time and inlines it. Supports word2vec text format and GloVe format (auto-detects header line).
+1. **if/else ternary** — `result = cond ? expr_true : expr_false`. Both scalar and vector branches supported. **Short-circuits** in both the Python reference interpreter and the generated C (C ternary / if-else only evaluates the taken branch). This enables **recursive base cases** — rules can now terminate recursion conditionally.
 
-2. **SIMD intrinsics** — when a dot product has width ≥ 8, the compiler emits a `_lal_dot_simd_N()` helper using AVX2 (`__m256`, `_mm256_fmadd_ps`) on x86_64 and NEON (`float32x4_t`, `vfmaq_f32`) on arm64, with a scalar fallback. Guards via `#ifdef __AVX2__` / `#ifdef __ARM_NEON__`.
+2. **int8 quantization** — `--quantize int8` flag stores concept vectors as `int8_t + scale` instead of `float`. Dot products use a specialized SIMD helper that dequantizes on the fly (`_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps` → `fmadd`). 4x smaller `.rodata` for concept data. Verified: quantized output matches float output exactly.
 
-3. **True recursion** — rule calls are now real C function calls, not inlined. Rules can call themselves or each other recursively. All transitively-reachable rules are emitted (no depth limit).
+3. **300-dim real-scale demo** — `embed_300d.lal` loads 300-dimensional vectors from a word2vec-format file with 32 words across 4 semantic clusters. Exercises the full pipeline at real embedding scale: SIMD (37 AVX2 blocks per dot), embedding loading, and classification.
 
 ## The language (6 primitives)
 
@@ -41,6 +43,7 @@ rule    name(args):
 ```
 
 Expressions support: `and`, `or`, `not`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`,
+**`cond ? a : b`** (if/else ternary, short-circuits),
 relation calls, **rule calls** (real recursion), **`recall(memory, query)`** (soft lookup),
 and `argmax { label: expr, ... }`.
 
@@ -55,24 +58,32 @@ and `argmax { label: expr, ... }`.
 ### 3. `vsa_ops.lal` — VSA operators (v0.2)
 Exercises `bind`, `bundle`, `permute` directly.
 
-### 4. `embed_demo.lal` — embedding loading (v0.3, NEW)
+### 4. `embed_demo.lal` — embedding loading (v0.3)
 Loads concept vectors from `embeddings.txt` via `load_word2vec()`. Also exercises SIMD (width-8 dots).
 
-### 5. `recursion_demo.lal` — true recursion (v0.3, NEW)
-A rule that chains through `shift_once` → `shift_twice` → `shift_thrice` via real C function calls. Proves recursion works without inlining.
+### 5. `recursion_demo.lal` — true recursion (v0.3)
+Chains through `shift_once` → `shift_twice` → `shift_thrice` via real C function calls.
+
+### 6. `graph_traversal.lal` — recursive graph traversal with if/else (v0.4, NEW)
+Follows a pointer chain in memory: `a→b→c→terminal`. Uses `if/else` ternary for the base case (`sim(current, terminal) > 0.5 ? current : follow(next)`). Proves that if/else enables true finite recursion with base cases.
+
+### 7. `embed_300d.lal` — 300-dim real-scale classification (v0.4, NEW)
+Loads 300-dimensional vectors from `embeddings_300d.txt` (32 words, 4 clusters). Exercises SIMD at real scale (37 AVX2 blocks per dot product). Can be compiled with `--quantize int8` for 4x smaller concept data.
 
 ## Verification
 
 ```
 $ python3 scripts/lal/verify_all.py
 
-=== Demo: demo ===          → 20 passed
-=== Demo: syllogism ===     → 16 passed
-=== Demo: vsa_ops ===       → 13 passed
-=== Demo: embed_demo ===    → 14 passed  (NEW)
-=== Demo: recursion_demo ===→ 12 passed  (NEW)
+=== Demo: demo ===            → 20 passed
+=== Demo: syllogism ===       → 16 passed
+=== Demo: vsa_ops ===         → 13 passed
+=== Demo: embed_demo ===      → 14 passed
+=== Demo: recursion_demo ===  → 12 passed
+=== Demo: graph_traversal === →  9 passed  (NEW: if/else recursion)
+=== Demo: embed_300d ===      →  8 passed  (NEW: 300-dim real scale)
 
-=== TOTAL: 75 passed, 0 failed ===
+=== TOTAL: 92 passed, 0 failed ===
 [*] ALL DEMOS VERIFIED — C output matches Python reference.
 ```
 

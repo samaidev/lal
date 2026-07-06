@@ -1,0 +1,46 @@
+# graph_traversal.lal — recursive graph traversal with if/else base case (v0.4).
+#
+# This demo proves that if/else enables TRUE finite recursion:
+#   - A memory stores a directed graph: a→b→c→terminal→terminal
+#   - The rule `follow` starts at a node and follows edges until it reaches
+#     `terminal`, then stops (base case).
+# - Without if/else, this would loop forever. With if/else, the base case
+#   short-circuits the recursion.
+
+concept node_a = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept node_b = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept node_c = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+concept terminal = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+
+bound all_dims = [0, 1, 2, 3, 4, 5, 6, 7]
+
+memory graph = [
+    node_a: node_b,
+    node_b: node_c,
+    node_c: terminal,
+    terminal: terminal
+]
+
+relate sim(a, b) = dot(a, b) @ all_dims
+
+# Recursive rule: follow the graph until we reach `terminal`.
+# Base case: if current node is terminal, return it.
+# Recursive case: look up the next node and recurse.
+rule follow(current):
+    # if/else ternary: scalar condition, vector branches.
+    # The C code short-circuits — the recursive call only executes when
+    # the condition is false (i.e., current is NOT terminal).
+    next = recall(graph, current)
+    result = sim(current, terminal) > 0.5 ? current : follow(next)
+    output(result)
+
+rule main(query):
+    dest = follow(query)
+    # Which node did we end up at?
+    best = argmax {
+        node_a:   sim(dest, node_a),
+        node_b:   sim(dest, node_b),
+        node_c:   sim(dest, node_c),
+        terminal: sim(dest, terminal)
+    }
+    output(best)

@@ -283,11 +283,23 @@ class _ExprParser:
         return float(self.s[start:self.i])
 
     def parse(self) -> Expr:
-        e = self.parse_or()
+        e = self.parse_ternary()
         self._skip_ws()
         if self.i < self.n:
             raise ParseError(f"trailing content at pos {self.i}: {self.s[self.i:]!r}")
         return e
+
+    def parse_ternary(self) -> Expr:
+        """ternary := or_expr ('?' or_expr ':' ternary)?
+        Emits ECall('if', [cond, true_expr, false_expr]).
+        Right-associative. Short-circuits in both reference interpreter and C."""
+        cond = self.parse_or()
+        if self._match("?"):
+            true_expr = self.parse_or()
+            self._expect(":")
+            false_expr = self.parse_ternary()  # right-assoc
+            return ECall("if", [cond, true_expr, false_expr])
+        return cond
 
     def parse_or(self) -> Expr:
         left = self.parse_and()
@@ -348,7 +360,7 @@ class _ExprParser:
         c = self.s[self.i]
         if c == "(":
             self._expect("(")
-            e = self.parse_or()
+            e = self.parse_ternary()
             self._expect(")")
             return e
 
@@ -362,7 +374,7 @@ class _ExprParser:
                 self._expect("(")
                 mem_name = self._read_ident()
                 self._expect(",")
-                query = self.parse_or()
+                query = self.parse_ternary()
                 self._expect(")")
                 return ERecall(mem_name, query)
             # function call?
@@ -370,9 +382,9 @@ class _ExprParser:
                 self._expect("(")
                 args = []
                 if self._peek() != ")":
-                    args.append(self.parse_or())
+                    args.append(self.parse_ternary())
                     while self._match(","):
-                        args.append(self.parse_or())
+                        args.append(self.parse_ternary())
                 self._expect(")")
                 return ECall(name, args)
             return EVar(name)
@@ -387,7 +399,7 @@ class _ExprParser:
         while True:
             label = self._read_ident()
             self._expect(":")
-            expr = self.parse_or()
+            expr = self.parse_ternary()
             items.append((label, expr))
             if self._match(","):
                 continue
@@ -681,6 +693,15 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
         if isinstance(e, ECall):
             if e.func == "dot":
                 raise RuntimeError("bare dot — must be inside a relate")
+            # 'if' (ternary) must short-circuit: only evaluate the taken branch.
+            # This is critical for recursion — the false branch may contain a
+            # recursive call that would loop forever if evaluated eagerly.
+            if e.func == "if":
+                cond = ev(e.args[0])
+                if float(cond) != 0.0:
+                    return ev(e.args[1])
+                else:
+                    return ev(e.args[2])
             args = [ev(a) for a in e.args]
             if e.func == "and":
                 return float(args[0]) * float(args[1])
@@ -769,10 +790,17 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
 # Global set of SIMD dot-product widths needed in the current compilation.
 # Reset at the start of each compile_to_c() call.
 _SIMD_HELPERS_NEEDED: Set[int] = set()
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2) -> str:
-    """Compile a rule (and any rules it calls, up to max_recursion_depth) to specialized C."""
-    global _SIMD_HELPERS_NEEDED
+# Global quantization mode: None (float32) or "int8".
+_QUANTIZE_MODE = None
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None) -> str:
+    """Compile a rule (and any rules it calls) to specialized C.
+
+    quantize: None for float32, or "int8" to store concept vectors as int8 + scale
+              (4x smaller .rodata, with runtime dequantization in the dot helper).
+    """
+    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE
     _SIMD_HELPERS_NEEDED = set()  # reset for this compilation
+    _QUANTIZE_MODE = quantize
 
     concept_map = {c.name: c.vec for c in concepts}
     bound_map = {b.name: b.dims for b in bounds}
@@ -811,6 +839,7 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     lines.append("#include <stdio.h>")
     lines.append("#include <stdlib.h>")
     lines.append("#include <string.h>")
+    lines.append("#include <stdint.h>")  # int8_t for quantization
     lines.append("#if defined(__AVX2__) || defined(__AVX__)")
     lines.append("#include <immintrin.h>")
     lines.append("#elif defined(__ARM_NEON) || defined(__ARM_NEON__)")
@@ -838,8 +867,18 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
         for c in sorted(concepts, key=lambda x: x.name):
             if c.name not in concepts_needing_full:
                 continue
-            arr = ", ".join(f"{v:.6f}f" for v in c.vec)
-            lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr}}};")
+            if _QUANTIZE_MODE == "int8":
+                q, scale = _quantize_int8(c.vec)
+                arr = ", ".join(str(x) for x in q)
+                lines.append(f"static const int8_t concept_{c.name}_q[{len(c.vec)}] = {{{arr}}};")
+                lines.append(f"static const float concept_{c.name}_scale = {scale:.8f}f;")
+                # Also emit a float version for VSA ops / recall (which need float vectors).
+                # This doubles storage for concepts used by VSA/recall, but keeps dots fast.
+                arr_f = ", ".join(f"{v:.6f}f" for v in c.vec)
+                lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr_f}}};")
+            else:
+                arr = ", ".join(f"{v:.6f}f" for v in c.vec)
+                lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr}}};")
         lines.append("")
 
     # Emit masked concept arrays for bounded dot products.
@@ -855,8 +894,14 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             cvec = concept_map[cname]
             dims = bound_map[bname]
             vals = [cvec[d] for d in dims]
-            arr = ", ".join(f"{v:.6f}f" for v in vals)
-            lines.append(f"static const float {cname}__{bname}[{len(dims)}] = {{{arr}}};")
+            if _QUANTIZE_MODE == "int8":
+                q, scale = _quantize_int8(vals)
+                arr = ", ".join(str(x) for x in q)
+                lines.append(f"static const int8_t {cname}__{bname}_q[{len(dims)}] = {{{arr}}};")
+                lines.append(f"static const float {cname}__{bname}_scale = {scale:.8f}f;")
+            else:
+                arr = ", ".join(f"{v:.6f}f" for v in vals)
+                lines.append(f"static const float {cname}__{bname}[{len(dims)}] = {{{arr}}};")
         lines.append("")
 
     # Pre-scan all rule bodies to collect SIMD dot widths needed.
@@ -872,6 +917,8 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
         lines.append(" * Compiled in only when the target supports them; scalar fallback otherwise. */")
         for width in sorted(_SIMD_HELPERS_NEEDED):
             lines.extend(_emit_simd_dot_helper(width))
+            if _QUANTIZE_MODE == "int8":
+                lines.extend(_emit_simd_qdot_helper(width))
         lines.append("")
 
     # Forward-declare all rules being emitted.
@@ -1094,9 +1141,9 @@ def _emit_simd_dot_helper(width: int) -> List[str]:
         lines.append(f"    {{")
         lines.append(f"        __m256 acc = _mm256_setzero_ps();")
         for k in range(n_avx):
-            lines.append(f"        __m256 va = _mm256_loadu_ps(a + {k*8});")
-            lines.append(f"        __m256 vb = _mm256_loadu_ps(b + {k*8});")
-            lines.append(f"        acc = _mm256_fmadd_ps(va, vb, acc);")
+            lines.append(f"        __m256 va_{k} = _mm256_loadu_ps(a + {k*8});")
+            lines.append(f"        __m256 vb_{k} = _mm256_loadu_ps(b + {k*8});")
+            lines.append(f"        acc = _mm256_fmadd_ps(va_{k}, vb_{k}, acc);")
         lines.append(f"        __m128 lo = _mm256_castps256_ps128(acc);")
         lines.append(f"        __m128 hi = _mm256_extractf128_ps(acc, 1);")
         lines.append(f"        __m128 s = _mm_add_ps(lo, hi);")
@@ -1122,9 +1169,9 @@ def _emit_simd_dot_helper(width: int) -> List[str]:
         lines.append(f"    {{")
         lines.append(f"        float32x4_t acc = vdupq_n_f32(0.0f);")
         for k in range(total_neon):
-            lines.append(f"        float32x4_t va = vld1q_f32(a + {k*4});")
-            lines.append(f"        float32x4_t vb = vld1q_f32(b + {k*4});")
-            lines.append(f"        acc = vfmaq_f32(acc, va, vb);")
+            lines.append(f"        float32x4_t va_{k} = vld1q_f32(a + {k*4});")
+            lines.append(f"        float32x4_t vb_{k} = vld1q_f32(b + {k*4});")
+            lines.append(f"        acc = vfmaq_f32(acc, va_{k}, vb_{k});")
         lines.append(f"        float tmp[4]; vst1q_f32(tmp, acc);")
         lines.append(f"        result = tmp[0] + tmp[1] + tmp[2] + tmp[3];")
         offset = total_neon * 4
@@ -1144,6 +1191,97 @@ def _emit_simd_dot_helper(width: int) -> List[str]:
     lines.append(f"    return result;")
     lines.append(f"}}")
     return lines
+
+
+def _emit_simd_qdot_helper(width: int) -> List[str]:
+    """Emit a SIMD dot-product helper: float[N] × int8[N]+scale → float.
+
+    Used when quantize='int8'. The concept is stored as int8 + scale; the query
+    is float. The helper dequantizes the int8 vector on the fly and does the dot.
+    """
+    lines = []
+    lines.append(f"/* quantized dot: float[{width}] × int8[{width}]*scale — SIMD dequantize */")
+    lines.append(f"static inline float _lal_dot_qsimd_{width}(const float* a, const int8_t* b_q, float b_scale) {{")
+    lines.append(f"    float result = 0.0f;")
+
+    n_avx = width // 8
+    rem_after_avx = width % 8
+    total_neon = width // 4
+    rem_neon = width % 4
+
+    # AVX2 path: load int8, widen to int32, convert to float, scale, then fmadd
+    lines.append(f"#if defined(__AVX2__) || defined(__AVX__)")
+    if n_avx > 0:
+        lines.append(f"    {{")
+        lines.append(f"        __m256 acc = _mm256_setzero_ps();")
+        for k in range(n_avx):
+            # Load 8 int8, widen to 8 int32, convert to float
+            lines.append(f"        __m128i bi8_{k} = _mm_loadl_epi64((const __m128i*)(b_q + {k*8}));")
+            lines.append(f"        __m256i bi32_{k} = _mm256_cvtepi8_epi32(bi8_{k});")
+            lines.append(f"        __m256 bf_{k} = _mm256_cvtepi32_ps(bi32_{k});")
+            lines.append(f"        __m256 bs_{k} = _mm256_mul_ps(bf_{k}, _mm256_set1_ps(b_scale));")
+            lines.append(f"        __m256 va_{k} = _mm256_loadu_ps(a + {k*8});")
+            lines.append(f"        acc = _mm256_fmadd_ps(va_{k}, bs_{k}, acc);")
+        lines.append(f"        __m128 lo = _mm256_castps256_ps128(acc);")
+        lines.append(f"        __m128 hi = _mm256_extractf128_ps(acc, 1);")
+        lines.append(f"        __m128 s = _mm_add_ps(lo, hi);")
+        lines.append(f"        s = _mm_hadd_ps(s, s);")
+        lines.append(f"        s = _mm_hadd_ps(s, s);")
+        lines.append(f"        result = _mm_cvtss_f32(s);")
+        offset = n_avx * 8
+        for k in range(rem_after_avx):
+            lines.append(f"        result += a[{offset+k}] * ((float)b_q[{offset+k}] * b_scale);")
+        lines.append(f"    }}")
+    else:
+        for k in range(width):
+            lines.append(f"    result += a[{k}] * ((float)b_q[{k}] * b_scale);")
+
+    # NEON path
+    lines.append(f"#elif defined(__ARM_NEON) || defined(__ARM_NEON__)")
+    if total_neon > 0:
+        lines.append(f"    {{")
+        lines.append(f"        float32x4_t acc = vdupq_n_f32(0.0f);")
+        for k in range(total_neon):
+            # Load 4 int8, widen to int32, convert to float
+            lines.append(f"        int8x8_t bi8_{k} = vld1_s8(b_q + {k*4});")
+            lines.append(f"        int32x4_t bi32_{k} = vmovl_s16(vget_low_s16(vmovl_s8(bi8_{k})));")
+            lines.append(f"        float32x4_t bf_{k} = vcvtq_f32_s32(bi32_{k});")
+            lines.append(f"        float32x4_t bs_{k} = vmulq_n_f32(bf_{k}, b_scale);")
+            lines.append(f"        float32x4_t va_{k} = vld1q_f32(a + {k*4});")
+            lines.append(f"        acc = vfmaq_f32(acc, va_{k}, bs_{k});")
+        lines.append(f"        float tmp[4]; vst1q_f32(tmp, acc);")
+        lines.append(f"        result = tmp[0] + tmp[1] + tmp[2] + tmp[3];")
+        offset = total_neon * 4
+        for k in range(rem_neon):
+            lines.append(f"        result += a[{offset+k}] * ((float)b_q[{offset+k}] * b_scale);")
+        lines.append(f"    }}")
+    else:
+        for k in range(width):
+            lines.append(f"    result += a[{k}] * ((float)b_q[{k}] * b_scale);")
+
+    # Scalar fallback
+    lines.append(f"#else")
+    for k in range(width):
+        lines.append(f"    result += a[{k}] * ((float)b_q[{k}] * b_scale);")
+    lines.append(f"#endif")
+
+    lines.append(f"    return result;")
+    lines.append(f"}}")
+    return lines
+
+
+def _quantize_int8(vec: List[float]) -> Tuple[List[int], float]:
+    """Quantize a float vector to int8 with a per-vector scale.
+    Returns (int8_values, scale) where dequantized[i] = int8[i] * scale.
+    """
+    max_abs = max(abs(v) for v in vec) if vec else 0.0
+    if max_abs < 1e-9:
+        return [0] * len(vec), 0.0
+    scale = max_abs / 127.0
+    q = [int(round(v / scale)) for v in vec]
+    # Clamp to int8 range
+    q = [max(-128, min(127, x)) for x in q]
+    return q, scale
 
 
 def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth):
@@ -1218,11 +1356,22 @@ def _expr_is_vector(expr, relate_map, rule_map):
     if isinstance(expr, ERecall):
         return True
     if isinstance(expr, ECall):
+        if e_func_name(expr) == "if":
+            # ternary: vector if either branch is a vector
+            t = _expr_is_vector(expr.args[1], relate_map, rule_map)
+            f = _expr_is_vector(expr.args[2], relate_map, rule_map)
+            return t or f
         # arithmetic on scalars stays scalar
         return False
     if isinstance(expr, EFloat) or isinstance(expr, EVar):
         return False
     return False
+
+def e_func_name(call_expr):
+    """Helper: get the function name from an ECall (or None)."""
+    if isinstance(call_expr, ECall):
+        return call_expr.func
+    return None
 
 
 def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth):
@@ -1234,6 +1383,12 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
     if isinstance(e, ECall):
         if e.func == "dot":
             raise RuntimeError("bare dot — must be inside a relate")
+        # 'if' ternary: scalar case → emit C ternary (short-circuits in C too)
+        if e.func == "if":
+            cond_str = _emit_scalar_expr(e.args[0], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+            true_str = _emit_scalar_expr(e.args[1], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+            false_str = _emit_scalar_expr(e.args[2], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+            return "float", f"(({cond_str}) ? ({true_str}) : ({false_str}))"
         arg_strs = [_emit_scalar_expr(a, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1] for a in e.args]
         if e.func == "and":
             return "float", f"({arg_strs[0]} * {arg_strs[1]})"
@@ -1270,31 +1425,35 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
             if r.bound_name:
                 dims = bound_map[r.bound_name]
                 width = len(dims)
-                # Use SIMD only if width >= 8 AND dims are contiguous (start at 0, step 1).
-                # For non-contiguous bounds, the masked arrays aren't contiguous in the
-                # original vector, so SIMD on them is still valid (they're their own arrays).
-                # Actually the masked arrays ARE contiguous (we extract them into separate arrays).
-                # So we can SIMD on masked arrays too, as long as width >= 8.
                 if width >= 8:
-                    # Emit a call to the SIMD dot helper.
                     if is_param:
                         a_expr = f"{var_name}__{r.bound_name}"
-                        b_expr = f"{concept_name}__{r.bound_name}"
                     elif is_local_vec:
-                        # Local vector indexed at bound dims — need a temp contiguous array.
-                        # Fall back to scalar for local vectors with bounds (rare case).
-                        terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        # Local vector indexed at bound dims — fall back to scalar
+                        if _QUANTIZE_MODE == "int8":
+                            terms = [f"{var_name}[{d}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
+                        else:
+                            terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
                         return "float", "(" + " + ".join(terms) + ")"
                     else:
                         raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
-                    # Register that we need a SIMD helper of this width.
                     _SIMD_HELPERS_NEEDED.add(width)
-                    return "float", f"_lal_dot_simd_{width}({a_expr}, {b_expr})"
+                    if _QUANTIZE_MODE == "int8":
+                        return "float", f"_lal_dot_qsimd_{width}({a_expr}, {concept_name}__{r.bound_name}_q, {concept_name}__{r.bound_name}_scale)"
+                    else:
+                        b_expr = f"{concept_name}__{r.bound_name}"
+                        return "float", f"_lal_dot_simd_{width}({a_expr}, {b_expr})"
                 else:
                     if is_param:
-                        terms = [f"{var_name}__{r.bound_name}[{k}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        if _QUANTIZE_MODE == "int8":
+                            terms = [f"{var_name}__{r.bound_name}[{k}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
+                        else:
+                            terms = [f"{var_name}__{r.bound_name}[{k}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
                     elif is_local_vec:
-                        terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
+                        if _QUANTIZE_MODE == "int8":
+                            terms = [f"{var_name}[{d}] * ((float){concept_name}__{r.bound_name}_q[{k}] * {concept_name}__{r.bound_name}_scale)" for k, d in enumerate(dims)]
+                        else:
+                            terms = [f"{var_name}[{d}] * {concept_name}__{r.bound_name}[{k}]" for k, d in enumerate(dims)]
                     else:
                         raise RuntimeError(f"relate dot var {var_name} is neither param nor local vector")
                     return "float", "(" + " + ".join(terms) + ")"
@@ -1303,9 +1462,15 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
                 width = len(concept_map[concept_name])
                 if width >= 8:
                     _SIMD_HELPERS_NEEDED.add(width)
-                    return "float", f"_lal_dot_simd_{width}({var_name}, concept_{concept_name})"
+                    if _QUANTIZE_MODE == "int8":
+                        return "float", f"_lal_dot_qsimd_{width}({var_name}, concept_{concept_name}_q, concept_{concept_name}_scale)"
+                    else:
+                        return "float", f"_lal_dot_simd_{width}({var_name}, concept_{concept_name})"
                 else:
-                    terms = [f"{var_name}[{d}] * concept_{concept_name}[{d}]" for d in range(width)]
+                    if _QUANTIZE_MODE == "int8":
+                        terms = [f"{var_name}[{d}] * ((float)concept_{concept_name}_q[{d}] * concept_{concept_name}_scale)" for d in range(width)]
+                    else:
+                        terms = [f"{var_name}[{d}] * concept_{concept_name}[{d}]" for d in range(width)]
                     return "float", "(" + " + ".join(terms) + ")"
         raise RuntimeError(f"relate op {r.op} is not scalar")
     raise RuntimeError(f"can't emit scalar: {e}")
@@ -1398,6 +1563,21 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
             lines.append(f"        {target_var}[{d}] = ({' + '.join(terms)}) / __total_weight;")
         lines.append(f"    }}")
         return
+    if isinstance(e, ECall) and e.func == "if":
+        # Vector ternary: emit if/else block, writing into target_var.
+        cond_str = _emit_scalar_expr(e.args[0], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+        lines.append(f"    if ({cond_str}) {{")
+        _emit_vector_expr(lines, target_var, e.args[1], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth, vec_dim)
+        lines.append(f"    }} else {{")
+        _emit_vector_expr(lines, target_var, e.args[2], concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth, vec_dim)
+        lines.append(f"    }}")
+        return
+    # Bare vector variable or concept ref: copy into target_var.
+    if isinstance(e, EVar):
+        src = _resolve_vec_arg(e, concept_names, rule_params, var_types)
+        for i in range(vec_dim):
+            lines.append(f"    {target_var}[{i}] = {src}[{i}];")
+        return
     raise RuntimeError(f"can't emit vector expr: {e}")
 
 
@@ -1432,24 +1612,28 @@ def _emit_argmax(lines, out_var, expr, concept_map, bound_map, memory_map, relat
 # =============================================================================
 
 def main():
-    if len(sys.argv) < 3:
-        print("usage: lal.py <input.lal> <rule_name> [output.c]")
-        sys.exit(1)
-    src_path = sys.argv[1]
-    rule_name = sys.argv[2]
-    out_path = sys.argv[3] if len(sys.argv) > 3 else None
+    import argparse
+    ap = argparse.ArgumentParser(description="LAL compiler: .lal → specialized C")
+    ap.add_argument("input", help="input .lal file")
+    ap.add_argument("rule", help="entry rule name")
+    ap.add_argument("output", nargs="?", help="output .c file (default: stdout)")
+    ap.add_argument("--quantize", choices=["int8"], default=None,
+                    help="quantize concept vectors to int8 (4x smaller .rodata)")
+    args = ap.parse_args()
 
-    with open(src_path) as f:
+    with open(args.input) as f:
         source = f.read()
 
-    concepts, bounds, memories, relates, rules = parse(source, src_path)
-    c_code = compile_to_c(concepts, bounds, memories, relates, rules, rule_name)
+    concepts, bounds, memories, relates, rules = parse(source, args.input)
+    c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule, quantize=args.quantize)
 
-    if out_path:
-        with open(out_path, "w") as f:
+    if args.output:
+        with open(args.output, "w") as f:
             f.write(c_code)
-        print(f"[*] compiled {src_path} rule '{rule_name}' -> {out_path}")
+        print(f"[*] compiled {args.input} rule '{args.rule}' -> {args.output}")
         print(f"    concepts: {len(concepts)}, bounds: {len(bounds)}, memories: {len(memories)}, relates: {len(relates)}, rules: {len(rules)}")
+        if args.quantize:
+            print(f"    quantization: {args.quantize}")
     else:
         print(c_code)
 

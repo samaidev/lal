@@ -56,6 +56,26 @@ DEMOS = [
         "test_concepts": ["base", "target"],
         "n_random": 10,
     },
+    {
+        "name": "graph_traversal",
+        "lal": "/home/z/my-project/scripts/lal/graph_traversal.lal",
+        "rule": "main",
+        "c":   "/home/z/my-project/download/lal-mvp/src/graph_traversal.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/graph_traversal_x86_64",
+        "labels": ["node_a", "node_b", "node_c", "terminal"],
+        "test_concepts": ["node_a", "node_b", "node_c", "terminal"],
+        "n_random": 5,
+    },
+    {
+        "name": "embed_300d",
+        "lal": "/home/z/my-project/scripts/lal/embed_300d.lal",
+        "rule": "classify",
+        "c":   "/home/z/my-project/download/lal-mvp/src/embed_300d.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/embed_300d_x86_64",
+        "labels": ["animal", "vehicle", "food", "tool"],
+        "test_concepts": ["animal", "vehicle", "food", "tool", "test_dog", "test_truck", "test_banana", "test_knife"],
+        "n_random": 0,  # 300-dim random vectors aren't meaningful
+    },
 ]
 
 def main():
@@ -69,7 +89,7 @@ def main():
         cm = {c.name: c.vec for c in concepts}
         # Build
         os.makedirs(os.path.dirname(demo["bin"]), exist_ok=True)
-        r = subprocess.run(["gcc", "-O3", "-o", demo["bin"], demo["c"]], capture_output=True, text=True)
+        r = subprocess.run(["gcc", "-O3", "-mavx2", "-mfma", "-o", demo["bin"], demo["c"]], capture_output=True, text=True)
         if r.returncode != 0:
             print(f"[!] build failed: {r.stderr}"); sys.exit(1)
         # Test
