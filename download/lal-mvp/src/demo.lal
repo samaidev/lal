@@ -1,0 +1,43 @@
+# demo.lal — a minimal LAL program demonstrating logic-native compilation
+#
+# Task: given an 8-dim query vector, classify it as {cat, dog, car, vehicle}
+#       using masked similarity.
+#
+# The key insight: BOUNDs let us declare "which dimensions matter for which
+# kind of question". The compiler then drops the other dimensions entirely,
+# so the resulting C code is smaller and faster than a generic dot-product
+# over all dims.
+
+# === Concepts (8-dim vectors) ===
+# These would normally come from a trained embedding; here we use hand-crafted
+# values so the demo is reproducible without any model file.
+concept cat     = [1.0, 0.1, 0.2, 0.7, 0.3, 0.5, 0.8, 0.2]
+concept dog     = [0.8, 0.2, 0.3, 0.6, 0.4, 0.4, 0.7, 0.3]
+concept car     = [0.1, 0.9, 0.8, 0.1, 0.7, 0.2, 0.1, 0.6]
+concept vehicle = [0.0, 0.9, 0.9, 0.0, 0.6, 0.1, 0.0, 0.7]
+
+# === Bounds (which dims to use for which kind of similarity) ===
+# Animals are similar on dims {0, 2, 3, 6} — these encode "animacy" features
+# Machines are similar on dims {1, 2, 4, 7} — these encode "artifact" features
+# Note dim 2 is shared (it's a "size" feature that both use)
+bound animal_dims  = [0, 2, 3, 6]
+bound machine_dims = [1, 2, 4, 7]
+
+# === Relations ===
+# "animal similarity" = dot product restricted to animal_dims
+# "machine similarity" = dot product restricted to machine_dims
+relate animal_sim(a, b)  = dot(a, b) @ animal_dims
+relate machine_sim(a, b) = dot(a, b) @ machine_dims
+
+# === Rule ===
+# Input: a query vector (8-dim)
+# Output: an int in {0, 1, 2, 3} — index of the best-matching concept.
+#         Each candidate is scored using the *appropriate* bound for its category.
+rule classify(query):
+    best = argmax {
+        cat:     animal_sim(query, cat),
+        dog:     animal_sim(query, dog),
+        car:     machine_sim(query, car),
+        vehicle: machine_sim(query, vehicle)
+    }
+    output(best)
