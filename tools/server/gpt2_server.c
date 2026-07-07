@@ -744,12 +744,21 @@ static float  g_final_ln[N_EMBD];
 /* KV cache for real causal self-attention.
  * Per layer: K and V for all positions [n_ctx, n_embd].
  * Total: 12 layers × 2 (K+V) × 1024 × 768 × 4 bytes = 72 MB.
- * Only allocated if --real-attention flag is set. */
-static float *g_k_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
-static float *g_v_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
+ * Only allocated if --real-attention flag is set.
+ *
+ * TurboQuant: when --turboquant is set, KV cache is stored as int8 + per-row
+ * scale (4x compression: 72MB → 18MB). K/V are quantized on write and
+ * dequantized on read in the attention functions. Based on Google Research's
+ * TurboQuant technique for KV cache compression. */
+static float *g_k_cache[N_LAYER];       /* [n_ctx, n_embd] per layer (float mode) */
+static float *g_v_cache[N_LAYER];       /* [n_ctx, n_embd] per layer (float mode) */
+static int8_t *g_k_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode) */
+static int8_t *g_v_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode) */
+static float  *g_k_scale[N_LAYER];     /* [n_ctx] per-row scale for K (turboquant) */
+static float  *g_v_scale[N_LAYER];     /* [n_ctx] per-row scale for V (turboquant) */
 static int    g_use_real_attention = 0;  /* set by --real-attention */
 static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attention) */
-static int    g_use_turboquant = 0;     /* set by --turboquant (runtime int8 quant) */
+static int    g_use_turboquant = 0;     /* set by --turboquant (KV cache int8 quant) */
 static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
 static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
 static float  g_top_p = 0.0f;           /* top-p (nucleus) sampling, 0=off; applied after top-k */
@@ -810,6 +819,30 @@ static int prune_cmp_idx_asc(const void *a, const void *b) {
  *
  * This replaces the broken "attn_out = V" shortcut that caused
  * repetitive outputs like "fox fox fox fox...". */
+/* TurboQuant helpers: quantize/dequantize a row of n_embd floats to int8.
+ * scale = max(abs(x)) / 127, then int8 = round(x / scale). */
+static float turboquant_quantize(int8_t *out, const float *in, int n) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(in[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = max_abs / 127.0f;
+    if (scale < 1e-8f) scale = 1e-8f;
+    float inv_scale = 1.0f / scale;
+    for (int i = 0; i < n; i++) {
+        int v = (int)(in[i] * inv_scale);
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        out[i] = (int8_t)v;
+    }
+    return scale;
+}
+
+static void turboquant_dequantize(float *out, const int8_t *in, float scale, int n) {
+    for (int i = 0; i < n; i++) out[i] = (float)in[i] * scale;
+}
+
 /* DFlash (Dynamic Flash Attention) — FlashAttention-style tiled KV.
  *
  * Key difference from real_attention: instead of materializing the full
@@ -824,37 +857,62 @@ static int prune_cmp_idx_asc(const void *a, const void *b) {
  * For very long sequences (>512), this also enables tiling: process K/V
  * in blocks of 64 positions to fit in L1 cache. */
 static void dflash_attention(float *attn_out, const float *qkv,
-                             int position, float *k_cache_layer, float *v_cache_layer) {
+                             int position, int layer_idx) {
     int n_head = N_HEAD;
     int head_dim = N_EMBD / n_head;  /* 64 */
     float scale = 1.0f / sqrtf((float)head_dim);
     int seq_len = position + 1;
+    int use_tq = g_use_turboquant && g_k_cache_q[layer_idx];
 
     const float *Q = qkv;
     const float *K_new = qkv + N_EMBD;
     const float *V_new = qkv + 2*N_EMBD;
 
-    /* Store current K, V into cache */
-    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
-    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+    /* Store current K, V into cache (quantize if turboquant) */
+    if (use_tq) {
+        g_k_scale[layer_idx][position] = turboquant_quantize(
+            g_k_cache_q[layer_idx] + (size_t)position * N_EMBD, K_new, N_EMBD);
+        g_v_scale[layer_idx][position] = turboquant_quantize(
+            g_v_cache_q[layer_idx] + (size_t)position * N_EMBD, V_new, N_EMBD);
+    } else {
+        memcpy(g_k_cache[layer_idx] + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
+        memcpy(g_v_cache[layer_idx] + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+    }
+
+    /* Temporary buffer for dequantized row (turboquant only) */
+    float k_row[N_EMBD], v_row[N_EMBD];
 
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
 
-        /* Pass 1: compute max_score and sum_exp without storing scores[] */
+        /* Pass 1: find max_score */
         float max_score = -1e30f;
-        /* First sub-pass: find max */
         for (int j = 0; j < seq_len; j++) {
-            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *K_jh;
+            if (use_tq) {
+                turboquant_dequantize(k_row, g_k_cache_q[layer_idx] + (size_t)j * N_EMBD,
+                                      g_k_scale[layer_idx][j], N_EMBD);
+                K_jh = k_row + h * head_dim;
+            } else {
+                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+            }
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
             dot *= scale;
             if (dot > max_score) max_score = dot;
         }
+
         /* Compute sum_exp */
         float sum_exp = 0.0f;
         for (int j = 0; j < seq_len; j++) {
-            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *K_jh;
+            if (use_tq) {
+                turboquant_dequantize(k_row, g_k_cache_q[layer_idx] + (size_t)j * N_EMBD,
+                                      g_k_scale[layer_idx][j], N_EMBD);
+                K_jh = k_row + h * head_dim;
+            } else {
+                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+            }
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
             dot *= scale;
@@ -862,16 +920,31 @@ static void dflash_attention(float *attn_out, const float *qkv,
         }
         float inv_sum = 1.0f / (sum_exp + 1e-12f);
 
-        /* Pass 2: accumulate V with softmax weights (recompute scores) */
+        /* Pass 2: accumulate V */
         float *out_h = attn_out + h * head_dim;
         for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
         for (int j = 0; j < seq_len; j++) {
-            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *K_jh;
+            if (use_tq) {
+                turboquant_dequantize(k_row, g_k_cache_q[layer_idx] + (size_t)j * N_EMBD,
+                                      g_k_scale[layer_idx][j], N_EMBD);
+                K_jh = k_row + h * head_dim;
+            } else {
+                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+            }
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
             dot *= scale;
             float weight = expf(dot - max_score) * inv_sum;
-            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+
+            const float *V_jh;
+            if (use_tq) {
+                turboquant_dequantize(v_row, g_v_cache_q[layer_idx] + (size_t)j * N_EMBD,
+                                      g_v_scale[layer_idx][j], N_EMBD);
+                V_jh = v_row + h * head_dim;
+            } else {
+                V_jh = g_v_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+            }
             for (int d = 0; d < head_dim; d++) out_h[d] += weight * V_jh[d];
         }
     }
@@ -1019,8 +1092,7 @@ static int gpt2_forward_token(int token_id, int position) {
             /* Attention: dflash (tiled) > real_attention (standard) > V-copy */
             if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
-                    dflash_attention(g_attn_out, g_qkv, position,
-                                     g_k_cache[l], g_v_cache[l]);
+                    dflash_attention(g_attn_out, g_qkv, position, l);
                 } else {
                     real_attention(g_attn_out, g_qkv, l, position,
                                    g_k_cache[l], g_v_cache[l]);
@@ -1046,8 +1118,7 @@ static int gpt2_forward_token(int token_id, int position) {
             /* Attention: dflash > real_attention_simd > real_attention > V-copy */
             if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
-                    dflash_attention(g_attn_out, g_qkv, position,
-                                     g_k_cache[l], g_v_cache[l]);
+                    dflash_attention(g_attn_out, g_qkv, position, l);
                 } else {
                     real_attention_simd(g_attn_out, g_qkv, l, position,
                                         g_k_cache[l], g_v_cache[l]);
@@ -1652,21 +1723,43 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[!] OOM allocating logits\n"); return 1;
     }
 
-    /* Allocate KV cache for real attention (72 MB: 12 layers × 2 × 1024 × 768 × 4B) */
+    /* Allocate KV cache for real attention.
+     * Float: 72 MB (12 layers × 2 × 1024 × 768 × 4B)
+     * TurboQuant (int8): 18 MB (4x compression) + 96 KB for per-row scales */
     if (g_use_real_attention || g_use_dflash) {
-        printf("[*] allocating KV cache for real causal attention (72 MB)...\n");
+        if (g_use_turboquant) {
+            printf("[*] allocating TurboQuant KV cache (int8, 18 MB)...\n");
+        } else {
+            printf("[*] allocating KV cache for real causal attention (72 MB)...\n");
+        }
         fflush(stdout);
         for (int l = 0; l < N_LAYER; l++) {
-            g_k_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
-            g_v_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
-            if (!g_k_cache[l] || !g_v_cache[l]) {
-                fprintf(stderr, "[!] OOM allocating KV cache for layer %d\n", l);
-                g_use_real_attention = 0;  /* fall back to simplified attention */
-                break;
+            if (g_use_turboquant) {
+                g_k_cache_q[l] = malloc((size_t)1024 * N_EMBD * sizeof(int8_t));
+                g_v_cache_q[l] = malloc((size_t)1024 * N_EMBD * sizeof(int8_t));
+                g_k_scale[l] = malloc((size_t)1024 * sizeof(float));
+                g_v_scale[l] = malloc((size_t)1024 * sizeof(float));
+                if (!g_k_cache_q[l] || !g_v_cache_q[l] || !g_k_scale[l] || !g_v_scale[l]) {
+                    fprintf(stderr, "[!] OOM allocating TurboQuant KV cache for layer %d\n", l);
+                    g_use_turboquant = 0;
+                    break;
+                }
+            } else {
+                g_k_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
+                g_v_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
+                if (!g_k_cache[l] || !g_v_cache[l]) {
+                    fprintf(stderr, "[!] OOM allocating KV cache for layer %d\n", l);
+                    g_use_real_attention = 0;
+                    break;
+                }
             }
         }
         if (g_use_real_attention || g_use_dflash) {
-            printf("[*] KV cache allocated — real causal self-attention enabled\n");
+            if (g_use_turboquant) {
+                printf("[*] TurboQuant KV cache allocated — int8 quantized attention\n");
+            } else {
+                printf("[*] KV cache allocated — real causal self-attention enabled\n");
+            }
         }
         fflush(stdout);
     }
