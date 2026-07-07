@@ -226,6 +226,23 @@ typedef struct {
 static BinGPT2Layer g_bin_layers[N_LAYER];
 static int g_binary_mode = 0;   /* set by --binary flag */
 
+/* Mixed-precision mode (--mixed-precision, implies --binary): keep the first
+ * and last transformer layers in float, binarize only the middle N_LAYER-2.
+ * This is the standard XNOR-Net quality fix — the first layer preserves the
+ * input distribution (binarizing the embedding+pos sum loses too much), and
+ * the last layer preserves the final discriminative features feeding the LM
+ * head. Memory cost: ~28 MB float per kept layer × 2 = ~56 MB on top of the
+ * 13 MB binary + 38 MB int8 LM head cache. Peak during load is higher because
+ * the full float file must be read to extract 2 layers, then freed.
+ *
+ * Orthogonal to STE (LAL-Bot's domain): STE improves the binary layers;
+ * mixed-precision keeps 2 layers fully accurate. They compose.
+ *
+ * g_layers[0] and g_layers[N_LAYER-1] are populated only in this mode; the
+ * forward loop picks the float branch for those two indices and the binary
+ * branch for the rest. */
+static int g_mixed_precision = 0;
+
 /* Binarize input x[in_dim] → packed bits x_bits[n_words] */
 static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_words) {
     for (int wi = 0; wi < n_words; wi++) {
@@ -345,6 +362,57 @@ static int load_binary_weights(const char *path) {
 
     fclose(f);
     g_binary_mode = 1;
+    return 0;
+}
+
+/* Load float weights for a SUBSET of layers (mixed-precision mode).
+ * Reads the full GPW2 float file, copies the requested layers' tensors into
+ * freshly malloc'd buffers pointed to by g_layers[l], then frees the temp
+ * tensor array (so resident memory drops back to just the kept layers).
+ * keep_layers[] holds layer indices; n_keep is its length.
+ * Returns 0 on success, -1 on failure. */
+static int load_float_layers_subset(const char *path, const int *keep_layers, int n_keep) {
+    int n_t = 0;
+    Tensor *t = tensor_load_all(path, &n_t);
+    if (!t) { fprintf(stderr, "[!] mixed-precision: cannot load float weights from %s\n", path); return -1; }
+
+    char key[128];
+    for (int ki = 0; ki < n_keep; ki++) {
+        int l = keep_layers[ki];
+        GPT2Layer *L = &g_layers[l];
+        /* 12 tensors per layer (GPT-2 Conv1D naming: c_fc=up-proj, c_proj=down-proj).
+         * Each entry: key, destination ptr, element count. We dup the data
+         * because tensor_free_all() releases the source arena. */
+        struct { const char *k; float **dst; size_t n; } ents[12];
+        sprintf(key, "h.%d.ln_1.weight", l);         ents[0].k = strdup(key);  ents[0].dst = &L->ln1_w;      ents[0].n = N_EMBD;
+        sprintf(key, "h.%d.ln_1.bias", l);           ents[1].k = strdup(key);  ents[1].dst = &L->ln1_b;      ents[1].n = N_EMBD;
+        sprintf(key, "h.%d.attn.c_attn.weight", l);  ents[2].k = strdup(key);  ents[2].dst = &L->c_attn_w;   ents[2].n = (size_t)N_EMBD * 3 * N_EMBD;
+        sprintf(key, "h.%d.attn.c_attn.bias", l);    ents[3].k = strdup(key);  ents[3].dst = &L->c_attn_b;   ents[3].n = 3 * N_EMBD;
+        sprintf(key, "h.%d.attn.c_proj.weight", l);  ents[4].k = strdup(key);  ents[4].dst = &L->c_proj_w;   ents[4].n = (size_t)N_EMBD * N_EMBD;
+        sprintf(key, "h.%d.attn.c_proj.bias", l);    ents[5].k = strdup(key);  ents[5].dst = &L->c_proj_b;   ents[5].n = N_EMBD;
+        sprintf(key, "h.%d.ln_2.weight", l);         ents[6].k = strdup(key);  ents[6].dst = &L->ln2_w;      ents[6].n = N_EMBD;
+        sprintf(key, "h.%d.ln_2.bias", l);           ents[7].k = strdup(key);  ents[7].dst = &L->ln2_b;      ents[7].n = N_EMBD;
+        sprintf(key, "h.%d.mlp.c_fc.weight", l);     ents[8].k = strdup(key);  ents[8].dst = &L->mlp_fc_w;   ents[8].n = (size_t)N_EMBD * MLP_DIM;
+        sprintf(key, "h.%d.mlp.c_fc.bias", l);       ents[9].k = strdup(key);  ents[9].dst = &L->mlp_fc_b;   ents[9].n = MLP_DIM;
+        sprintf(key, "h.%d.mlp.c_proj.weight", l);   ents[10].k = strdup(key); ents[10].dst = &L->mlp_proj_w; ents[10].n = (size_t)MLP_DIM * N_EMBD;
+        sprintf(key, "h.%d.mlp.c_proj.bias", l);     ents[11].k = strdup(key); ents[11].dst = &L->mlp_proj_b; ents[11].n = N_EMBD;
+
+        for (int e = 0; e < 12; e++) {
+            float *src = tensor_get(t, n_t, ents[e].k);
+            if (!src) {
+                fprintf(stderr, "[!] mixed-precision: missing tensor %s\n", ents[e].k);
+                for (int c = 0; c < 12; c++) free((void *)ents[c].k);
+                tensor_free_all(t, n_t);
+                return -1;
+            }
+            float *buf = malloc(ents[e].n * sizeof(float));
+            if (!buf) { fprintf(stderr, "[!] OOM in mixed-precision layer %d\n", l); return -1; }
+            memcpy(buf, src, ents[e].n * sizeof(float));
+            *(ents[e].dst) = buf;
+            free((void *)ents[e].k);
+        }
+    }
+    tensor_free_all(t, n_t);
     return 0;
 }
 
@@ -1341,7 +1409,13 @@ static int gpt2_forward_token(int token_id, int position) {
 
     /* Layers */
     for (int l = 0; l < N_LAYER; l++) {
-        if (g_binary_mode) {
+        /* Mixed-precision: first and last layers run in float (g_layers[l]),
+         * the rest in binary (g_bin_layers[l]). Falls through to binary for
+         * all layers in pure --binary mode, and to float for all layers when
+         * binary mode is off. */
+        int use_float_layer = !g_binary_mode ||
+            (g_mixed_precision && (l == 0 || l == N_LAYER - 1));
+        if (!use_float_layer) {
             /* Binary forward: XNOR + popcount (32x fewer FLOPs per layer) */
             BinGPT2Layer *L = &g_bin_layers[l];
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
@@ -1884,6 +1958,13 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--binary") == 0) {
             use_binary = 1;
+        } else if (strcmp(argv[i], "--mixed-precision") == 0) {
+            /* Mixed-precision: implies --binary, but keeps first/last layers
+             * float (standard XNOR-Net quality fix). Needs BOTH gpt2_binary.bin
+             * (for the middle binary layers + embeddings) and gpt2_weights.bin
+             * (for the 2 float layers). */
+            use_binary = 1;
+            g_mixed_precision = 1;
         } else if (strcmp(argv[i], "--real-attention") == 0) {
             g_use_real_attention = 1;
         } else if (strcmp(argv[i], "--dflash") == 0) {
@@ -1950,6 +2031,31 @@ int main(int argc, char **argv) {
         double ldt = (tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9;
         printf("[*] binary weights loaded in %.2fs (12 layers, XNOR+popcount)\n", ldt);
         fflush(stdout);
+
+        /* Mixed-precision: also load float weights for layers 0 and N_LAYER-1.
+         * Reads the full float file transiently (~497 MB peak), copies the 2
+         * layers (~56 MB) into g_layers[0]/g_layers[N_LAYER-1], then frees the
+         * rest. Resident memory after: binary(13MB) + 2 float layers(56MB) +
+         * wte(154MB) + int8 LM head(38MB) ≈ 261 MB. */
+        if (g_mixed_precision) {
+            const char *fw = getenv("LAL_WEIGHTS");
+            if (!fw) fw = "prebuilt/gpt2_weights.bin";
+            printf("[*] mixed-precision: loading float layers {0, %d} from %s...\n",
+                   N_LAYER - 1, fw);
+            fflush(stdout);
+            int keep[2] = {0, N_LAYER - 1};
+            struct timespec tm0, tm1;
+            clock_gettime(CLOCK_MONOTONIC, &tm0);
+            if (load_float_layers_subset(fw, keep, 2) != 0) {
+                fprintf(stderr, "[!] mixed-precision load failed; falling back to pure binary\n");
+                g_mixed_precision = 0;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &tm1);
+            double mdt = (tm1.tv_sec - tm0.tv_sec) + (tm1.tv_nsec - tm0.tv_nsec) * 1e-9;
+            printf("[*] mixed-precision float layers loaded in %.2fs (layers 0 and %d)\n",
+                   mdt, N_LAYER - 1);
+            fflush(stdout);
+        }
     } else {
         printf("[*] loading float weights...\n");
         fflush(stdout);
