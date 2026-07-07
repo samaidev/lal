@@ -866,6 +866,7 @@ static void handle_request(int client_fd) {
         write(client_fd, body, body_len);
         free(html);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/generate") == 0) {
+        fprintf(stderr, "[d] POST /generate received\n"); fflush(stderr);
         char *body = strstr(buf, "\r\n\r\n");
         if (!body) { close(client_fd); return; }
         body += 4;
@@ -909,12 +910,16 @@ static void handle_request(int client_fd) {
         static int all_tokens[1024];
         memcpy(all_tokens, input_tokens, n_input * sizeof(int));
         int total = n_input;
+        fprintf(stderr, "[d] starting generation: n_input=%d n_tokens=%d\n", n_input, n_tokens); fflush(stderr);
         for (int gen = 0; gen < n_tokens; gen++) {
+            fprintf(stderr, "[d] gen=%d total=%d calling forward\n", gen, total); fflush(stderr);
             int next = gpt2_forward_token(all_tokens[total - 1], total - 1);
+            fprintf(stderr, "[d] gen=%d got token=%d\n", gen, next); fflush(stderr);
             output_tokens[gen] = next;
             all_tokens[total++] = next;
             if (total >= 1024) { n_tokens = gen + 1; break; }
         }
+        fprintf(stderr, "[d] generation done, building response\n"); fflush(stderr);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
