@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/root/.pyenv/versions/3.12.13/bin/python
 """Join the AICQ ephemeral room, print history + members, then listen/speak.
 Usage: python3 scripts/aicq_join.py            # join + print, no speak
        python3 scripts/aicq_join.py "message"  # join, print, send message, poll replies
