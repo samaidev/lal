@@ -18,6 +18,9 @@ lal/
 │   │   ├── gpt2_server.c    # AVX2 SIMD inference + hash tokenizer
 │   │   ├── frontend.html    # Browser UI
 │   │   └── README.md        # Why two inference paths (binary vs. float)
+│   ├── arm/                 # ARMv7 / Termux / Android deployment
+│   │   ├── launcher.sh      # Detached daemon launcher for Termux
+│   │   └── README.md        # Tested on 1.9 GB RAM Android tablet
 │   ├── export_*.py          # Weight export from PyTorch checkpoints
 │   └── verify.py            # End-to-end correctness check
 ├── prebuilt/                # Pre-built binaries (open out of the box!)
@@ -59,8 +62,10 @@ The runtime is model-agnostic. GPT-2 is just one example.
 | GPT-2 training (LAL native, binary) | 10000 steps, pure C | 35s, 3.4ms/step, loss 5.5→0.3 |
 | vs PyTorch | speedup | 250x |
 | Weight compression | binary (sign+alpha) | 44x (498MB → 11.3MB) |
-| GPT-2 web server (float, AVX2 SIMD) | inference, single-core | 96 ms/token (10.4 tok/s) |
+| GPT-2 web server (float, AVX2 SIMD) | inference, x86_64 single-core | 96 ms/token (10.4 tok/s) |
 | vs original scalar server | speedup | ~5x (490 → 96 ms/token) |
+| GPT-2 on ARMv7 Android tablet | inference, Cortex-A7 @ 1.4GHz | 9.7 s/token (0.1 tok/s) |
+| ARM RAM footprint | 1.9 GB total, 498 MB weights | works where PyTorch cannot run at all |
 
 ## License
 
