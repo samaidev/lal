@@ -1991,10 +1991,18 @@ int main(int argc, char **argv) {
     }  /* end else (float mode) */
 
     /* Quantize wte to int8 + per-row scale for the int8 LM head.
-     * Float mode only (binary mode keeps its own LM head path). One-time cost
-     * at startup (~50ms for 50257×768). g_wte stays float for the embedding
-     * lookup; g_wte_q is used only by lm_head_int8_parallel. */
-    if (g_use_lm_head_int8 && !use_binary && g_wte) {
+     * Works in BOTH float and binary modes — both load g_wte as float (the
+     * embeddings stay unbinarized; only the 12 transformer layers are
+     * binarized in binary mode). One-time cost at startup (~50ms for
+     * 50257×768). g_wte stays float for the embedding lookup; g_wte_q is
+     * used only by lm_head_int8_parallel.
+     *
+     * Binary mode is where this matters most: the LM head (logits = wte @ x)
+     * reads 154 MB of float wte per token, and on memory-constrained devices
+     * (ARM tablets, LPDDR3) that bandwidth dominates. int8 cuts it to 38 MB
+     * → ~4x less bandwidth on the single hottest path. LAL-Bot confirmed
+     * the tablet's 0.2 tok/s bottleneck is the LM head, not attention. */
+    if (g_use_lm_head_int8 && g_wte) {
         struct timespec tq0, tq1;
         clock_gettime(CLOCK_MONOTONIC, &tq0);
         g_wte_q = malloc((size_t)VOCAB_SIZE * N_EMBD * sizeof(int8_t));
