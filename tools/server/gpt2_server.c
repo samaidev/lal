@@ -221,15 +221,24 @@ static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_w
     }
 }
 
-/* Binary forward: y[out_dim] = (2*popcount(XNOR(x_bits, wbits[j])) - in_dim) * alpha[j] + bias[j]
- * Uses __builtin_popcountll — portable across x86 and ARM (ARM falls back to
- * software popcount, still much faster than 64 scalar multiplications). */
+/* Binary forward (XNOR-Net style):
+ *   y[j] = mean(|x|) * alpha[j] * (2*popcount(XNOR(x_bits, wbits[j])) - in_dim) + bias[j]
+ *
+ * The mean(|x|) factor is CRITICAL — without it, the dot product magnitude
+ * is wrong by a factor of mean(|x|), which varies per input. This was the
+ * root cause of poor output quality: the original code omitted mean(|x|),
+ * so every layer's output had wrong scale, and after 12 layers the signal
+ * was completely buried.
+ *
+ * XNOR-Net formula (Rastegari et al. 2016):
+ *   dot(x, w) ≈ mean(|x|) * mean(|w|) * sum(sign(x) * sign(w))
+ *             = mean(|x|) * alpha  * (2*pc - N)
+ * where pc = popcount(XNOR(sign(x), sign(w)))
+ */
 static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
-    /* Binarize input once */
-    uint64_t x_bits[16];  /* max in_dim = 3072 → 48 words; we stack-alloc 16 for n=768 (12 words) */
-    /* For mlp_proj (in_dim=3072), we need 48 words — use heap */
     int n_words = bl->n_words;
     uint64_t *xb;
+    uint64_t x_bits[16];  /* stack alloc for small in_dim (768 → 12 words) */
     if (n_words <= 16) {
         xb = x_bits;
     } else {
@@ -237,14 +246,19 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     }
     binarize_input(x, xb, bl->in_dim, n_words);
 
+    /* Compute mean(|x|) — the input scale factor */
+    float abs_sum = 0.0f;
+    for (int i = 0; i < bl->in_dim; i++) abs_sum += fabsf(x[i]);
+    float x_scale = abs_sum / bl->in_dim;
+
     for (int j = 0; j < bl->out_dim; j++) {
         const uint64_t *wb = bl->wbits + (size_t)j * n_words;
         int pc = 0;
         for (int wi = 0; wi < n_words; wi++) {
             pc += __builtin_popcountll(~(xb[wi] ^ wb[wi]));
         }
-        /* dot = (2*pc - in_dim) * alpha — XNOR gives count of matching signs */
-        y[j] = (float)(2 * pc - bl->in_dim) * bl->alpha[j] + bl->bias[j];
+        /* XNOR-Net: dot ≈ mean(|x|) * alpha * (2*pc - N) */
+        y[j] = x_scale * bl->alpha[j] * (float)(2 * pc - bl->in_dim) + bl->bias[j];
     }
     if (n_words > 16) free(xb);
 }
