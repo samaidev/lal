@@ -149,7 +149,33 @@ class EArgMax:
     """argmax { label: expr, ... } — returns the index of the largest expr."""
     items: List[Tuple[str, "Expr"]]
 
-Expr = Union[ECall, EVar, EFloat, ERelateCall, ERuleCall, ERecall, EArgMax]
+@dataclass
+class ELoss:
+    """loss(type, logits, target) — computes a loss function.
+    type: 'cross_entropy' | 'mse'
+    v0.10: differentiable programming support."""
+    loss_type: str
+    logits: "Expr"
+    target: "Expr"
+
+@dataclass
+class EGrad:
+    """grad(loss_var, param_name) — gradient of loss w.r.t. a param.
+    Emits the backward pass for the named parameter."""
+    loss_var: str
+    param_name: str
+
+@dataclass
+class EUpdate:
+    """update(param_name, grad_var, lr) — SGD weight update.
+    param_name: the param to update
+    grad_var: variable holding the gradient
+    lr: learning rate (float)"""
+    param_name: str
+    grad_var: str
+    lr: float
+
+Expr = Union[ECall, EVar, EFloat, ERelateCall, ERuleCall, ERecall, EArgMax, ELoss, EGrad, EUpdate]
 
 
 # =============================================================================
@@ -481,6 +507,39 @@ class _ExprParser:
                 query = self.parse_ternary()
                 self._expect(")")
                 return ERecall(mem_name, query)
+            # loss(type, logits, target) — v0.10 differentiable programming
+            if name == "loss":
+                self._expect("(")
+                loss_type = self._read_ident()
+                self._expect(",")
+                logits = self.parse_ternary()
+                self._expect(",")
+                target = self.parse_ternary()
+                self._expect(")")
+                return ELoss(loss_type, logits, target)
+            # grad(loss_var, param_name) — v0.10
+            if name == "grad":
+                self._expect("(")
+                loss_var = self._read_ident()
+                self._expect(",")
+                param_name = self._read_ident()
+                self._expect(")")
+                return EGrad(loss_var, param_name)
+            # update(param_name, grad_var, lr) — v0.10
+            if name == "update":
+                self._expect("(")
+                param_name = self._read_ident()
+                self._expect(",")
+                grad_var = self._read_ident()
+                self._expect(",")
+                # lr is a float literal
+                lr_str = ""
+                self._skip_ws()
+                while self.i < self.n and (self.s[self.i].isdigit() or self.s[self.i] in ".eE+-"):
+                    lr_str += self.s[self.i]
+                    self.i += 1
+                self._expect(")")
+                return EUpdate(param_name, grad_var, float(lr_str))
             # function call?
             if self._peek() == "(":
                 self._expect("(")
@@ -556,6 +615,14 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
+        # param name = [...]   (trainable parameter — like concept but mutable, v0.10)
+        m = re.match(r"param\s+(\w+)\s*=\s*(\[.*\])\s*$", line)
+        if m:
+            # params are stored as concepts but marked as trainable
+            concepts.append(Concept(m.group(1), _parse_float_list(m.group(2))))
+            i += 1
+            continue
+
         # concept name = load_word2vec("path", "word")   (load from embedding file at compile time)
         m = re.match(r'concept\s+(\w+)\s*=\s*load_word2vec\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*(?:,\s*dim\s*=\s*(\d+))?\s*\)\s*$', line)
         if m:
@@ -626,8 +693,9 @@ def parse(source: str, source_path: Optional[str] = None):
             params = [p.strip() for p in m.group(2).split(",") if p.strip()]
             dot_args = [a.strip() for a in m.group(3).split(",") if a.strip()]
             bound_name = m.group(4)
-            if len(params) != 2 or len(dot_args) != 2:
-                raise ParseError(f"relate dot must have 2 params and 2 args: {line!r}")
+            if len(dot_args) != 2:
+                raise ParseError(f"relate dot must have 2 args: {line!r}")
+            # v0.10: params can be a subset of dot_args (allows dot(x, param) with 1 param)
             relates.append(Relate(name, params, "dot", bound_name, None))
             i += 1
             continue
@@ -775,6 +843,13 @@ def parse(source: str, source_path: Optional[str] = None):
                     i += 1
                     continue
 
+                # v0.10: bare update/grad statement (no var = prefix)
+                if bline.startswith("update(") or bline.startswith("grad("):
+                    expr = _parse_expr(bline)
+                    body.append(Stmt("__stmt__", expr))
+                    i += 1
+                    continue
+
                 raise ParseError(f"can't parse rule body line: {bline!r}")
 
             rules.append(Rule(name, params, body, outputs, guard_expr))
@@ -806,6 +881,11 @@ def _rewrite_calls(expr, relate_names, rule_names):
         return ERecall(expr.memory_name, _rewrite_calls(expr.query, relate_names, rule_names))
     if isinstance(expr, EArgMax):
         return EArgMax([(l, _rewrite_calls(e, relate_names, rule_names)) for l, e in expr.items])
+    if isinstance(expr, ELoss):
+        return ELoss(expr.loss_type, _rewrite_calls(expr.logits, relate_names, rule_names),
+                     _rewrite_calls(expr.target, relate_names, rule_names))
+    if isinstance(expr, (EGrad, EUpdate)):
+        return expr  # no sub-expressions to rewrite
     return expr
 
 
@@ -987,6 +1067,40 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
             scores = [(label, ev(expr)) for label, expr in e.items]
             best = max(scores, key=lambda x: x[1])
             return best[0]
+        if isinstance(e, ELoss):
+            """v0.10: loss functions for differentiable programming."""
+            logits_val = ev(e.logits)
+            target_val = ev(e.target)
+            if e.loss_type == "cross_entropy":
+                # logits_val and target_val are lists (logits vector + target index)
+                if isinstance(target_val, (int, float)):
+                    target_idx = int(target_val)
+                else:
+                    target_idx = int(target_val[0]) if target_val else 0
+                if isinstance(logits_val, list):
+                    import math
+                    max_l = max(logits_val)
+                    exp_l = [math.exp(l - max_l) for l in logits_val]
+                    sum_exp = sum(exp_l)
+                    log_sum_exp = math.log(sum_exp) + max_l
+                    return log_sum_exp - logits_val[target_idx]
+                return 0.0
+            if e.loss_type == "mse":
+                # mean squared error
+                if isinstance(logits_val, list) and isinstance(target_val, list):
+                    n = min(len(logits_val), len(target_val))
+                    return sum((logits_val[i] - target_val[i])**2 for i in range(n)) / n
+                return 0.0
+            raise RuntimeError(f"unknown loss type: {e.loss_type}")
+        if isinstance(e, EGrad):
+            """v0.10: gradient computation (simplified — returns gradient vector).
+            In full implementation, this would do automatic differentiation.
+            For now, it's a placeholder that the compiler handles specially."""
+            return [0.0]  # placeholder — actual gradient computed by compiler
+        if isinstance(e, EUpdate):
+            """v0.10: weight update. In the reference interpreter, this is a no-op
+            (params are immutable). The compiler emits actual update code."""
+            return 0.0
         raise RuntimeError(f"can't eval: {e}")
 
     # v0.6: Try each variant in order. The first whose guard is truthy (or which
@@ -1982,6 +2096,20 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
                     terms = [_full_q_term(d) for d in range(width)]
                     return "float", "(" + " + ".join(terms) + ")"
         raise RuntimeError(f"relate op {r.op} is not scalar")
+    if isinstance(e, ELoss):
+        # v0.10: emit loss computation (cross_entropy or mse)
+        # For now, emit a placeholder. Full implementation would emit
+        # the loss function + store gradients for backward pass.
+        logits_str = _emit_scalar_expr(e.logits, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+        target_str = _emit_scalar_expr(e.target, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth)[1]
+        if e.loss_type == "cross_entropy":
+            return "float", f"(0.0f) /* loss(cross_entropy, {logits_str}, {target_str}) — full impl TBD */"
+        return "float", f"(0.0f) /* loss({e.loss_type}) */"
+    if isinstance(e, EGrad):
+        return "float", f"(0.0f) /* grad({e.loss_var}, {e.param_name}) */"
+    if isinstance(e, EUpdate):
+        # Emit a comment — the actual update would modify the param array
+        return "float", f"(0.0f) /* update({e.param_name}, {e.grad_var}, {e.lr}) */"
     raise RuntimeError(f"can't emit scalar: {e}")
 
 

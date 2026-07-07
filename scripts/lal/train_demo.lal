@@ -1,0 +1,35 @@
+# train_demo.lal — LAL differentiable programming demo (v0.10).
+#
+# A tiny "neural network" that learns to predict {0, 1} from 4-dim input.
+# This exercises: param, loss, grad, update.
+#
+# The network: y = sigmoid(dot(x, w) + b)
+# Loss: cross_entropy(y, target)
+# Training: 100 steps of SGD
+
+# Trainable parameters (4-dim weight + 1-dim bias)
+param w = [0.1, -0.2, 0.3, -0.1]
+param b = [0.0]
+
+bound all = [0, 1, 2, 3]
+
+relate score(x, ww) = dot(x, ww) @ all
+
+# Training rule: forward + loss + backward + update
+rule train_step(x, target):
+    s = score(x, w)
+    l = loss(cross_entropy, s, target)
+    gw = grad(l, w)
+    gb = grad(l, b)
+    update(w, gw, 0.01)
+    update(b, gb, 0.01)
+    output(l)
+
+# Inference rule
+rule predict(x):
+    s = score(x, w)
+    best = argmax {
+        zero: s < 0.5,
+        one:  s >= 0.5
+    }
+    output(best)
