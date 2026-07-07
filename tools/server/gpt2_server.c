@@ -991,14 +991,18 @@ int main(int argc, char **argv) {
     }
 
     /* Auto-detect thread count.
-     * NOTE: LM head is memory-bound (154MB weight reads/token), so threading
-     * only helps on 4+ core machines with multiple memory channels.
-     * On 2-core systems, single-threaded is faster (avoids cache contention).
-     * ARM Android: we set 256KB pthread stack in lm_head_parallel to avoid
-     * stack overflow, so multi-threading is safe. */
+     * On ARM Android, pthread_create with lm_head_avx2 crashes (likely NEON
+     * register save/restore issue in bionic). Force single-threaded on ARM
+     * and rely on --prune-vocab to reduce LM head work. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+#if defined(__ARM_ARCH) || defined(__arm__) || defined(__aarch64__)
+    g_n_threads = 1;  /* ARM: single-threaded, use --prune-vocab for speed */
+    /* Auto-enable 50% vocab pruning on ARM if not specified */
+    if (g_prune_frac == 0.0f) g_prune_frac = 0.5f;
+#else
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
+#endif
 
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
            use_binary ? "BINARY XNOR+popcount" : "float SIMD",
