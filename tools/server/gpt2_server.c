@@ -385,8 +385,21 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
      * and use SIMD float dot product. We do this when --bwn flag is set. */
     if (g_use_bwn) {
         /* BWN: float dot product with sign(w) unpacked from bits.
-         * Slower than XNOR but training-consistent (no activation binarization).
-         * 8x unrolled for auto-vectorization. */
+         * Uses a pre-computed lookup table: byte → 8 floats of ±1.
+         * Table is 256×8×4B = 8KB (fits L1). Each iteration:
+         *   1. Extract byte from wbits
+         *   2. Load 8 sign floats from table
+         *   3. Dot with 8 x floats (SIMD auto-vectorizable)
+         * This is ~8x faster than scalar bit-by-bit extraction. */
+        static float sign_lut[256][8];
+        static int lut_init = 0;
+        if (!lut_init) {
+            for (int b = 0; b < 256; b++)
+                for (int i = 0; i < 8; i++)
+                    sign_lut[b][i] = (b >> i) & 1 ? 1.0f : -1.0f;
+            lut_init = 1;
+        }
+
         for (int j = 0; j < bl->out_dim; j++) {
             const uint64_t *wb = bl->wbits + (size_t)j * n_words;
             float dot = 0.0f;
@@ -395,21 +408,22 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                 int base = wi * 64;
                 for (int bi = 0; bi < 8; bi++) {
                     int idx = base + bi * 8;
+                    uint8_t byte = (w >> (bi * 8)) & 0xFF;
+                    const float *sw = sign_lut[byte];
                     if (idx + 7 < bl->in_dim) {
-                        /* Unpack 8 sign bits and dot with 8 float x values */
-                        dot += x[idx+0] * ((w >> (bi*8+0)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+1] * ((w >> (bi*8+1)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+2] * ((w >> (bi*8+2)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+3] * ((w >> (bi*8+3)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+4] * ((w >> (bi*8+4)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+5] * ((w >> (bi*8+5)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+6] * ((w >> (bi*8+6)) & 1 ? 1.0f : -1.0f);
-                        dot += x[idx+7] * ((w >> (bi*8+7)) & 1 ? 1.0f : -1.0f);
+                        /* 8x unrolled dot product — auto-vectorizes to SIMD */
+                        dot += x[idx+0] * sw[0];
+                        dot += x[idx+1] * sw[1];
+                        dot += x[idx+2] * sw[2];
+                        dot += x[idx+3] * sw[3];
+                        dot += x[idx+4] * sw[4];
+                        dot += x[idx+5] * sw[5];
+                        dot += x[idx+6] * sw[6];
+                        dot += x[idx+7] * sw[7];
                     } else {
                         for (int k = 0; k < 8; k++) {
                             int i = idx + k;
-                            if (i < bl->in_dim)
-                                dot += x[i] * ((w >> (bi*8+k)) & 1 ? 1.0f : -1.0f);
+                            if (i < bl->in_dim) dot += x[i] * sw[k];
                         }
                     }
                 }
