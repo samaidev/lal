@@ -45,13 +45,79 @@ static int encode(const char *t, int *tk) {
     tk[0]=464;tk[1]=995;tk[2]=318;tk[3]=257;tk[4]=1639;tk[5]=286;tk[6]=869;return 7;
 }
 
+/* Export fine-tuned binary weights to GB2L file (same format as gpt2_binary.bin).
+ * After STE training, wbits/alpha/bias have been updated. Export them so the
+ * inference server can load the improved weights. */
+static void export_binary_weights(Model *m, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[!] cannot open %s for writing\n", path); return; }
+
+    int n_layer = m->cfg.n_layer;
+    int n_embd = m->cfg.n_embd;
+    int mlp_dim = m->cfg.mlp_dim;
+    int vocab = m->cfg.vocab_size;
+    int n_ctx = m->cfg.n_ctx;
+
+    /* Header */
+    fwrite("GB2L", 1, 4, f);
+    int hdr[5] = {n_layer, n_embd, mlp_dim, vocab, n_ctx};
+    fwrite(hdr, 4, 5, f);
+
+    /* Embeddings (float — from original model, not binarized) */
+    fwrite(m->wte, sizeof(float), (size_t)vocab * n_embd, f);
+    fwrite(m->wpe, sizeof(float), (size_t)n_ctx * n_embd, f);
+    fwrite(m->ln_f_w, sizeof(float), n_embd, f);
+    fwrite(m->ln_f_b, sizeof(float), n_embd, f);
+
+    /* Per-layer binary weights (updated by STE) */
+    for (int l = 0; l < n_layer; l++) {
+        TransLayer *tl = &m->layers[l];
+        /* LayerNorm (float, not updated) */
+        fwrite(tl->norm1_w, sizeof(float), n_embd, f);
+        fwrite(tl->norm1_b, sizeof(float), n_embd, f);
+        fwrite(tl->norm2_w, sizeof(float), n_embd, f);
+        fwrite(tl->norm2_b, sizeof(float), n_embd, f);
+
+        /* 4 binary matrices per layer */
+        BinLayer *mats[4];
+        if (m->cfg.qkv_merged) {
+            mats[0] = &tl->attn_q;  /* merged QKV */
+            mats[1] = &tl->attn_o;
+            mats[2] = &tl->mlp_gate;
+            mats[3] = &tl->mlp_down;
+        } else {
+            mats[0] = &tl->attn_q;
+            mats[1] = &tl->attn_o;
+            mats[2] = &tl->mlp_gate;
+            mats[3] = &tl->mlp_down;
+        }
+
+        for (int mi = 0; mi < 4; mi++) {
+            BinLayer *bl = mats[mi];
+            int mhdr[4] = {bl->out_dim, bl->in_dim, bl->n_words, 0};
+            fwrite(mhdr, 4, 4, f);
+            /* wbits: [out_dim * n_words] uint64s */
+            fwrite(bl->wbits, sizeof(uint64_t),
+                   (size_t)bl->out_dim * bl->n_words, f);
+            /* alpha + bias */
+            fwrite(bl->alpha, sizeof(float), bl->out_dim, f);
+            fwrite(bl->bias, sizeof(float), bl->out_dim, f);
+        }
+    }
+
+    fclose(f);
+    printf("[*] exported STE-tuned binary weights to %s\n", path);
+}
+
 int main(int argc, char **argv) {
     int n_steps = argc > 1 ? atoi(argv[1]) : 200;
     float lr = argc > 2 ? atof(argv[2]) : 0.05;
     int use_ste = 0;
-    /* Parse --ste flag */
+    const char *export_path = NULL;
+    /* Parse flags */
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--ste") == 0) use_ste = 1;
+        else if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) export_path = argv[++i];
     }
 
     printf("[*] LAL Training — GPT-2 (model-agnostic runtime, no PyTorch)\n");
@@ -59,6 +125,9 @@ int main(int argc, char **argv) {
     if (use_ste) {
         g_use_ste = 1;
         printf("[*] STE mode: binary weights will be updated via Straight-Through Estimator\n");
+    }
+    if (export_path) {
+        printf("[*] will export tuned weights to %s after training\n", export_path);
     }
 
     struct timespec t0, t1;
@@ -88,6 +157,11 @@ int main(int argc, char **argv) {
     double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
     printf("[*] done in %.1fs (%.1f ms/step)\n", dt, dt/n_steps*1000);
     printf("[*] no PyTorch, no Python, pure C\n");
+
+    /* Export STE-tuned weights if requested */
+    if (export_path) {
+        export_binary_weights(&model, export_path);
+    }
 
     model_free(&model);
     return 0;
