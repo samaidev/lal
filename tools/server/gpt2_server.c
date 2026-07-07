@@ -753,6 +753,15 @@ static int prune_cmp_idx_asc(const void *a, const void *b) {
 }
 
 static int gpt2_forward_token(int token_id, int position) {
+    /* Bounds check — prevent OOB access on g_wte/g_wpe */
+    if (token_id < 0 || token_id >= VOCAB_SIZE) {
+        fprintf(stderr, "[!] bad token_id=%d, clamping to 0\n", token_id);
+        token_id = 0;
+    }
+    if (position < 0 || position >= 1024) {
+        fprintf(stderr, "[!] bad position=%d, clamping to 0\n", position);
+        position = 0;
+    }
     /* Embedding */
     for (int i = 0; i < N_EMBD; i++)
         g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
@@ -831,7 +840,11 @@ static char *load_file(const char *path, long *size_out) {
 }
 
 static void handle_request(int client_fd) {
-    char buf[16384];
+    /* NOTE: buf + result + escaped + json + all_tokens ≈ 40 KB on stack.
+     * ARM Android's default pthread stack can be as small as 8 KB, which
+     * caused a segfault on the 2nd request (stack overflow into guard page).
+     * Fix: make the large buffers static so they live in BSS, not stack. */
+    static char buf[16384];
     int n = read(client_fd, buf, sizeof(buf) - 1);
     if (n <= 0) { close(client_fd); return; }
     buf[n] = '\0';
@@ -857,7 +870,8 @@ static void handle_request(int client_fd) {
         if (!body) { close(client_fd); return; }
         body += 4;
 
-        char prompt[1024] = "";
+        static char prompt[1024];
+        prompt[0] = '\0';
         int n_tokens = 20;
         /* Simple JSON parse */
         char *p = strstr(body, "\"prompt\"");
@@ -887,12 +901,12 @@ static void handle_request(int client_fd) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        int input_tokens[256];
+        static int input_tokens[256];
         int n_input = encode_text(prompt, input_tokens, 256);
         if (n_input == 0) { input_tokens[0] = 464; n_input = 1; }
 
-        int output_tokens[100];
-        int all_tokens[1024];
+        static int output_tokens[100];
+        static int all_tokens[1024];
         memcpy(all_tokens, input_tokens, n_input * sizeof(int));
         int total = n_input;
         for (int gen = 0; gen < n_tokens; gen++) {
@@ -906,16 +920,17 @@ static void handle_request(int client_fd) {
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
         /* Build output text */
-        char result[4096] = "";
+        static char result[4096];
+        result[0] = '\0';
         int pos = snprintf(result, sizeof(result), "%s", prompt);
         for (int i = 0; i < n_tokens && pos < 4000; i++) {
-            char tok[256];
+            static char tok[256];
             int tl = decode_token(output_tokens[i], tok, sizeof(tok) - 1);
             tok[tl] = '\0';
             pos += snprintf(result + pos, sizeof(result) - pos, "%s", tok);
         }
 
-        char escaped[5120];
+        static char escaped[5120];
         int ei = 0;
         for (int i = 0; result[i] && ei < 5110; i++) {
             if (result[i] == '"') { escaped[ei++] = '\\'; escaped[ei++] = '"'; }
@@ -927,7 +942,7 @@ static void handle_request(int client_fd) {
         escaped[ei] = '\0';
 
         double tps = n_tokens / (dt > 0 ? dt : 1e-6);
-        char json[6144];
+        static char json[6144];
         int jpos = snprintf(json, sizeof(json),
             "{\"text\":\"%s\",\"time\":\"%.3f\",\"n_tokens\":%d,\"tokens_per_sec\":\"%.1f\"}",
             escaped, dt, n_tokens, tps);
