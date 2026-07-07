@@ -473,6 +473,29 @@ static void lm_head_parallel(float *logits, const float *x, const float *wte,
     }
 }
 
+/* Pruned LM head: only compute logits for active vocab rows.
+ * Skips rows with smallest L2 norm (set via g_prune_frac).
+ * Non-active logits are set to -INFINITY so argmax never picks them. */
+static void lm_head_pruned(float *logits, const float *x, const float *wte,
+                           const int *active_vocab, int n_active, int n_embd) {
+    /* Initialize all logits to -INFINITY */
+    for (int v = 0; v < VOCAB_SIZE; v++) logits[v] = -1e30f;
+
+    /* Compute logits only for active vocab rows.
+     * Each row is a dense 768-dim dot product — SIMD friendly. */
+    for (int vi = 0; vi < n_active; vi++) {
+        int v = active_vocab[vi];
+        const float *w = wte + (size_t)v * n_embd;
+        v8f acc = v8f_zero();
+        int i = 0;
+        for (; i + 8 <= n_embd; i += 8)
+            acc = v8f_fmadd(v8f_load(x + i), v8f_load(w + i), acc);
+        float s = v8f_hsum(acc);
+        for (; i < n_embd; i++) s += x[i] * w[i];
+        logits[v] = s;
+    }
+}
+
 /* GELU (tanh approximation, GPT-2 style) */
 static inline float gelu_fast(float x) {
     const float c = 0.7978845608028654f;  /* sqrt(2/π) */
@@ -498,6 +521,33 @@ static float  g_mlp_out[N_EMBD];
 static float  g_final_ln[N_EMBD];
 static float *g_logits = NULL;       /* [VOCAB_SIZE], allocated once */
 static int    g_n_threads = 1;       /* worker threads for LM head */
+
+/* Vocab pruning: skip rows of wte (LM head) with smallest L2 norm.
+ * Set via --prune-vocab <frac> (0.0 = no pruning, 0.5 = drop 50% of vocab).
+ *
+ * Why this works:
+ *   - GPT-2's vocab has 50257 entries, but most text generation uses <5000
+ *     common tokens. The rest are rare unicode, foreign scripts, special chars.
+ *   - Rare tokens have small embedding norms — they contribute little to
+ *     logits and are almost never selected by argmax.
+ *   - Skipping 50% of vocab rows halves LM head FLOPs (the bottleneck on
+ *     ARM/memory-bound devices) with negligible quality loss for English text.
+ *   - This is "structured sparsity" — whole rows dropped, not individual
+ *     weights. Dense SIMD within each row is preserved.
+ */
+static int    g_n_active_vocab = VOCAB_SIZE;
+static int   *g_active_vocab = NULL;   /* [n_active_vocab], indices into wte */
+static float  g_prune_frac = 0.0f;     /* set from --prune-vocab */
+
+/* File-scope pointer for qsort comparator (qsort_r is non-portable) */
+static float *g_prune_norm_ref = NULL;
+static int prune_cmp_desc(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    float na = g_prune_norm_ref[ia], nb = g_prune_norm_ref[ib];
+    if (na < nb) return 1;   /* descending: larger norm first */
+    if (na > nb) return -1;
+    return 0;
+}
 
 static int gpt2_forward_token(int token_id, int position) {
     /* Embedding */
@@ -536,8 +586,13 @@ static int gpt2_forward_token(int token_id, int position) {
     /* Final norm */
     layer_norm_simd(g_final_ln, g_x, g_ln_f_w, g_ln_f_b, N_EMBD);
 
-    /* LM head: logits = wte @ final_ln  (tied embeddings) */
-    lm_head_parallel(g_logits, g_final_ln, g_wte, VOCAB_SIZE, N_EMBD, g_n_threads);
+    /* LM head: logits = wte @ final_ln  (tied embeddings)
+     * Use pruned version if --prune-vocab was set, else full parallel. */
+    if (g_active_vocab && g_n_active_vocab < VOCAB_SIZE) {
+        lm_head_pruned(g_logits, g_final_ln, g_wte, g_active_vocab, g_n_active_vocab, N_EMBD);
+    } else {
+        lm_head_parallel(g_logits, g_final_ln, g_wte, VOCAB_SIZE, N_EMBD, g_n_threads);
+    }
 
     /* Argmax */
     int best = 0;
@@ -686,7 +741,17 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     int port = 8080;
-    if (argc > 1) port = atoi(argv[1]);
+    /* Parse args: [port] [--prune-vocab FRAC]
+     * FRAC in [0, 0.9]: fraction of vocab (smallest-norm rows) to drop. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
+            g_prune_frac = (float)atof(argv[++i]);
+            if (g_prune_frac < 0.0f) g_prune_frac = 0.0f;
+            if (g_prune_frac > 0.9f) g_prune_frac = 0.9f;
+        } else {
+            port = atoi(argv[i]);
+        }
+    }
 
     /* Auto-detect thread count.
      * NOTE: LM head is memory-bound (154MB weight reads/token), so threading
@@ -698,6 +763,11 @@ int main(int argc, char **argv) {
 
     printf("[*] LAL GPT-2 Server (SIMD-optimized, %d thread%s, %ld cores detected)\n",
            g_n_threads, g_n_threads > 1 ? "s" : "", ncpu);
+    if (g_prune_frac > 0.0f) {
+        printf("[*] vocab pruning: dropping %.0f%% smallest-norm rows (%d → %d active)\n",
+               g_prune_frac * 100.0f, VOCAB_SIZE,
+               (int)((1.0f - g_prune_frac) * VOCAB_SIZE));
+    }
     printf("[*] loading model (float, AVX2 SIMD)...\n");
     fflush(stdout);
 
@@ -742,6 +812,64 @@ int main(int argc, char **argv) {
     g_logits = NULL;
     if (posix_memalign((void **)&g_logits, 32, VOCAB_SIZE * sizeof(float)) != 0 || !g_logits) {
         fprintf(stderr, "[!] OOM allocating logits\n"); return 1;
+    }
+
+    /* Vocab pruning: compute row L2 norms, keep top (1 - prune_frac) by norm.
+     * Strategy: partial sort via qsort, then take the top N.
+     * This is O(V log V) once at startup — 50257 log(50257) ≈ 800k comparisons. */
+    if (g_prune_frac > 0.0f) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        /* Compute row norms */
+        float *row_norm = malloc(VOCAB_SIZE * sizeof(float));
+        int *vocab_idx  = malloc(VOCAB_SIZE * sizeof(int));
+        if (!row_norm || !vocab_idx) { fprintf(stderr, "[!] OOM pruning\n"); return 1; }
+
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            const float *w = g_wte + (size_t)v * N_EMBD;
+            v8f acc = v8f_zero();
+            int i = 0;
+            for (; i + 8 <= N_EMBD; i += 8) {
+                v8f wv = v8f_load(w + i);
+                acc = v8f_fmadd(wv, wv, acc);
+            }
+            float s = v8f_hsum(acc);
+            for (; i < N_EMBD; i++) s += w[i] * w[i];
+            row_norm[v] = s;  /* squared norm — monotonic, fine for ranking */
+            vocab_idx[v] = v;
+        }
+
+        /* Sort vocab_idx by row_norm descending (largest norm first = keep).
+         * Comparator uses a file-scope static pointer (qsort_r is non-portable). */
+        g_prune_norm_ref = row_norm;
+        qsort(vocab_idx, VOCAB_SIZE, sizeof(int), prune_cmp_desc);
+
+        /* Keep top (1 - prune_frac) */
+        g_n_active_vocab = (int)((1.0f - g_prune_frac) * VOCAB_SIZE);
+        if (g_n_active_vocab < 1) g_n_active_vocab = 1;
+        g_active_vocab = malloc(g_n_active_vocab * sizeof(int));
+        if (!g_active_vocab) { fprintf(stderr, "[!] OOM active_vocab\n"); return 1; }
+        for (int i = 0; i < g_n_active_vocab; i++) {
+            g_active_vocab[i] = vocab_idx[i];
+        }
+
+        /* Stats: report the cutoff norm */
+        float cutoff_sq = row_norm[vocab_idx[g_n_active_vocab - 1]];
+        float cutoff = sqrtf(cutoff_sq);
+        float min_sq = row_norm[vocab_idx[VOCAB_SIZE - 1]];
+        float max_sq = row_norm[vocab_idx[0]];
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
+        printf("[*] vocab pruning: %d/%d active (cutoff norm=%.4f, range %.4f..%.4f), %.2fs\n",
+               g_n_active_vocab, VOCAB_SIZE, cutoff,
+               sqrtf(min_sq), sqrtf(max_sq), dt);
+        fflush(stdout);
+
+        free(row_norm);
+        free(vocab_idx);
     }
 
     load_tokenizer(tokenizer_path);
