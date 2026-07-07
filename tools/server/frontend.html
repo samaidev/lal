@@ -114,11 +114,14 @@
       Top-k <input type="number" id="topk" value="40" min="0" max="50257" step="1" style="width:62px;">
     </label>
     <label class="label" style="font-weight:normal; opacity:0.8;">
+      Top-p <input type="number" id="topp" value="0.9" min="0" max="1" step="0.05" style="width:52px;">
+    </label>
+    <label class="label" style="font-weight:normal; opacity:0.8;">
       Rep-penalty <input type="number" id="reppen" value="1.1" min="1" max="2" step="0.05" style="width:52px;">
     </label>
     <span class="preset" onclick="setSampling('greedy')" title="argmax">Greedy</span>
-    <span class="preset" onclick="setSampling('balanced')" title="temp0.8/top40/rep1.1">Balanced</span>
-    <span class="preset" onclick="setSampling('creative')" title="temp1.0/top80/rep1.2">Creative</span>
+    <span class="preset" onclick="setSampling('balanced')" title="temp0.8/top40/topp0.9/rep1.1">Balanced</span>
+    <span class="preset" onclick="setSampling('creative')" title="temp1.0/top80/topp0.95/rep1.2">Creative</span>
   </div>
 </div>
 
@@ -136,13 +139,14 @@ function setPreset(el) {
 /* Sampling presets. 'greedy' = pure argmax (temp 0); others vary creativity. */
 function setSampling(mode) {
   const map = {
-    greedy:   { temp: 0,   topk: 0,  reppen: 1.0 },
-    balanced: { temp: 0.8, topk: 40, reppen: 1.1 },
-    creative: { temp: 1.0, topk: 80, reppen: 1.2 }
+    greedy:   { temp: 0,   topk: 0,  topp: 0,    reppen: 1.0 },
+    balanced: { temp: 0.8, topk: 40, topp: 0.9,  reppen: 1.1 },
+    creative: { temp: 1.0, topk: 80, topp: 0.95, reppen: 1.2 }
   };
   const m = map[mode]; if (!m) return;
   document.getElementById('temp').value   = m.temp;
   document.getElementById('topk').value   = m.topk;
+  document.getElementById('topp').value   = m.topp;
   document.getElementById('reppen').value = m.reppen;
 }
 
@@ -156,6 +160,7 @@ async function generate() {
   /* Per-request sampling params (override server CLI defaults). */
   const temp   = parseFloat(document.getElementById('temp').value);
   const topk   = parseInt(document.getElementById('topk').value);
+  const topp   = parseFloat(document.getElementById('topp').value);
   const reppen = parseFloat(document.getElementById('reppen').value);
 
   btn.disabled = true;
@@ -170,7 +175,7 @@ async function generate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt: p, n_tokens: n,
-        temperature: temp, top_k: topk, repetition_penalty: reppen
+        temperature: temp, top_k: topk, top_p: topp, repetition_penalty: reppen
       })
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
