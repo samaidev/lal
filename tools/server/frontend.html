@@ -105,6 +105,21 @@
     <input type="number" id="ntok" value="20" min="1" max="100">
     <button id="btn" onclick="generate()">Generate</button>
   </div>
+  <div class="controls" style="flex-wrap:wrap; gap:10px 18px; margin-top:8px;">
+    <span class="label">Sampling</span>
+    <label class="label" style="font-weight:normal; opacity:0.8;">
+      Temp <input type="number" id="temp" value="0.8" min="0" max="2" step="0.1" style="width:52px;">
+    </label>
+    <label class="label" style="font-weight:normal; opacity:0.8;">
+      Top-k <input type="number" id="topk" value="40" min="0" max="50257" step="1" style="width:62px;">
+    </label>
+    <label class="label" style="font-weight:normal; opacity:0.8;">
+      Rep-penalty <input type="number" id="reppen" value="1.1" min="1" max="2" step="0.05" style="width:52px;">
+    </label>
+    <span class="preset" onclick="setSampling('greedy')" title="argmax">Greedy</span>
+    <span class="preset" onclick="setSampling('balanced')" title="temp0.8/top40/rep1.1">Balanced</span>
+    <span class="preset" onclick="setSampling('creative')" title="temp1.0/top80/rep1.2">Creative</span>
+  </div>
 </div>
 
 <div class="box">
@@ -118,12 +133,30 @@ function setPreset(el) {
   document.getElementById('prompt').value = el.textContent;
 }
 
+/* Sampling presets. 'greedy' = pure argmax (temp 0); others vary creativity. */
+function setSampling(mode) {
+  const map = {
+    greedy:   { temp: 0,   topk: 0,  reppen: 1.0 },
+    balanced: { temp: 0.8, topk: 40, reppen: 1.1 },
+    creative: { temp: 1.0, topk: 80, reppen: 1.2 }
+  };
+  const m = map[mode]; if (!m) return;
+  document.getElementById('temp').value   = m.temp;
+  document.getElementById('topk').value   = m.topk;
+  document.getElementById('reppen').value = m.reppen;
+}
+
 async function generate() {
   const p = document.getElementById('prompt').value;
   const n = parseInt(document.getElementById('ntok').value);
   const btn = document.getElementById('btn');
   const out = document.getElementById('output');
   const st  = document.getElementById('status');
+
+  /* Per-request sampling params (override server CLI defaults). */
+  const temp   = parseFloat(document.getElementById('temp').value);
+  const topk   = parseInt(document.getElementById('topk').value);
+  const reppen = parseFloat(document.getElementById('reppen').value);
 
   btn.disabled = true;
   out.innerHTML = '<span class="cursor"> </span>';
@@ -135,7 +168,10 @@ async function generate() {
     const r = await fetch('/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: p, n_tokens: n })
+      body: JSON.stringify({
+        prompt: p, n_tokens: n,
+        temperature: temp, top_k: topk, repetition_penalty: reppen
+      })
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();

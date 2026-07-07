@@ -861,6 +861,15 @@ static void real_attention(float *attn_out, const float *qkv, int layer_idx,
 
 static int gpt2_forward_token(int token_id, int position) {
 
+    /* Embedding: g_x = wte[token] + wpe[position].
+     * This was present in the original code but got dropped in commit ce19601,
+     * which left g_x holding the previous token's residual stream — causing
+     * degenerate "the the the..." output regardless of attention. Restored. */
+    if (token_id < 0 || token_id >= VOCAB_SIZE) token_id = 0;
+    if (position < 0 || position >= 1024) position = 0;
+    for (int i = 0; i < N_EMBD; i++)
+        g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
+
     /* Layers */
     for (int l = 0; l < N_LAYER; l++) {
         if (g_binary_mode) {
@@ -1072,6 +1081,27 @@ static void handle_request(int client_fd) {
         if (n_tokens < 1) n_tokens = 1;
         if (n_tokens > 100) n_tokens = 100;
 
+        /* Per-request sampling overrides (optional JSON fields).
+         * LAL-Bot's CLI flags set the server-wide defaults; these let the
+         * web frontend vary temperature/top_k/rep_penalty per request without
+         * restarting. We save the CLI defaults and restore them afterwards so
+         * a request without these fields keeps using the CLI config. */
+        float saved_temp = g_temperature;
+        int   saved_topk = g_top_k;
+        float saved_rep  = g_rep_penalty;
+        p = strstr(body, "\"temperature\"");
+        if (p) { p = strchr(p, ':'); if (p) g_temperature = (float)atof(p + 1); }
+        if (g_temperature < 0.0f) g_temperature = 0.0f;
+        if (g_temperature > 2.0f) g_temperature = 2.0f;
+        p = strstr(body, "\"top_k\"");
+        if (p) { p = strchr(p, ':'); if (p) g_top_k = atoi(p + 1); }
+        if (g_top_k < 0) g_top_k = 0;
+        if (g_top_k > VOCAB_SIZE) g_top_k = VOCAB_SIZE;
+        p = strstr(body, "\"repetition_penalty\"");
+        if (p) { p = strchr(p, ':'); if (p) g_rep_penalty = (float)atof(p + 1); }
+        if (g_rep_penalty < 1.0f) g_rep_penalty = 1.0f;
+        if (g_rep_penalty > 2.0f) g_rep_penalty = 2.0f;
+
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -1121,6 +1151,11 @@ static void handle_request(int client_fd) {
 
             if (total >= 1024) { n_tokens = gen + 1; break; }
         }
+
+        /* Restore CLI-default sampling params (per-request override done). */
+        g_temperature = saved_temp;
+        g_top_k = saved_topk;
+        g_rep_penalty = saved_rep;
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
