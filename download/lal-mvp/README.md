@@ -25,6 +25,8 @@ A logic-native language: write programs using **concept / boundary / relation** 
 
 4. **Web playground** — a Next.js app that lets you edit .lal source in the browser, click "Compile", and see the generated C code instantly. Supports quantization mode selection (float32/int8/int4). Runs lalc in a sandboxed API route.
 
+5. **Real GPT-2 embeddings (v0.6.1)** — `export_gpt2_embeddings.py` exports real GPT-2 (124M params, 768-dim) learned embeddings to word2vec format. `gpt2_demo.lal` classifies words into semantic categories using real GPT-2 knowledge. `gpt2_analogy.lal` solves the classic **king − man + woman = queen** analogy using `vadd`/`vsub` vector arithmetic — the compiled C binary has GPT-2 embeddings baked in, no PyTorch at runtime. Also added `vadd`/`vsub` vector operators for element-wise add/subtract.
+
 ## The language (6 primitives)
 
 ```lal

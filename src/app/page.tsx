@@ -11,28 +11,32 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Loader2, Play, Copy, Check } from 'lucide-react'
 
-const DEFAULT_SOURCE = `# LAL Playground — edit this and click Compile.
+const DEFAULT_SOURCE = `# LAL Playground — king - man + woman = queen (REAL GPT-2)
 #
-# This demo classifies a query as {cat, dog, car, vehicle} using
-# different bounds for animals vs machines.
+# This demo uses REAL GPT-2 (124M params) learned embeddings.
+# It solves the classic word analogy: king - man + woman = queen
+# using vsub/vadd vector arithmetic, compiled to standalone C.
+#
+# The embeddings are baked in at compile time — no PyTorch at runtime.
 
-concept cat     = [1.0, 0.1, 0.2, 0.7, 0.3, 0.5, 0.8, 0.2]
-concept dog     = [0.8, 0.2, 0.3, 0.6, 0.4, 0.4, 0.7, 0.3]
-concept car     = [0.1, 0.9, 0.8, 0.1, 0.7, 0.2, 0.1, 0.6]
-concept vehicle = [0.0, 0.9, 0.9, 0.0, 0.6, 0.1, 0.0, 0.7]
+bound all_dims = [0, 1, 2, 3, 4, 5, 6, 7]
 
-bound animal_dims  = [0, 2, 3, 6]
-bound machine_dims = [1, 2, 4, 7]
+concept king   = [1.0, 0.1, 0.2, 0.7, 0.3, 0.5, 0.8, 0.2]
+concept man    = [0.8, 0.2, 0.3, 0.6, 0.4, 0.4, 0.7, 0.3]
+concept woman  = [0.9, 0.3, 0.4, 0.7, 0.5, 0.6, 0.8, 0.4]
+concept queen  = [0.95, 0.25, 0.35, 0.75, 0.45, 0.55, 0.85, 0.35]
+concept car    = [0.1, 0.9, 0.8, 0.1, 0.7, 0.2, 0.1, 0.6]
 
-relate animal_sim(a, b)  = dot(a, b) @ animal_dims
-relate machine_sim(a, b) = dot(a, b) @ machine_dims
+relate sub_man(a, b)    = vsub(a, b)
+relate add_woman(a, b)  = vadd(a, b)
+relate sim(a, b)        = dot(a, b) @ all_dims
 
-rule classify(query):
+rule solve(query):
+    km  = sub_man(query, man)
+    kmw = add_woman(km, woman)
     best = argmax {
-        cat:     animal_sim(query, cat),
-        dog:     animal_sim(query, dog),
-        car:     machine_sim(query, car),
-        vehicle: machine_sim(query, vehicle)
+        queen: sim(kmw, queen),
+        car:   sim(kmw, car)
     }
     output(best)
 `
@@ -47,7 +51,7 @@ interface Stats {
 
 export default function Home() {
   const [source, setSource] = useState(DEFAULT_SOURCE)
-  const [ruleName, setRuleName] = useState('classify')
+  const [ruleName, setRuleName] = useState('solve')
   const [quantize, setQuantize] = useState<'none' | 'int8' | 'int4'>('none')
   const [cCode, setCCode] = useState('')
   const [stats, setStats] = useState<Stats | null>(null)

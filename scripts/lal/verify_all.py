@@ -118,6 +118,28 @@ DEMOS = [
                           "test_happy", "test_perfect", "test_sad", "test_worst"],
         "n_random": 0,
     },
+    {
+        "name": "gpt2_demo",
+        "lal": "/home/z/my-project/scripts/lal/gpt2_demo.lal",
+        "rule": "classify",
+        "c":   "/home/z/my-project/download/lal-mvp/src/gpt2_demo.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/gpt2_demo_x86_64",
+        "labels": ["royal", "geo", "animal", "vehicle", "food"],
+        "test_concepts": ["test_queen", "test_princess", "test_berlin", "test_madrid",
+                          "test_lion", "test_elephant", "test_truck", "test_bus",
+                          "test_coffee", "test_banana"],
+        "n_random": 0,
+    },
+    {
+        "name": "gpt2_analogy",
+        "lal": "/home/z/my-project/scripts/lal/gpt2_analogy.lal",
+        "rule": "solve",
+        "c":   "/home/z/my-project/download/lal-mvp/src/gpt2_analogy.c",
+        "bin": "/home/z/my-project/download/lal-mvp/build/gpt2_analogy_x86_64",
+        "labels": ["queen", "prince", "princess", "royal", "car", "apple"],
+        "test_concepts": ["king"],
+        "n_random": 0,
+    },
 ]
 
 def main():

@@ -554,6 +554,30 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
+        # relate name(a, b) = vadd(a, b)   (vector element-wise add, v0.6)
+        m = re.match(r"relate\s+(\w+)\s*\(([^)]*)\)\s*=\s*vadd\(([^)]*)\)\s*$", line)
+        if m:
+            name = m.group(1)
+            params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+            args = [a.strip() for a in m.group(3).split(",") if a.strip()]
+            if len(params) != 2 or len(args) != 2:
+                raise ParseError(f"relate vadd must have 2 params and 2 args: {line!r}")
+            relates.append(Relate(name, params, "vadd", None, None))
+            i += 1
+            continue
+
+        # relate name(a, b) = vsub(a, b)   (vector element-wise subtract, v0.6)
+        m = re.match(r"relate\s+(\w+)\s*\(([^)]*)\)\s*=\s*vsub\(([^)]*)\)\s*$", line)
+        if m:
+            name = m.group(1)
+            params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+            args = [a.strip() for a in m.group(3).split(",") if a.strip()]
+            if len(params) != 2 or len(args) != 2:
+                raise ParseError(f"relate vsub must have 2 params and 2 args: {line!r}")
+            relates.append(Relate(name, params, "vsub", None, None))
+            i += 1
+            continue
+
         # relate name(a) = permute(a, k)
         m = re.match(r"relate\s+(\w+)\s*\(([^)]*)\)\s*=\s*permute\(([^)]*)\)\s*$", line)
         if m:
@@ -755,6 +779,12 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
             if r.op == "permute":
                 a = arg_vals[0]
                 return _vsa_permute(a, r.permute_k)
+            if r.op == "vadd":
+                a, b = arg_vals[0], arg_vals[1]
+                return [a[i] + b[i] for i in range(len(a))]
+            if r.op == "vsub":
+                a, b = arg_vals[0], arg_vals[1]
+                return [a[i] - b[i] for i in range(len(a))]
             raise RuntimeError(f"unknown relate op: {r.op}")
         if isinstance(e, ERuleCall):
             # Recursively run the called rule with the arg as input
@@ -1149,10 +1179,10 @@ def _collect_param_bound_pairs(expr, relate_map, concept_names, rule_params, use
 
 
 def _collect_concepts_needing_full(expr, relate_map, concept_names, needed, memory_map):
-    """Collect concept names that need full-dim arrays (used by VSA ops, recall, or unbounded dot)."""
+    """Collect concept names that need full-dim arrays (used by VSA ops, vadd/vsub, recall, or unbounded dot)."""
     if isinstance(expr, ERelateCall):
         r = relate_map[expr.name]
-        if r.op in ("bind", "bundle", "permute"):
+        if r.op in ("bind", "bundle", "permute", "vadd", "vsub"):
             for a in expr.args:
                 if isinstance(a, EVar) and a.name in concept_names:
                     needed.add(a.name)
@@ -1624,7 +1654,7 @@ def _expr_is_vector(expr, relate_map, rule_map):
     """Does this expression produce a vector (vs a scalar)?"""
     if isinstance(expr, ERelateCall):
         r = relate_map[expr.name]
-        return r.op in ("bind", "bundle", "permute")
+        return r.op in ("bind", "bundle", "permute", "vadd", "vsub")
     if isinstance(expr, ERuleCall):
         return True  # rule calls return vectors
     if isinstance(expr, ERecall):
@@ -1792,13 +1822,26 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
             lines.append(f"    if (__max_abs > 1e-9f) {{ for (int i = 0; i < {vec_dim}; i++) {target_var}[i] /= __max_abs; }}")
             return
         if r.op == "permute":
-            # permute(a, k)[i] = a[(i - k) mod N]
             a = e.args[0]
             a_vec = _resolve_vec_arg(a, concept_names, rule_params, var_types)
             k = r.permute_k
             for i in range(vec_dim):
                 src = (i - k) % vec_dim
                 lines.append(f"    {target_var}[{i}] = {a_vec}[{src}];")
+            return
+        if r.op == "vadd":
+            a, b = e.args[0], e.args[1]
+            a_vec = _resolve_vec_arg(a, concept_names, rule_params, var_types)
+            b_vec = _resolve_vec_arg(b, concept_names, rule_params, var_types)
+            for i in range(vec_dim):
+                lines.append(f"    {target_var}[{i}] = {a_vec}[{i}] + {b_vec}[{i}];")
+            return
+        if r.op == "vsub":
+            a, b = e.args[0], e.args[1]
+            a_vec = _resolve_vec_arg(a, concept_names, rule_params, var_types)
+            b_vec = _resolve_vec_arg(b, concept_names, rule_params, var_types)
+            for i in range(vec_dim):
+                lines.append(f"    {target_var}[{i}] = {a_vec}[{i}] - {b_vec}[{i}];")
             return
         raise RuntimeError(f"relate op {r.op} is not vector")
     if isinstance(e, ERuleCall):
