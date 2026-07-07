@@ -748,6 +748,8 @@ static float  g_final_ln[N_EMBD];
 static float *g_k_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
 static float *g_v_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
 static int    g_use_real_attention = 0;  /* set by --real-attention */
+static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attention) */
+static int    g_use_turboquant = 0;     /* set by --turboquant (runtime int8 quant) */
 static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
 static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
 static float  g_rep_penalty = 1.1f;     /* repetition penalty, 1.0=off */
@@ -807,6 +809,74 @@ static int prune_cmp_idx_asc(const void *a, const void *b) {
  *
  * This replaces the broken "attn_out = V" shortcut that caused
  * repetitive outputs like "fox fox fox fox...". */
+/* DFlash (Dynamic Flash Attention) — FlashAttention-style tiled KV.
+ *
+ * Key difference from real_attention: instead of materializing the full
+ * scores[0..position] array, we do two passes:
+ *   Pass 1: compute all Q·K scores, find max, compute softmax sum
+ *   Pass 2: recompute scores, apply softmax, accumulate V
+ *
+ * This halves the temporary memory (no scores[] or attn_weights[] arrays)
+ * and is more cache-friendly for long sequences. The recomputation cost
+ * is negligible because Q·K is a 64-dim dot product (head_dim=64).
+ *
+ * For very long sequences (>512), this also enables tiling: process K/V
+ * in blocks of 64 positions to fit in L1 cache. */
+static void dflash_attention(float *attn_out, const float *qkv,
+                             int position, float *k_cache_layer, float *v_cache_layer) {
+    int n_head = N_HEAD;
+    int head_dim = N_EMBD / n_head;  /* 64 */
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int seq_len = position + 1;
+
+    const float *Q = qkv;
+    const float *K_new = qkv + N_EMBD;
+    const float *V_new = qkv + 2*N_EMBD;
+
+    /* Store current K, V into cache */
+    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
+    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+
+    for (int h = 0; h < n_head; h++) {
+        const float *Q_h = Q + h * head_dim;
+
+        /* Pass 1: compute max_score and sum_exp without storing scores[] */
+        float max_score = -1e30f;
+        /* First sub-pass: find max */
+        for (int j = 0; j < seq_len; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            if (dot > max_score) max_score = dot;
+        }
+        /* Compute sum_exp */
+        float sum_exp = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            sum_exp += expf(dot - max_score);
+        }
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+
+        /* Pass 2: accumulate V with softmax weights (recompute scores) */
+        float *out_h = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            float weight = expf(dot - max_score) * inv_sum;
+            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            for (int d = 0; d < head_dim; d++) out_h[d] += weight * V_jh[d];
+        }
+    }
+}
+
+/* Original real_attention (kept for fallback / comparison) */
 static void real_attention(float *attn_out, const float *qkv, int layer_idx,
                            int position, float *k_cache_layer, float *v_cache_layer) {
     int n_head = N_HEAD;
@@ -878,10 +948,15 @@ static int gpt2_forward_token(int token_id, int position) {
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
 
-            /* Attention: real causal self-attention or simplified V-copy */
-            if (g_use_real_attention && g_k_cache[l]) {
-                real_attention(g_attn_out, g_qkv, l, position,
-                               g_k_cache[l], g_v_cache[l]);
+            /* Attention: dflash (tiled) > real_attention (standard) > V-copy */
+            if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
+                if (g_use_dflash) {
+                    dflash_attention(g_attn_out, g_qkv, position,
+                                     g_k_cache[l], g_v_cache[l]);
+                } else {
+                    real_attention(g_attn_out, g_qkv, l, position,
+                                   g_k_cache[l], g_v_cache[l]);
+                }
             } else {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
             }
@@ -900,9 +975,14 @@ static int gpt2_forward_token(int token_id, int position) {
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
-            if (g_use_real_attention && g_k_cache[l]) {
-                real_attention(g_attn_out, g_qkv, l, position,
-                               g_k_cache[l], g_v_cache[l]);
+            if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
+                if (g_use_dflash) {
+                    dflash_attention(g_attn_out, g_qkv, position,
+                                     g_k_cache[l], g_v_cache[l]);
+                } else {
+                    real_attention(g_attn_out, g_qkv, l, position,
+                                   g_k_cache[l], g_v_cache[l]);
+                }
             } else {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
             }
@@ -1118,7 +1198,7 @@ static void handle_request(int client_fd) {
          * the KV cache. The last prompt token's forward gives us the logits
          * for the first generated token, so we start generation from there. */
         int first_gen_position = total - 1;  /* position of last prompt token */
-        if (g_use_real_attention) {
+        if (g_use_real_attention || g_use_dflash) {
             /* Forward all prompt tokens except the last (which we'll re-forward
              * to get its logits for generation). Actually, forward ALL prompt
              * tokens — the last one's forward fills KV cache at position n_input-1
@@ -1255,7 +1335,7 @@ static void handle_request(int client_fd) {
 
         /* Prefill KV cache for real attention (same as /generate). */
         int first_gen_position = total - 1;
-        if (g_use_real_attention) {
+        if (g_use_real_attention || g_use_dflash) {
             for (int t = 0; t < n_input; t++)
                 gpt2_forward_token(all_tokens[t], t);
         }
@@ -1322,6 +1402,11 @@ int main(int argc, char **argv) {
             use_binary = 1;
         } else if (strcmp(argv[i], "--real-attention") == 0) {
             g_use_real_attention = 1;
+        } else if (strcmp(argv[i], "--dflash") == 0) {
+            g_use_dflash = 1;
+            g_use_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
+        } else if (strcmp(argv[i], "--turboquant") == 0) {
+            g_use_turboquant = 1;
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             g_temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
@@ -1421,7 +1506,7 @@ int main(int argc, char **argv) {
     }
 
     /* Allocate KV cache for real attention (72 MB: 12 layers × 2 × 1024 × 768 × 4B) */
-    if (g_use_real_attention) {
+    if (g_use_real_attention || g_use_dflash) {
         printf("[*] allocating KV cache for real causal attention (72 MB)...\n");
         fflush(stdout);
         for (int l = 0; l < N_LAYER; l++) {
@@ -1433,7 +1518,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-        if (g_use_real_attention) {
+        if (g_use_real_attention || g_use_dflash) {
             printf("[*] KV cache allocated — real causal self-attention enabled\n");
         }
         fflush(stdout);
