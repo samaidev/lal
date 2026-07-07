@@ -1806,6 +1806,43 @@ static int gpt2_forward_token(int token_id, int position) {
     return best;
 }
 
+/* === LAL three-layer fusion (level 1): live-model forward entry point ===
+ *
+ * Prime the model with a prompt string, populating g_final_ln (the final
+ * hidden state) so a subsequent lal_server_get_hidden() call returns the
+ * model's contextualized representation of this prompt.
+ *
+ * This is the level-1 entry point for LIVE model testing: a test harness
+ * (or, at fusion level 2, the .lal program itself) calls this to run the
+ * DNN forward over a prompt, then the .lal logic layer reads the resulting
+ * hidden state via runtime_context() / lal_server_get_hidden().
+ *
+ * Reuses the same prefill path as the HTTP /generate handler: tokenize via
+ * encode_text, loop gpt2_forward_token over all prompt tokens (skipping the
+ * LM head — we only need the hidden state, not generated tokens). After this
+ * call, g_final_ln holds the last prompt token's contextualized vector.
+ *
+ * For semantically meaningful context (last token attending to the full
+ * prompt), run the server with --real-attention or --dflash so the KV cache
+ * is populated during prefill. Without real attention, g_final_ln is still a
+ * valid 768-dim model output but reflects only the last token in isolation
+ * (V-copy attention), not the full prompt context.
+ *
+ * Returns the number of prompt tokens processed, or -1 if prompt is NULL.
+ * The model + tokenizer must be loaded first (via the normal server init). */
+int lal_server_forward(const char *prompt) {
+    if (!prompt) return -1;
+    static int tokens[256];
+    int n = encode_text(prompt, tokens, 256);
+    if (n == 0) { tokens[0] = 464; n = 1; }  /* fall back to "The" token */
+    for (int t = 0; t < n; t++) {
+        g_skip_lm_head = (t < n - 1) ? 1 : 0;
+        gpt2_forward_token(tokens[t], t);
+    }
+    g_skip_lm_head = 0;
+    return n;
+}
+
 /* ========================================================================
  * HTTP server
  * ======================================================================== */
