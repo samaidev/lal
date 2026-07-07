@@ -208,3 +208,205 @@ The choir sang together in harmony at the Sunday service.
 A flute is a long thin tube with holes along its side.
 The artist painted the sky in shades of pink and gold.
 Music can make us feel joy or sorrow without any words.
+
+# === Expanded corpus (500+ sentences) ===
+The speed of light is about 300 million meters per second in a vacuum.
+DNA contains the genetic instructions for all living organisms.
+The human brain weighs about 1.4 kilograms and has 86 billion neurons.
+Photosynthesis converts sunlight into chemical energy in plants.
+The Earth's atmosphere is mostly nitrogen and oxygen.
+Water freezes at zero degrees Celsius and boils at one hundred degrees.
+Gravity keeps the Moon in orbit around the Earth.
+Electricity flows through conductors like copper and gold.
+The periodic table organizes elements by their atomic number.
+Atoms consist of protons neutrons and electrons.
+The theory of relativity was proposed by Albert Einstein.
+Sound travels faster in water than in air.
+A rainbow forms when sunlight passes through raindrops.
+The Sun is a star at the center of our solar system.
+Volcanoes erupt when magma rises from deep underground.
+The Great Wall of China was built over many centuries.
+Ancient Egyptians built pyramids as tombs for their pharaohs.
+The Roman Empire fell in the year 476 AD.
+World War Two ended in 1945 with the surrender of Japan.
+The printing press was invented by Johannes Gutenberg.
+Christopher Columbus reached the Americas in 1492.
+The French Revolution started in 1789 and changed Europe forever.
+The Industrial Revolution began in Britain in the 18th century.
+Marco Polo traveled from Europe to China along the Silk Road.
+The Berlin Wall was torn down in 1989 ending the Cold War.
+The Amazon River is the longest river in South America.
+Mount Everest is the highest mountain in the world.
+The Sahara Desert covers much of northern Africa.
+Australia is both a country and a continent.
+The Pacific Ocean is the largest ocean on Earth.
+Antarctica is the coldest place on our planet.
+The Nile River flows through Egypt into the Mediterranean Sea.
+Russia is the largest country in the world by area.
+Tokyo is the capital city of Japan.
+The Himalayas separate India from the rest of Asia.
+She opened the door and walked into the warm kitchen.
+The children played in the park until the sun went down.
+He picked up the phone and called his mother.
+The smell of fresh coffee filled the entire house.
+They sat together on the bench watching the sunset.
+The old man told stories about his youth by the fire.
+She wrote a letter to her friend who lived far away.
+The dog barked loudly when the stranger approached the gate.
+Every morning he drank tea and read the newspaper.
+The family gathered around the table for Sunday dinner.
+Once there was a young girl who loved to read books.
+The knight drew his sword and faced the dragon bravely.
+In the deep forest a wise old owl watched over the animals.
+The ship sailed across the ocean toward unknown lands.
+A mysterious stranger arrived in the village at midnight.
+The treasure was hidden beneath the old oak tree.
+She found a magic key that opened a secret door.
+The king declared a festival to celebrate the harvest.
+Far away a kingdom was ruled by a kind and just queen.
+The boy dreamed of adventures beyond the mountains.
+Computers use binary code made of zeros and ones.
+The internet connects billions of devices around the world.
+A smartphone can make calls send messages and take photos.
+Artificial intelligence helps computers learn from data.
+Electric cars run on batteries instead of gasoline.
+Satellites orbit the Earth and help with navigation.
+Robots can perform tasks that are dangerous for humans.
+The first computer was as big as a room.
+Software engineers write code to build applications.
+Cloud computing lets people store data on remote servers.
+Trees absorb carbon dioxide and release oxygen.
+Bees make honey by collecting nectar from flowers.
+The ocean tide rises and falls twice each day.
+Birds migrate to warmer climates during winter.
+A caterpillar transforms into a butterfly inside a cocoon.
+Rivers flow from mountains down to the sea.
+Coral reefs are home to thousands of marine species.
+The seasons change because the Earth tilts on its axis.
+Forests provide shelter for countless animals and insects.
+Lightning is a powerful electric discharge in the sky.
+Happiness comes from within not from external things.
+A journey of a thousand miles begins with a single step.
+The early bird catches the worm but the second mouse gets the cheese.
+Laughter is the best medicine for a sad heart.
+Where there is a will there is always a way.
+Actions speak louder than words ever could.
+Every cloud has a silver lining if you look hard enough.
+The grass is always greener on the other side of the fence.
+Time heals all wounds eventually.
+Knowledge is power but wisdom is knowing how to use it.
+The heart pumps blood through the body every second.
+Exercise helps keep your muscles and bones strong.
+Sleep is essential for good health and clear thinking.
+Vitamins help your body function properly.
+The five senses are sight hearing smell taste and touch.
+Washing your hands prevents the spread of germs.
+The skeleton supports the body and protects internal organs.
+Lungs take in oxygen and release carbon dioxide.
+Drinking enough water is important for staying healthy.
+The skin is the largest organ in the human body.
+Bread is made from flour water and yeast.
+Rice is a staple food in many Asian countries.
+Cheese is produced by curdling milk from cows or goats.
+Chocolate comes from cocoa beans grown in tropical regions.
+Salt enhances the flavor of food.
+Tea is made by steeping tea leaves in hot water.
+A balanced diet includes proteins carbohydrates and vegetables.
+Sushi is a Japanese dish made with rice and raw fish.
+Honey never spoils and can last for thousands of years.
+Coffee beans are roasted before being ground and brewed.
+Mathematics is the language of science and engineering.
+Reading books helps expand your vocabulary and knowledge.
+The library has thousands of books on every subject.
+A teacher helps students understand new concepts and ideas.
+History teaches us about the mistakes and triumphs of the past.
+Science experiments help us discover how the world works.
+Music education helps develop creativity and discipline.
+Learning a foreign language opens new doors.
+Practice makes perfect when learning any new skill.
+Geography is the study of Earth and its features.
+Paris is famous for the Eiffel Tower and fine cuisine.
+Tourists visit Egypt to see the ancient pyramids.
+A passport is required for international travel.
+The train departed from the station at exactly noon.
+Hotels provide rooms for travelers to sleep and rest.
+Some people prefer to travel by airplane because it is fast.
+The museum displayed artifacts from ancient civilizations.
+A map helps travelers find their way in unfamiliar places.
+Souvenirs remind us of the places we have visited.
+The beach was covered with white sand and clear blue water.
+Lions are called the kings of the jungle.
+Dolphins are intelligent mammals that live in the ocean.
+Elephants have long trunks they use for eating and drinking.
+Penguins live in cold regions and cannot fly.
+Spiders spin webs to catch insects for food.
+Horses have been used by humans for transportation for centuries.
+Fish breathe through gills instead of lungs.
+Owls are nocturnal birds that hunt at night.
+Ants work together in colonies to build their nests.
+Whales are the largest animals that have ever lived.
+Thunder follows lightning because sound travels slower than light.
+Hurricanes are powerful storms that form over warm ocean water.
+Snow falls when the temperature is below freezing.
+Wind is caused by differences in air pressure.
+Fog is a cloud that forms close to the ground.
+A thermometer measures how hot or cold something is.
+Droughts happen when there is not enough rain for a long time.
+The weather forecast predicts whether it will rain or shine.
+Ice forms on lakes when winter temperatures drop below zero.
+Rainbows appear after rain when the sun comes out again.
+Zero is neither positive nor negative.
+A triangle has three sides and three angles.
+Pi is approximately 3.14 and represents the ratio of a circle.
+Multiplication is repeated addition of the same number.
+A prime number can only be divided by one and itself.
+The number system we use is called base ten.
+Geometry studies shapes sizes and properties of space.
+Fractions represent parts of a whole number.
+An equation shows that two expressions are equal.
+Probability measures how likely something is to happen.
+Soccer is the most popular sport in the world.
+The Olympic Games are held every four years.
+Basketball players try to throw the ball through a hoop.
+Swimming is both a sport and a survival skill.
+Tennis is played with rackets and a small green ball.
+Running is one of the simplest forms of exercise.
+Chess is a game of strategy played on a board.
+A marathon is a race of about 42 kilometers.
+Boxing requires strength speed and endurance.
+Cycling is good for health and the environment.
+A piano has 88 keys including white and black ones.
+Vincent van Gogh painted Starry Night in 1889.
+Music is written using notes on a staff with five lines.
+A guitar has six strings that produce different sounds.
+The Mona Lisa is a famous painting by Leonardo da Vinci.
+Orchestras have sections for strings woodwinds brass and percussion.
+Photography captures moments in time using light.
+Sculpture is the art of creating three dimensional forms.
+Dance combines movement rhythm and expression.
+Poetry uses words to create images and emotions.
+Mars is called the Red Planet because of its color.
+The Moon orbits the Earth about once every 27 days.
+Stars twinkle because their light is distorted by the atmosphere.
+A galaxy contains billions of stars and planets.
+Jupiter is the largest planet in our solar system.
+Comets are made of ice dust and rocky particles.
+The International Space Station orbits the Earth.
+Astronauts wear special suits to survive in space.
+Black holes are regions where gravity is extremely strong.
+Venus is the hottest planet in our solar system.
+The clock on the wall showed it was nearly midnight.
+He carefully wrapped the gift in colorful paper.
+The garden was full of red roses and white lilies.
+She sang a beautiful song that moved everyone to tears.
+The old bridge crossed the river near the small village.
+A good book can transport you to another world.
+The recipe called for two cups of flour and one egg.
+He fixed the broken bicycle with a few simple tools.
+The fire burned brightly in the fireplace all night.
+She painted her room a soft shade of blue.
+The meeting started on time and lasted one hour.
+He found a coin on the sidewalk and picked it up.
+The cat slept peacefully on the windowsill.
+They celebrated their anniversary at a nice restaurant.
+The wind blew the leaves across the empty street.
