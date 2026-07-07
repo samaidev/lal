@@ -414,7 +414,7 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                     }
                 }
             }
-            y[j] = dot * bl->alpha[j] / bl->in_dim + bl->bias[j];
+            y[j] = dot * bl->alpha[j] + bl->bias[j];
         }
         return;
     }
