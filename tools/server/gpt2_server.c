@@ -750,6 +750,9 @@ static float *g_v_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
 static int    g_use_real_attention = 0;  /* set by --real-attention */
 static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
 static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
+static float  g_rep_penalty = 1.1f;     /* repetition penalty, 1.0=off */
+static int    g_recent_tokens[256];     /* ring buffer of recent tokens */
+static int    g_n_recent = 0;           /* count of recent tokens (up to 256) */
 static float *g_logits = NULL;       /* [VOCAB_SIZE], allocated once */
 static int    g_n_threads = 1;       /* worker threads for LM head */
 
@@ -917,11 +920,24 @@ static int gpt2_forward_token(int token_id, int position) {
         lm_head_parallel(g_logits, g_final_ln, g_wte, VOCAB_SIZE, N_EMBD, g_n_threads);
     }
 
-    /* Sampling: top-k + temperature.
+    /* Sampling: top-k + temperature + repetition penalty.
      * Pure argmax causes repetitive loops ("the the the...").
-     * Top-k sampling from the k highest-prob tokens breaks the cycle
-     * and produces more natural text. Default: temperature=0.8, top_k=40. */
+     * Top-k sampling from the k highest-prob tokens breaks the cycle.
+     * Repetition penalty reduces probability of already-generated tokens.
+     * Defaults: temperature=0.8, top_k=40, rep_penalty=1.1. */
     if (g_temperature > 0.0f && g_top_k > 0) {
+        /* Apply repetition penalty: reduce logits of tokens in recent history */
+        if (g_rep_penalty > 1.0f) {
+            /* Penalty the last N generated tokens (from g_recent_tokens) */
+            for (int i = 0; i < g_n_recent; i++) {
+                int t = g_recent_tokens[i];
+                if (t >= 0 && t < VOCAB_SIZE) {
+                    if (g_logits[t] > 0) g_logits[t] /= g_rep_penalty;
+                    else g_logits[t] *= g_rep_penalty;
+                }
+            }
+        }
+
         /* Find top-k logits via partial selection (simple approach: scan once) */
         int top_k = g_top_k;
         if (top_k > VOCAB_SIZE) top_k = VOCAB_SIZE;
@@ -1085,16 +1101,24 @@ static void handle_request(int client_fd) {
              * for the NEXT token. We can use that directly for gen=0. */
         }
 
+        /* Reset recent token tracking for repetition penalty */
+        g_n_recent = 0;
+
         for (int gen = 0; gen < n_tokens; gen++) {
             int pos = first_gen_position + gen;  /* position in sequence */
-            /* For real attention: position pos is already in KV cache if we
-             * forwarded the prompt. The first generated token uses the logits
-             * from the last prompt token's forward. But our API returns a token,
-             * so we re-forward at position=pos (KV cache already has it, but
-             * that's OK — real_attention overwrites the same slot). */
             int next = gpt2_forward_token(all_tokens[total - 1], pos);
             output_tokens[gen] = next;
             all_tokens[total++] = next;
+
+            /* Track for repetition penalty (ring buffer) */
+            if (g_n_recent < 256) {
+                g_recent_tokens[g_n_recent++] = next;
+            } else {
+                /* Shift ring buffer */
+                memmove(g_recent_tokens, g_recent_tokens + 1, 255 * sizeof(int));
+                g_recent_tokens[255] = next;
+            }
+
             if (total >= 1024) { n_tokens = gen + 1; break; }
         }
 
@@ -1162,6 +1186,8 @@ int main(int argc, char **argv) {
             g_temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
             g_top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
+            g_rep_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
             g_prune_frac = (float)atof(argv[++i]);
             if (g_prune_frac < 0.0f) g_prune_frac = 0.0f;
