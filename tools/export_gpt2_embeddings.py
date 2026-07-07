@@ -53,7 +53,7 @@ def main():
     # GPT-2 uses BPE tokenization. For single common words, the word is usually
     # a single token (with a leading space). We look up each word's token.
     DIM = 768
-    out_path = "/home/z/my-project/scripts/lal/gpt2_embeddings.txt"
+    out_path = "/home/z/my-project/prebuilt/gpt2_embeddings.txt"
 
     exported = []
     for word in WORDS:

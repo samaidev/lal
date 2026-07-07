@@ -477,12 +477,12 @@ int main(int argc, char **argv) {
     int n_gen = argc > 2 ? atoi(argv[2]) : 20;
 
     printf("[*] loading GPT-2 weights...\n");
-    load_weights("/home/z/my-project/scripts/lal/gpt2_weights.bin");
+    load_weights("/home/z/my-project/prebuilt/gpt2_weights.bin");
 #ifdef BINARY
-    gpt2_binary_init("/home/z/my-project/scripts/lal/gpt2_binary_finetuned.bin");
+    gpt2_binary_init("/home/z/my-project/prebuilt/gpt2_binary_finetuned.bin");
 #endif
     printf("[*] loading tokenizer...\n");
-    load_tokenizer("/home/z/my-project/scripts/lal/gpt2_tokenizer.bin");
+    load_tokenizer("/home/z/my-project/prebuilt/gpt2_tokenizer.bin");
 
     /* Encode prompt */
     int tokens[1024];

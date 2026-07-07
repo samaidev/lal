@@ -436,7 +436,7 @@ int main(int argc, char **argv) {
     struct timespec t0,t1;
     clock_gettime(CLOCK_MONOTONIC,&t0);
     printf("[*] loading weights...\n");
-    load_all_tensors("/home/z/my-project/scripts/lal/gpt2_weights.bin");
+    load_all_tensors("/home/z/my-project/prebuilt/gpt2_weights.bin");
     load_layernorms();
     load_and_binarize();
     clock_gettime(CLOCK_MONOTONIC,&t1);

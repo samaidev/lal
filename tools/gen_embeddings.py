@@ -54,5 +54,5 @@ def generate(dim, path):
 
 
 if __name__ == "__main__":
-    generate(300, "/home/z/my-project/scripts/lal/embeddings_300d.txt")
-    generate(768, "/home/z/my-project/scripts/lal/embeddings_768d.txt")
+    generate(300, "/home/z/my-project/prebuilt/embeddings_300d.txt")
+    generate(768, "/home/z/my-project/prebuilt/embeddings_768d.txt")

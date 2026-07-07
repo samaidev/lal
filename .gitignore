@@ -1,59 +1,19 @@
-# Build artifacts
-build/
-*.o
-*.so
-*.exe
-
-# Generated C files
-*.c.gen
-
 # Python
 __pycache__/
 *.pyc
-*.pyo
-
-# Large binary files (regenerate with tools/)
-*.bin
-gpt2_weights.bin
-gpt2_binary_finetuned.bin
-gpt2_tokenizer.bin
-gpt2_model.bin
-
-# Environment
-.env
-
-# Old Next.js / web playground (removed)
-node_modules/
-.next/
-dev.log
-*.log
-.zscripts/
-Caddyfile
-package.json
-package-lock.json
-bun.lock
-tsconfig.json
-next.config.ts
-next-env.d.ts
-postcss.config.mjs
-tailwind.config.ts
-eslint.config.mjs
-components.json
-postcss.config.mjs
-
-# Skills / upload (not part of this project)
-skills/
-upload/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Old directories (superseded by new structure)
-scripts/
-download/
-src/
-mini-services/
-examples/
-prisma/
-public/
+# Build temp (prebuilt/ is tracked!)
+build/
+
+# Large binary weight files (regenerate with tools/)
+prebuilt/gpt2_weights.bin
+prebuilt/gpt2_binary_finetuned.bin
+
+# Not part of project
+skills/
+upload/
+.env

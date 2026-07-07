@@ -280,7 +280,7 @@ def main():
     
     # Save fine-tuned binary weights
     print("\n[*] exporting binary weights...")
-    export_binary_weights(model, "/home/z/my-project/scripts/lal/gpt2_binary_finetuned.bin")
+    export_binary_weights(model, "/home/z/my-project/prebuilt/gpt2_binary_finetuned.bin")
     
     # Test generation with fine-tuned model
     print("\n[*] testing generation...")

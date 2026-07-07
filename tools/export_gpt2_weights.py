@@ -17,7 +17,7 @@ def main():
     model.eval()
     sd = model.state_dict()
 
-    out_path = "/home/z/my-project/scripts/lal/gpt2_weights.bin"
+    out_path = "/home/z/my-project/prebuilt/gpt2_weights.bin"
     with open(out_path, "wb") as f:
         # Header: magic + count
         f.write(b"GPW2")
