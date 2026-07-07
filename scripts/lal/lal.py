@@ -1003,15 +1003,20 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
 _SIMD_HELPERS_NEEDED: Set[int] = set()
 # Global quantization mode: None (float32) or "int8".
 _QUANTIZE_MODE = None
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None) -> str:
+# v0.8: parallel emission mode — emit wide SIMD for linear layers
+_PARALLEL_MODE = False
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False) -> str:
     """Compile a rule (and any rules it calls) to specialized C.
 
-    quantize: None for float32, or "int8" to store concept vectors as int8 + scale
-              (4x smaller .rodata, with runtime dequantization in the dot helper).
+    quantize: None for float32, or "int8"/"int4" for quantized concept data.
+    parallel: if True, emit wide SIMD (AVX2/NEON) for linear layers — 8 outputs
+              per instruction instead of serial loop. This realizes the "parallel
+              logic" model: all output dimensions computed simultaneously.
     """
-    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE
+    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE
     _SIMD_HELPERS_NEEDED = set()  # reset for this compilation
     _QUANTIZE_MODE = quantize
+    _PARALLEL_MODE = parallel
 
     concept_map = {c.name: c.vec for c in concepts}
     bound_map = {b.name: b.dims for b in bounds}
@@ -1946,6 +1951,143 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
     raise RuntimeError(f"can't emit scalar: {e}")
 
 
+def _emit_linear_serial(lines, target_var, r, a_vec, out_dim, in_dim, bias):
+    """Serial CSR sparse matmul — one output at a time (v0.7 default)."""
+    w = r.weight_data
+    values = []
+    col_idx = []
+    row_ptr = [0]
+    for j in range(out_dim):
+        wj = w[j]
+        for i in range(in_dim):
+            if wj[i] != 0.0:
+                values.append(wj[i])
+                col_idx.append(i)
+        row_ptr.append(len(values))
+    nnz = len(values)
+    prune_pct = 100.0 * (1.0 - nnz / (out_dim * in_dim)) if out_dim * in_dim > 0 else 0.0
+
+    arr_prefix = f"_lal_{r.name}_{id(r) & 0xFFFFFF:x}"
+    lines.append(f"    /* linear {r.name} (serial CSR): {out_dim} out, {nnz}/{out_dim*in_dim} kept ({prune_pct:.1f}% pruned) */")
+    if nnz > 0:
+        vals_str = ", ".join(f"{v:.6f}f" for v in values)
+        cols_str = ", ".join(str(c) for c in col_idx)
+        rows_str = ", ".join(str(rp) for rp in row_ptr)
+        lines.append(f"    static const float {arr_prefix}_vals[{nnz}] = {{{vals_str}}};")
+        lines.append(f"    static const int {arr_prefix}_cols[{nnz}] = {{{cols_str}}};")
+        lines.append(f"    static const int {arr_prefix}_rowptr[{out_dim+1}] = {{{rows_str}}};")
+        lines.append(f"    for (int j = 0; j < {out_dim}; j++) {{")
+        lines.append(f"        float s = {bias[j]:.6f}f;")
+        lines.append(f"        for (int k = {arr_prefix}_rowptr[j]; k < {arr_prefix}_rowptr[j+1]; k++) {{")
+        lines.append(f"            s += {a_vec}[{arr_prefix}_cols[k]] * {arr_prefix}_vals[k];")
+        lines.append(f"        }}")
+        lines.append(f"        {target_var}[j] = s;")
+        lines.append(f"    }}")
+    else:
+        for j in range(out_dim):
+            lines.append(f"    {target_var}[{j}] = {bias[j]:.6f}f;")
+
+
+def _emit_linear_parallel(lines, target_var, r, a_vec, out_dim, in_dim, bias):
+    """Parallel SIMD sparse matmul — 8 outputs per AVX2 instruction (v0.8).
+
+    Uses CSR storage (compact) but processes 8 consecutive output rows at a time
+    via AVX2 gather + FMA. This realizes the "parallel logic" model: 8 output
+    dimensions (8 "rules") computed simultaneously per SIMD instruction.
+
+    The key: instead of a serial loop over j, we block j into groups of 8 and
+    use _mm256_i32gather_ps to collect 8 input values (one per output row's
+    current column), then one _mm256_fmadd_ps advances all 8 accumulators.
+    """
+    w = r.weight_data
+    # Build CSR
+    values = []
+    col_idx = []
+    row_ptr = [0]
+    for j in range(out_dim):
+        wj = w[j]
+        for i in range(in_dim):
+            if wj[i] != 0.0:
+                values.append(wj[i])
+                col_idx.append(i)
+        row_ptr.append(len(values))
+    nnz = len(values)
+    prune_pct = 100.0 * (1.0 - nnz / (out_dim * in_dim)) if out_dim * in_dim > 0 else 0.0
+
+    arr_prefix = f"_lal_{r.name}_{id(r) & 0xFFFFFF:x}"
+    lines.append(f"    /* linear {r.name} (PARALLEL SIMD): {out_dim} out, {nnz}/{out_dim*in_dim} kept ({prune_pct:.1f}% pruned) */")
+    lines.append(f"    /* 8 outputs per AVX2 gather+FMA — parallel logic */")
+
+    # Emit compact CSR arrays
+    if nnz > 0:
+        vals_str = ", ".join(f"{v:.6f}f" for v in values)
+        cols_str = ", ".join(str(c) for c in col_idx)
+        rows_str = ", ".join(str(rp) for rp in row_ptr)
+        bias_str = ", ".join(f"{b:.6f}f" for b in bias)
+        lines.append(f"    static const float {arr_prefix}_vals[{nnz}] = {{{vals_str}}};")
+        lines.append(f"    static const int {arr_prefix}_cols[{nnz}] = {{{cols_str}}};")
+        lines.append(f"    static const int {arr_prefix}_rowptr[{out_dim+1}] = {{{rows_str}}};")
+        lines.append(f"    static const float {arr_prefix}_bias[{out_dim}] = {{{bias_str}}};")
+
+        lines.append(f"#if defined(__AVX2__) || defined(__AVX__)")
+        n_full_blocks = out_dim // 8
+        n_rem = out_dim % 8
+
+        # Process 8 output rows at a time (parallel logic)
+        lines.append(f"    for (int blk = 0; blk < {n_full_blocks}; blk++) {{")
+        lines.append(f"        int j0 = blk * 8;")
+        lines.append(f"        __m256 acc = _mm256_loadu_ps(&{arr_prefix}_bias[j0]);")
+        lines.append(f"        int max_rowlen = 0;")
+        lines.append(f"        for (int jj = 0; jj < 8; jj++) {{")
+        lines.append(f"            int rl = {arr_prefix}_rowptr[j0+jj+1] - {arr_prefix}_rowptr[j0+jj];")
+        lines.append(f"            if (rl > max_rowlen) max_rowlen = rl;")
+        lines.append(f"        }}")
+        # For each slot k in [0, max_rowlen), gather the 8 columns and values
+        lines.append(f"        for (int k = 0; k < max_rowlen; k++) {{")
+        lines.append(f"            int cols8[8]; float vals8[8];")
+        lines.append(f"            for (int jj = 0; jj < 8; jj++) {{")
+        lines.append(f"                int row_start = {arr_prefix}_rowptr[j0+jj];")
+        lines.append(f"                int row_end = {arr_prefix}_rowptr[j0+jj+1];")
+        lines.append(f"                if (k < row_end - row_start) {{")
+        lines.append(f"                    cols8[jj] = {arr_prefix}_cols[row_start + k];")
+        lines.append(f"                    vals8[jj] = {arr_prefix}_vals[row_start + k];")
+        lines.append(f"                }} else {{")
+        lines.append(f"                    cols8[jj] = 0; vals8[jj] = 0.0f;")
+        lines.append(f"                }}")
+        lines.append(f"            }}")
+        lines.append(f"            __m256i vi = _mm256_loadu_si256((const __m256i*)cols8);")
+        lines.append(f"            __m256 gathered = _mm256_i32gather_ps({a_vec}, vi, 4);")
+        lines.append(f"            __m256 vw = _mm256_loadu_ps(vals8);")
+        lines.append(f"            acc = _mm256_fmadd_ps(gathered, vw, acc);")
+        lines.append(f"        }}")
+        lines.append(f"        _mm256_storeu_ps(&{target_var}[j0], acc);")
+        lines.append(f"    }}")
+        # Remainder (serial)
+        if n_rem > 0:
+            j0 = n_full_blocks * 8
+            lines.append(f"    for (int j = {j0}; j < {out_dim}; j++) {{")
+            lines.append(f"        float s = {arr_prefix}_bias[j];")
+            lines.append(f"        for (int k = {arr_prefix}_rowptr[j]; k < {arr_prefix}_rowptr[j+1]; k++) {{")
+            lines.append(f"            s += {a_vec}[{arr_prefix}_cols[k]] * {arr_prefix}_vals[k];")
+            lines.append(f"        }}")
+            lines.append(f"        {target_var}[j] = s;")
+            lines.append(f"    }}")
+        lines.append(f"#else")
+        # Scalar fallback
+        lines.append(f"    for (int j = 0; j < {out_dim}; j++) {{")
+        lines.append(f"        float s = {arr_prefix}_bias[j];")
+        lines.append(f"        for (int k = {arr_prefix}_rowptr[j]; k < {arr_prefix}_rowptr[j+1]; k++) {{")
+        lines.append(f"            s += {a_vec}[{arr_prefix}_cols[k]] * {arr_prefix}_vals[k];")
+        lines.append(f"        }}")
+        lines.append(f"        {target_var}[j] = s;")
+        lines.append(f"    }}")
+        lines.append(f"#endif")
+    else:
+        bias_str = ", ".join(f"{b:.6f}f" for b in bias)
+        lines.append(f"    static const float {arr_prefix}_bias[{out_dim}] = {{{bias_str}}};")
+        lines.append(f"    for (int j = 0; j < {out_dim}; j++) {target_var}[j] = {arr_prefix}_bias[j];")
+
+
 def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule_params, var_types, max_recursion_depth, vec_dim):
     """Emit a vector expression, writing into target_var[0..vec_dim-1]."""
     if isinstance(e, ERelateCall):
@@ -1994,54 +2136,19 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
                 lines.append(f"    {target_var}[{i}] = {a_vec}[{i}] - {b_vec}[{i}];")
             return
         if r.op == "linear":
-            # v0.7: compiled linear layer. Emit the pruned weight as a static
-            # sparse array (CSR format: values + indices + row_ptrs), then a
-            # loop that only iterates over non-zero entries. This is the core
-            # "logic pruning" — weak connections are gone at compile time.
+            # v0.7: compiled linear layer with threshold pruning.
+            # v0.8: parallel mode emits wide SIMD (8 outputs per instruction).
             a = e.args[0]
             a_vec = _resolve_vec_arg(a, concept_names, rule_params, var_types)
-            w = r.weight_data  # [out_dim][in_dim], pruned (zeros for dropped)
+            w = r.weight_data  # [out_dim][in_dim], pruned
             bias = r.weight_bias  # [out_dim]
             out_dim = len(w)
             in_dim = len(w[0]) if out_dim > 0 else 0
 
-            # Build CSR representation
-            values = []
-            col_idx = []
-            row_ptr = [0]
-            for j in range(out_dim):
-                wj = w[j]
-                for i in range(in_dim):
-                    if wj[i] != 0.0:
-                        values.append(wj[i])
-                        col_idx.append(i)
-                row_ptr.append(len(values))
-            nnz = len(values)
-            prune_pct = 100.0 * (1.0 - nnz / (out_dim * in_dim)) if out_dim * in_dim > 0 else 0.0
-
-            # Emit static arrays (only once per rule — use a unique prefix)
-            arr_prefix = f"_lal_{r.name}_{id(r) & 0xFFFFFF:x}"
-            lines.append(f"    /* linear {r.name}: {out_dim} outputs, {nnz}/{out_dim*in_dim} kept ({prune_pct:.1f}% pruned) */")
-            # Emit the CSR arrays as static const at function scope
-            if nnz > 0:
-                vals_str = ", ".join(f"{v:.6f}f" for v in values)
-                cols_str = ", ".join(str(c) for c in col_idx)
-                rows_str = ", ".join(str(rp) for rp in row_ptr)
-                lines.append(f"    static const float {arr_prefix}_vals[{nnz}] = {{{vals_str}}};")
-                lines.append(f"    static const int {arr_prefix}_cols[{nnz}] = {{{cols_str}}};")
-                lines.append(f"    static const int {arr_prefix}_rowptr[{out_dim+1}] = {{{rows_str}}};")
-                # Emit the sparse matmul loop
-                lines.append(f"    for (int j = 0; j < {out_dim}; j++) {{")
-                lines.append(f"        float s = {bias[j]:.6f}f;")
-                lines.append(f"        for (int k = {arr_prefix}_rowptr[j]; k < {arr_prefix}_rowptr[j+1]; k++) {{")
-                lines.append(f"            s += {a_vec}[{arr_prefix}_cols[k]] * {arr_prefix}_vals[k];")
-                lines.append(f"        }}")
-                lines.append(f"        {target_var}[j] = s;")
-                lines.append(f"    }}")
+            if _PARALLEL_MODE and out_dim >= 8:
+                _emit_linear_parallel(lines, target_var, r, a_vec, out_dim, in_dim, bias)
             else:
-                # Fully pruned — just bias
-                for j in range(out_dim):
-                    lines.append(f"    {target_var}[{j}] = {bias[j]:.6f}f;  /* fully pruned */")
+                _emit_linear_serial(lines, target_var, r, a_vec, out_dim, in_dim, bias)
             return
         raise RuntimeError(f"relate op {r.op} is not vector")
     if isinstance(e, ERuleCall):
@@ -2214,13 +2321,16 @@ def main():
     ap.add_argument("output", nargs="?", help="output .c file (default: stdout)")
     ap.add_argument("--quantize", choices=["int8", "int4"], default=None,
                     help="quantize concept vectors to int8 (4x smaller) or int4 (8x smaller)")
+    ap.add_argument("--parallel", action="store_true",
+                    help="emit parallel SIMD linear layers (AVX2/NEON, 8 outputs per instruction)")
     args = ap.parse_args()
 
     with open(args.input) as f:
         source = f.read()
 
     concepts, bounds, memories, relates, rules = parse(source, args.input)
-    c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule, quantize=args.quantize)
+    c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule,
+                          quantize=args.quantize, parallel=args.parallel)
 
     if args.output:
         with open(args.output, "w") as f:
