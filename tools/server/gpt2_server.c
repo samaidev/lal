@@ -740,6 +740,16 @@ static float  g_fc[MLP_DIM];
 static float  g_mlp[MLP_DIM];
 static float  g_mlp_out[N_EMBD];
 static float  g_final_ln[N_EMBD];
+
+/* KV cache for real causal self-attention.
+ * Per layer: K and V for all positions [n_ctx, n_embd].
+ * Total: 12 layers × 2 (K+V) × 1024 × 768 × 4 bytes = 72 MB.
+ * Only allocated if --real-attention flag is set. */
+static float *g_k_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
+static float *g_v_cache[N_LAYER];  /* [n_ctx, n_embd] per layer */
+static int    g_use_real_attention = 0;  /* set by --real-attention */
+static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
+static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
 static float *g_logits = NULL;       /* [VOCAB_SIZE], allocated once */
 static int    g_n_threads = 1;       /* worker threads for LM head */
 
@@ -775,19 +785,78 @@ static int prune_cmp_idx_asc(const void *a, const void *b) {
     return (ia > ib) - (ia < ib);  /* ascending by vocab index */
 }
 
+/* Real causal self-attention with multi-head QK softmax.
+ *
+ * GPT-2: 12 heads, head_dim=64, n_embd=768.
+ * QKV from c_attn: [n_embd] → [3*n_embd] = [Q(768), K(768), V(768)]
+ * Each split into 12 heads of 64 dims.
+ *
+ * For position t, we have:
+ *   Q[t] = current query (just computed)
+ *   K[0..t] = all keys up to current (from KV cache + current)
+ *   V[0..t] = all values
+ *
+ * Per head h:
+ *   scores[j] = Q[h] · K[j,h] / sqrt(head_dim)   for j = 0..t
+ *   attn[h] = softmax(scores) @ V[0..t, h]
+ *
+ * Result: concat(attn[0..11]) → [n_embd] → c_proj
+ *
+ * This replaces the broken "attn_out = V" shortcut that caused
+ * repetitive outputs like "fox fox fox fox...". */
+static void real_attention(float *attn_out, const float *qkv, int layer_idx,
+                           int position, float *k_cache_layer, float *v_cache_layer) {
+    int n_head = N_HEAD;
+    int head_dim = N_EMBD / n_head;  /* 64 */
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *Q = qkv;                  /* [n_embd] */
+    const float *K_new = qkv + N_EMBD;     /* [n_embd] */
+    const float *V_new = qkv + 2*N_EMBD;   /* [n_embd] */
+
+    /* Store current K, V into cache at this position */
+    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
+    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+
+    float scores[1024];  /* max seq_len per head */
+    float attn_weights[1024];
+
+    for (int h = 0; h < n_head; h++) {
+        const float *Q_h = Q + h * head_dim;   /* [head_dim] */
+
+        /* Compute scores[j] = Q_h · K[j, h] * scale, for j = 0..position */
+        float max_score = -1e30f;
+        for (int j = 0; j <= position; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[j] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+
+        /* Softmax with max subtraction for numerical stability */
+        float sum_exp = 0.0f;
+        for (int j = 0; j <= position; j++) {
+            float e = expf(scores[j] - max_score);
+            attn_weights[j] = e;
+            sum_exp += e;
+        }
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+        for (int j = 0; j <= position; j++) attn_weights[j] *= inv_sum;
+
+        /* Weighted sum of V: attn_out[h] = sum_j attn_weights[j] * V[j, h] */
+        float *out_h = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        for (int j = 0; j <= position; j++) {
+            float w = attn_weights[j];
+            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            for (int d = 0; d < head_dim; d++) out_h[d] += w * V_jh[d];
+        }
+    }
+}
+
 static int gpt2_forward_token(int token_id, int position) {
-    /* Bounds check — prevent OOB access on g_wte/g_wpe */
-    if (token_id < 0 || token_id >= VOCAB_SIZE) {
-        fprintf(stderr, "[!] bad token_id=%d, clamping to 0\n", token_id);
-        token_id = 0;
-    }
-    if (position < 0 || position >= 1024) {
-        fprintf(stderr, "[!] bad position=%d, clamping to 0\n", position);
-        position = 0;
-    }
-    /* Embedding */
-    for (int i = 0; i < N_EMBD; i++)
-        g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
 
     /* Layers */
     for (int l = 0; l < N_LAYER; l++) {
@@ -796,7 +865,14 @@ static int gpt2_forward_token(int token_id, int position) {
             BinGPT2Layer *L = &g_bin_layers[l];
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
-            memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+
+            /* Attention: real causal self-attention or simplified V-copy */
+            if (g_use_real_attention && g_k_cache[l]) {
+                real_attention(g_attn_out, g_qkv, l, position,
+                               g_k_cache[l], g_v_cache[l]);
+            } else {
+                memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            }
             bin_matmul(g_attn_out, &L->c_proj, g_proj);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
@@ -811,7 +887,13 @@ static int gpt2_forward_token(int token_id, int position) {
 
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
-            memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+
+            if (g_use_real_attention && g_k_cache[l]) {
+                real_attention(g_attn_out, g_qkv, l, position,
+                               g_k_cache[l], g_v_cache[l]);
+            } else {
+                memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            }
             matmul_avx2(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
@@ -835,7 +917,61 @@ static int gpt2_forward_token(int token_id, int position) {
         lm_head_parallel(g_logits, g_final_ln, g_wte, VOCAB_SIZE, N_EMBD, g_n_threads);
     }
 
-    /* Argmax */
+    /* Sampling: top-k + temperature.
+     * Pure argmax causes repetitive loops ("the the the...").
+     * Top-k sampling from the k highest-prob tokens breaks the cycle
+     * and produces more natural text. Default: temperature=0.8, top_k=40. */
+    if (g_temperature > 0.0f && g_top_k > 0) {
+        /* Find top-k logits via partial selection (simple approach: scan once) */
+        int top_k = g_top_k;
+        if (top_k > VOCAB_SIZE) top_k = VOCAB_SIZE;
+
+        /* Find the k-th largest logit via a simple threshold scan.
+         * For small k (40), we do k passes of find-max-and-mask. */
+        float threshold = -1e30f;
+        int seen = 0;
+        /* Simple selection: find max, set to -inf, repeat k times to get threshold */
+        static float logits_copy[50257];
+        memcpy(logits_copy, g_logits, VOCAB_SIZE * sizeof(float));
+        for (int sel = 0; sel < top_k; sel++) {
+            int max_v = 0;
+            float max_val = logits_copy[0];
+            for (int v = 1; v < VOCAB_SIZE; v++) {
+                if (logits_copy[v] > max_val) { max_val = logits_copy[v]; max_v = v; }
+            }
+            threshold = max_val;
+            logits_copy[max_v] = -1e30f;  /* remove so next pass finds next-best */
+        }
+
+        /* Apply softmax over top-k tokens only, with temperature */
+        float max_logit = threshold;  /* approximate (actual max is higher) */
+        /* Re-find actual max among top-k */
+        float actual_max = -1e30f;
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            if (g_logits[v] >= threshold && g_logits[v] > actual_max) actual_max = g_logits[v];
+        }
+
+        float sum_exp = 0.0f;
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            if (g_logits[v] >= threshold) {
+                logits_copy[v] = expf((g_logits[v] - actual_max) / g_temperature);
+                sum_exp += logits_copy[v];
+            } else {
+                logits_copy[v] = 0.0f;
+            }
+        }
+
+        /* Sample from the distribution */
+        float r = (float)(rand() % 1000000) / 1000000.0f * sum_exp;
+        float cum = 0.0f;
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            cum += logits_copy[v];
+            if (cum >= r) return v;
+        }
+        return VOCAB_SIZE - 1;  /* fallback */
+    }
+
+    /* Argmax (deterministic, for temperature=0) */
     int best = 0;
     float best_val = g_logits[0];
     for (int v = 1; v < VOCAB_SIZE; v++) {
@@ -931,8 +1067,32 @@ static void handle_request(int client_fd) {
         static int all_tokens[1024];
         memcpy(all_tokens, input_tokens, n_input * sizeof(int));
         int total = n_input;
+
+        /* If real attention is enabled, forward the prompt first to fill
+         * the KV cache. The last prompt token's forward gives us the logits
+         * for the first generated token, so we start generation from there. */
+        int first_gen_position = total - 1;  /* position of last prompt token */
+        if (g_use_real_attention) {
+            /* Forward all prompt tokens except the last (which we'll re-forward
+             * to get its logits for generation). Actually, forward ALL prompt
+             * tokens — the last one's forward fills KV cache at position n_input-1
+             * and returns the next-token prediction. */
+            for (int t = 0; t < n_input; t++) {
+                gpt2_forward_token(all_tokens[t], t);
+            }
+            /* After forwarding prompt, KV cache has positions 0..n_input-1.
+             * The last forward (position n_input-1) already computed logits
+             * for the NEXT token. We can use that directly for gen=0. */
+        }
+
         for (int gen = 0; gen < n_tokens; gen++) {
-            int next = gpt2_forward_token(all_tokens[total - 1], total - 1);
+            int pos = first_gen_position + gen;  /* position in sequence */
+            /* For real attention: position pos is already in KV cache if we
+             * forwarded the prompt. The first generated token uses the logits
+             * from the last prompt token's forward. But our API returns a token,
+             * so we re-forward at position=pos (KV cache already has it, but
+             * that's OK — real_attention overwrites the same slot). */
+            int next = gpt2_forward_token(all_tokens[total - 1], pos);
             output_tokens[gen] = next;
             all_tokens[total++] = next;
             if (total >= 1024) { n_tokens = gen + 1; break; }
@@ -986,6 +1146,7 @@ static void handle_request(int client_fd) {
  * ======================================================================== */
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    srand(time(NULL));  /* seed for top-k sampling */
 
     int port = 8080;
     int use_binary = 0;
@@ -995,6 +1156,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--binary") == 0) {
             use_binary = 1;
+        } else if (strcmp(argv[i], "--real-attention") == 0) {
+            g_use_real_attention = 1;
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            g_temperature = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            g_top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
             g_prune_frac = (float)atof(argv[++i]);
             if (g_prune_frac < 0.0f) g_prune_frac = 0.0f;
@@ -1085,6 +1252,25 @@ int main(int argc, char **argv) {
     g_logits = NULL;
     if (posix_memalign((void **)&g_logits, 32, VOCAB_SIZE * sizeof(float)) != 0 || !g_logits) {
         fprintf(stderr, "[!] OOM allocating logits\n"); return 1;
+    }
+
+    /* Allocate KV cache for real attention (72 MB: 12 layers × 2 × 1024 × 768 × 4B) */
+    if (g_use_real_attention) {
+        printf("[*] allocating KV cache for real causal attention (72 MB)...\n");
+        fflush(stdout);
+        for (int l = 0; l < N_LAYER; l++) {
+            g_k_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
+            g_v_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
+            if (!g_k_cache[l] || !g_v_cache[l]) {
+                fprintf(stderr, "[!] OOM allocating KV cache for layer %d\n", l);
+                g_use_real_attention = 0;  /* fall back to simplified attention */
+                break;
+            }
+        }
+        if (g_use_real_attention) {
+            printf("[*] KV cache allocated — real causal self-attention enabled\n");
+        }
+        fflush(stdout);
     }
 
     /* Vocab pruning: compute row L2 norms, keep top (1 - prune_frac) by norm.
