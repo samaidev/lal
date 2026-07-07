@@ -762,6 +762,7 @@ static int gpt2_forward_token(int token_id, int position) {
         fprintf(stderr, "[!] bad position=%d, clamping to 0\n", position);
         position = 0;
     }
+    fprintf(stderr, "[d]   forward: token=%d pos=%d embedding\n", token_id, position); fflush(stderr);
     /* Embedding */
     for (int i = 0; i < N_EMBD; i++)
         g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
@@ -771,16 +772,21 @@ static int gpt2_forward_token(int token_id, int position) {
         if (g_binary_mode) {
             /* Binary forward: XNOR + popcount (32x fewer FLOPs per layer) */
             BinGPT2Layer *L = &g_bin_layers[l];
-
+            fprintf(stderr, "[d]   layer %d ln1\n", l); fflush(stderr);
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
+            fprintf(stderr, "[d]   layer %d c_attn\n", l); fflush(stderr);
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
             memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            fprintf(stderr, "[d]   layer %d c_proj\n", l); fflush(stderr);
             bin_matmul(g_attn_out, &L->c_proj, g_proj);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
+            fprintf(stderr, "[d]   layer %d ln2\n", l); fflush(stderr);
             layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
+            fprintf(stderr, "[d]   layer %d mlp_fc\n", l); fflush(stderr);
             bin_matmul(g_ln2, &L->mlp_fc, g_fc);
             for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
+            fprintf(stderr, "[d]   layer %d mlp_proj\n", l); fflush(stderr);
             bin_matmul(g_fc, &L->mlp_proj, g_mlp_out);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
         } else {
