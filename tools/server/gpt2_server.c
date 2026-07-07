@@ -1005,13 +1005,13 @@ int main(int argc, char **argv) {
     }
 
     /* Auto-detect thread count.
-     * On ARMv7 Android (32-bit), pthread + NEON crashes in lm_head_avx2
-     * (bionic's NEON register save/restore bug). Force single-threaded there.
-     * On AArch64 (64-bit ARM, e.g. Raspberry Pi 4, modern phones), pthread
-     * works fine — use multi-threading for the LM head. */
+     * On ARM (both ARMv7 and AArch64), pthread + NEON in lm_head_avx2
+     * crashes. Root cause unclear (possibly PRoot interference, or NEON
+     * register save/restore issue). Force single-threaded on all ARM.
+     * x86_64 works fine with multi-threading. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-#if defined(__arm__) && !defined(__aarch64__)
-    g_n_threads = 1;  /* ARMv7 32-bit: single-threaded (bionic NEON bug) */
+#if defined(__arm__) || defined(__aarch64__)
+    g_n_threads = 1;  /* ARM: single-threaded (pthread+NEON crashes) */
 #else
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
