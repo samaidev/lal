@@ -567,37 +567,9 @@ static void bin_layer_repack(BinLayer *bl) {
         }
     }
 
-    /* Pack wbits_T[i][wi] from sign(w_float[j*in + i]) for j in 64-blocks.
-     * This is strided (stride=in), but only done once per step.
-     * The wbits path above is the hot one (contiguous). */
-    for (int i = 0; i < in; i++) {
-        for (int wi = 0; wi < bl->n_words_T; wi++) {
-            uint64_t word = 0;
-            int base = wi * 64;
-            for (int grp = 0; grp < 8; grp++) {
-                int idx = base + grp * 8;
-                if (idx + 7 < out) {
-                    if (bl->w_float[(idx+0)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 0));
-                    if (bl->w_float[(idx+1)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 1));
-                    if (bl->w_float[(idx+2)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 2));
-                    if (bl->w_float[(idx+3)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 3));
-                    if (bl->w_float[(idx+4)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 4));
-                    if (bl->w_float[(idx+5)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 5));
-                    if (bl->w_float[(idx+6)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 6));
-                    if (bl->w_float[(idx+7)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 7));
-                } else {
-                    for (int bi = 0; bi < 8; bi++) {
-                        int j = idx + bi;
-                        if (j < out && bl->w_float[j * in + i] > 0.0f)
-                            word |= (1ULL << (grp * 8 + bi));
-                    }
-                }
-            }
-            bl->wbits_T[i * bl->n_words_T + wi] = word;
-        }
-    }
-
-    /* Recompute alpha = mean(|w_float|) per output — now CONTIGUOUS! */
+    /* Skip wbits_T repack in STE mode — grad_x is now computed from w_float
+     * directly (float arithmetic), so wbits_T is never read during STE training.
+     * This saves the strided wbits_T repack loop (the slowest part). */
     for (int j = 0; j < out; j++) {
         const float *wf = &bl->w_float[j * in];  /* contiguous [in] */
         float abs_sum = 0;
@@ -734,28 +706,68 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
                       BinLayer *bl, float lr) {
     int in = bl->in_dim, out = bl->out_dim;
 
-    /* Part 1: grad_x = grad_y @ w (using binary weights, same as bin_backward) */
-    int nw_T = bl->n_words_T;
-    uint64_t gybits[64];
-    for (int wi = 0; wi < nw_T; wi++) {
-        uint64_t word = 0;
-        for (int bi = 0; bi < 64; bi++) {
-            int j = wi * 64 + bi;
-            if (j < out && grad_y[j] > 0.0f) word |= (1ULL << bi);
+    /* Part 1: grad_x computation.
+     * In STE mode, skip wbits_T repack entirely — compute grad_x directly
+     * from w_float using float arithmetic. This avoids the strided wbits_T
+     * repack (50% of repack cost) at the expense of float mul-adds.
+     *
+     * grad_x[i] = sum_j grad_y[j] * sign(w_float[j*in+i]) * alpha[j]
+     *
+     * w_float is [out, in], so w_float[j*in+i] has i contiguous per j.
+     * But we need i fixed, j varying — that's strided. So we compute
+     * per-i by accumulating over j. With [out,in] layout, w_float[j*in+i]
+     * for fixed i has stride=in. This is still strided but avoids repack.
+     *
+     * Alternative: compute grad_x = sign(w_float)^T @ (grad_y * alpha)
+     * which is a matrix-vector product. We can do it per-output j and
+     * accumulate into grad_x (since w_float[j*in+i] is contiguous in i). */
+    if (bl->w_float) {
+        /* Zero grad_x first */
+        for (int i = 0; i < in; i++) grad_x[i] = 0.0f;
+        /* For each output j: grad_x += grad_y[j] * alpha[j] * sign(w_float[j*in+i])
+         * w_float[j*in + 0..in-1] is contiguous → SIMD-friendly! */
+        for (int j = 0; j < out; j++) {
+            float gy = grad_y[j];
+            if (fabsf(gy) < 1e-8f) continue;
+            float scale = gy * bl->alpha[j];
+            const float *wf = &bl->w_float[j * in];  /* contiguous [in] */
+            for (int i = 0; i + 7 < in; i += 8) {
+                grad_x[i+0] += scale * (wf[i+0] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+1] += scale * (wf[i+1] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+2] += scale * (wf[i+2] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+3] += scale * (wf[i+3] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+4] += scale * (wf[i+4] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+5] += scale * (wf[i+5] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+6] += scale * (wf[i+6] > 0.0f ? 1.0f : -1.0f);
+                grad_x[i+7] += scale * (wf[i+7] > 0.0f ? 1.0f : -1.0f);
+            }
+            for (int i = (in / 8) * 8; i < in; i++)
+                grad_x[i] += scale * (wf[i] > 0.0f ? 1.0f : -1.0f);
         }
-        gybits[wi] = word;
-    }
-    float mean_abs_gy = 0, mean_alpha = 0;
-    for (int j = 0; j < out; j++) mean_abs_gy += fabsf(grad_y[j]);
-    mean_abs_gy /= out;
-    for (int j = 0; j < out; j++) mean_alpha += bl->alpha[j];
-    mean_alpha /= out;
-    for (int i = 0; i < in; i++) {
-        int pc = 0;
-        const uint64_t *wbT = &bl->wbits_T[i * nw_T];
-        for (int wi = 0; wi < nw_T; wi++)
-            pc += __builtin_popcountll(~(gybits[wi] ^ wbT[wi]));
-        grad_x[i] = (float)(2 * pc - out) * mean_alpha * mean_abs_gy;
+    } else {
+        /* No w_float — use popcount on existing wbits_T (original path) */
+        int nw_T = bl->n_words_T;
+        uint64_t gybits[64];
+        for (int wi = 0; wi < nw_T; wi++) {
+            uint64_t word = 0;
+            for (int bi = 0; bi < 64; bi++) {
+                int j = wi * 64 + bi;
+                if (j < out && grad_y[j] > 0.0f) word |= (1ULL << bi);
+            }
+            gybits[wi] = word;
+        }
+        float mean_abs_gy = 0, mean_alpha = 0;
+        for (int j = 0; j < out; j++) mean_abs_gy += fabsf(grad_y[j]);
+        mean_abs_gy /= out;
+        for (int j = 0; j < out; j++) mean_alpha += bl->alpha[j];
+        mean_alpha /= out;
+        for (int i = 0; i < in; i++) {
+            int pc = 0;
+            const uint64_t *wbT = &bl->wbits_T[i * nw_T];
+            for (int wi = 0; wi < nw_T; wi++)
+                pc += __builtin_popcountll(~(gybits[wi] ^ wbT[wi]));
+            grad_x[i] = (float)(2 * pc - out) * mean_alpha * mean_abs_gy;
+        }
     }
 
     /* Part 2: STE update — w_float[j*in + i] -= lr * grad_y[j] * x[i]
