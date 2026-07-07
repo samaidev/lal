@@ -208,13 +208,20 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
 
     /* Attention */
     if (cfg->qkv_merged) {
-        bin_forward(act->q, act->norm1_out, &tl->attn_q);  /* q = [3n] */
+        if (g_use_bnn_fast_path) bin_forward_bnn(act->q, act->norm1_out, &tl->attn_q);
+        else                     bin_forward     (act->q, act->norm1_out, &tl->attn_q);
         act->k = act->q + n;
         act->v = act->q + 2 * n;
     } else {
-        bin_forward(act->q, act->norm1_out, &tl->attn_q);
-        bin_forward(act->k, act->norm1_out, &tl->attn_k);
-        bin_forward(act->v, act->norm1_out, &tl->attn_v);
+        if (g_use_bnn_fast_path) {
+            bin_forward_bnn(act->q, act->norm1_out, &tl->attn_q);
+            bin_forward_bnn(act->k, act->norm1_out, &tl->attn_k);
+            bin_forward_bnn(act->v, act->norm1_out, &tl->attn_v);
+        } else {
+            bin_forward(act->q, act->norm1_out, &tl->attn_q);
+            bin_forward(act->k, act->norm1_out, &tl->attn_k);
+            bin_forward(act->v, act->norm1_out, &tl->attn_v);
+        }
     }
 
     if (cfg->attn_type == ATTN_ROPE)
@@ -222,7 +229,8 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
 
     /* Simplified attention: V copy (full attention in future) */
     memcpy(act->attn_out, act->v, n * sizeof(float));
-    bin_forward(act->proj_out, act->attn_out, &tl->attn_o);
+    if (g_use_bnn_fast_path) bin_forward_bnn(act->proj_out, act->attn_out, &tl->attn_o);
+    else                     bin_forward     (act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     clip_array(x, n, 10.0f);
 
@@ -235,23 +243,34 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         /* SwiGLU: hidden = silu(gate(ln2)) * up(ln2) */
         float *gate = malloc(m * sizeof(float));
         float *up = malloc(m * sizeof(float));
-        bin_forward(gate, act->norm2_out, &tl->mlp_gate);
-        bin_forward(up, act->norm2_out, &tl->mlp_up);
+        if (g_use_bnn_fast_path) {
+            bin_forward_bnn(gate, act->norm2_out, &tl->mlp_gate);
+            bin_forward_bnn(up,   act->norm2_out, &tl->mlp_up);
+        } else {
+            bin_forward(gate, act->norm2_out, &tl->mlp_gate);
+            bin_forward(up,   act->norm2_out, &tl->mlp_up);
+        }
         for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
         free(gate); free(up);
     } else {
         /* GELU: hidden = gelu(c_fc(ln2)) */
-        bin_forward(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
+        if (g_use_bnn_fast_path) bin_forward_bnn(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
+        else                     bin_forward     (act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
         for (int i = 0; i < m; i++) act->mlp_hidden[i] = gelu(act->mlp_hidden[i]);
     }
 
-    bin_forward(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
+    if (g_use_bnn_fast_path) bin_forward_bnn(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
+    else                     bin_forward     (act->mlp_out, act->mlp_hidden, &tl->mlp_down);
     for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
     clip_array(x, n, 10.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
 int g_use_ste = 0;
+
+/* Global flag: use legacy BNN fast path (binarizes x too). Off by default —
+ * BNN causes train/inference mismatch. Enable only for max-speed-low-quality. */
+int g_use_bnn_fast_path = 0;
 
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                           ModelConfig *cfg, float lr) {
@@ -584,9 +603,47 @@ static void bin_layer_repack(BinLayer *bl) {
 }
 
 /* ========================================================================
- * Binary Forward: XNOR + popcount
+ * Binary Forward — BWN (default, matches Python STE training)
+ * ========================================================================
+ * x stays float. Only W is binarized (sign(W) * alpha).
+ * Adds XNOR-Net K-norm: K = ||x||_1 / in_dim, preserves input magnitude.
+ *
+ *   y[j] = (sum_i sign(W[j,i]) * x[i]) * alpha[j] * K + bias[j]
+ *
+ * This is the mathematically correct BWN forward. The old bin_forward was
+ * BNN (binarized x too) which diverged from training and caused quality
+ * collapse. BNN is retained as bin_forward_bnn() for opt-in fast mode.
  * ======================================================================== */
 void bin_forward(float *y, const float *x, const BinLayer *bl) {
+    int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
+
+    /* K-norm: ||x||_1 / in_dim (XNOR-Net input scaling factor) */
+    float abs_sum = 0.0f;
+    for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
+    float K = abs_sum / in;
+
+    for (int j = 0; j < out; j++) {
+        const uint64_t *wb = &bl->wbits[j * nw];
+        float s = 0.0f;
+        /* Unpack sign bits and accumulate sign * x[i] */
+        for (int wi = 0; wi < nw; wi++) {
+            uint64_t w = wb[wi];
+            int base = wi * 64;
+            int limit = (base + 64 < in) ? 64 : (in - base);
+            for (int bi = 0; bi < limit; bi++) {
+                /* sign(W[j,base+bi]) = +1 if bit set, -1 if clear */
+                float sign_w = (w >> bi) & 1ULL ? 1.0f : -1.0f;
+                s += sign_w * x[base + bi];
+            }
+        }
+        y[j] = s * bl->alpha[j] * K + bl->bias[j];
+    }
+}
+
+/* Legacy BNN fast path: XNOR + popcount, binarizes BOTH x and W.
+ * ~64x faster than BWN but causes train/inference distribution mismatch.
+ * Kept for opt-in via g_use_bnn_fast_path flag. Do NOT use by default. */
+void bin_forward_bnn(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
     /* Binarize input */
     uint64_t xbits[64];
@@ -608,6 +665,8 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
     }
 }
 
+/* Legacy bin_forward_float: BWN without K-norm. Kept for callers that
+ * explicitly don't want input magnitude scaling. */
 void bin_forward_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
     for (int j = 0; j < out; j++) {
@@ -657,7 +716,14 @@ void bin_backward(float *grad_x, const float *grad_y, const float *x,
         grad_x[i] = (float)(2 * pc - out) * mean_alpha * mean_abs_gy;
     }
 
-    /* Part 2: alpha + bias update via popcount (reuse x_bits) */
+    /* Part 2: alpha + bias update via popcount (reuse x_bits)
+     *
+     * [FIX 严重4] alpha update direction: was '+=', now '-'= to match bias.
+     *   Old code: bl->alpha[j] += lr * grad_alpha * gy / in;   (WRONG: ascends loss)
+     *   New code: bl->alpha[j] -= lr * grad_alpha * gy;         (correct: descends loss)
+     * Also dropped spurious '/in' that shrank alpha's effective LR by in_dim.
+     * [FIX 严重6] Removed alpha clamp to [0.001, 1.0] — it prevented alpha from
+     *   converging to its natural magnitude and forced a fake floor. */
     float mean_abs_x = 0;
     for (int i = 0; i < in; i++) mean_abs_x += fabsf(x[i]);
     mean_abs_x /= in;
@@ -678,9 +744,10 @@ void bin_backward(float *grad_x, const float *grad_y, const float *x,
         for (int wi = 0; wi < bl->n_words; wi++)
             pc += __builtin_popcountll(~(xbits[wi] ^ wb[wi]));
         float grad_alpha = (float)(2 * pc - in) * mean_abs_x;
-        bl->alpha[j] += lr * grad_alpha * gy / in;
-        if (bl->alpha[j] < 0.001f) bl->alpha[j] = 0.001f;
-        if (bl->alpha[j] > 1.0f) bl->alpha[j] = 1.0f;
+        bl->alpha[j] -= lr * grad_alpha * gy;   /* FIXED: direction + no /in */
+        /* Removed: if (bl->alpha[j] < 0.001f) bl->alpha[j] = 0.001f;
+         *         if (bl->alpha[j] > 1.0f)   bl->alpha[j] = 1.0f; */
+        if (bl->alpha[j] < 0.0f) bl->alpha[j] = 0.0f;  /* only non-negativity */
         bl->bias[j] -= lr * gy;
     }
 }
@@ -820,9 +887,8 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
             for (int wi = 0; wi < bl->n_words; wi++)
                 pc += __builtin_popcountll(~(xbits[wi] ^ wb[wi]));
             float grad_alpha = (float)(2 * pc - in) * mean_abs_x;
-            bl->alpha[j] += lr * grad_alpha * gy / in;
-            if (bl->alpha[j] < 0.001f) bl->alpha[j] = 0.001f;
-            if (bl->alpha[j] > 1.0f) bl->alpha[j] = 1.0f;
+            bl->alpha[j] -= lr * grad_alpha * gy;   /* FIXED: direction + no /in */
+            if (bl->alpha[j] < 0.0f) bl->alpha[j] = 0.0f;
             bl->bias[j] -= lr * gy;
         }
     }
