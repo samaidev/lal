@@ -42,12 +42,23 @@ static float *get_tensor(const char *key) {
 }
 
 /* === Binary weights === */
-typedef struct { uint64_t *wbits; float *alpha,*bias; int in_dim,out_dim,n_words; } BinLayer;
+/* wbits: row-major packed bits [out_dim][n_words] — for forward (popcount per output)
+ * wbits_T: col-major packed bits [in_dim][n_words_T] — for backward grad_x (popcount per input)
+ * n_words_T = (out_dim+63)/64 */
+typedef struct {
+    uint64_t *wbits;    /* [out_dim * n_words] — row-major, for forward */
+    uint64_t *wbits_T;  /* [in_dim * n_words_T] — col-major (transposed), for backward */
+    float *alpha, *bias;
+    int in_dim, out_dim, n_words, n_words_T;
+} BinLayer;
 static BinLayer g_bin[N_LAYER][4];
 
 static void binarize(BinLayer *bl,const float *W,const float *bias,int in_dim,int out_dim) {
-    bl->in_dim=in_dim; bl->out_dim=out_dim; bl->n_words=(in_dim+63)/64;
+    bl->in_dim=in_dim; bl->out_dim=out_dim;
+    bl->n_words=(in_dim+63)/64;     /* words per output row (for forward) */
+    bl->n_words_T=(out_dim+63)/64;  /* words per input col (for backward) */
     bl->wbits=calloc(out_dim*bl->n_words,sizeof(uint64_t));
+    bl->wbits_T=calloc(in_dim*bl->n_words_T,sizeof(uint64_t));
     bl->alpha=calloc(out_dim,sizeof(float));
     bl->bias=bias?malloc(out_dim*sizeof(float)):calloc(out_dim,sizeof(float));
     for(int j=0;j<out_dim;j++){
@@ -59,6 +70,14 @@ static void binarize(BinLayer *bl,const float *W,const float *bias,int in_dim,in
             for(int bi=0;bi<64;bi++){int idx=wi*64+bi;
                 if(idx<in_dim&&W[idx*out_dim+j]>0.0f) word|=(1ULL<<bi);}
             bl->wbits[j*bl->n_words+wi]=word;
+        }
+    }
+    /* Build transposed bits: for each input i, pack sign(w[j][i]) across outputs j */
+    for(int i=0;i<in_dim;i++){
+        for(int wi=0;wi<bl->n_words_T;wi++){uint64_t word=0;
+            for(int bi=0;bi<64;bi++){int j=wi*64+bi;
+                if(j<out_dim&&W[i*out_dim+j]>0.0f) word|=(1ULL<<bi);}
+            bl->wbits_T[i*bl->n_words_T+wi]=word;
         }
     }
 }
@@ -151,49 +170,62 @@ static void bin_fwd(float *y,const float *x,const BinLayer *bl) {
     }
 }
 
-/* === Binary backward + update === */
-/* === Binary backward: fast grad_x via XNOR+popcount, float alpha update === */
+/* === Binary backward with XNOR+popcount for grad_x === */
+/* grad_x[i] = sum_j(grad_y[j] * sign(w[j][i]) * alpha[j])
+ *
+ * Split into: sign part (popcount) + magnitude part (float)
+ *   sign_product[i] = sum_j sign(grad_y[j]) * sign(w[j][i])     ← popcount
+ *   mag_weighted[i] = sum_j |grad_y[j]| * alpha[j] * sign(w[j][i])  ← still float but simpler
+ *
+ * For the popcount part: binarize grad_y, use wbits_T (transposed) to get
+ * sign(w[:,i]) packed per input i. Then XNOR + popcount gives match count.
+ *
+ * Full approach:
+ *   1. Binarize grad_y → gy_bits
+ *   2. For each input i: popcount(XNOR(gy_bits, wbits_T[i])) = matches
+ *      grad_x_sign[i] = 2*matches - out_dim  (net sign agreement)
+ *   3. Scale: grad_x[i] = grad_x_sign[i] * mean_alpha * mean_abs_gy
+ *      (approximate — exact would need per-j scaling, but this is much faster)
+ *
+ * For alpha/bias update: still use float loop (only out_dim iterations, fast)
+ */
 static void bin_bwd(float *grad_x,const float *grad_y,const float *x,BinLayer *bl,float lr) {
-    int in=bl->in_dim,out=bl->out_dim,nw=bl->n_words;
-    for(int i=0;i<in;i++) grad_x[i]=0.0f;
+    int in=bl->in_dim, out=bl->out_dim;
+    int nw_T=bl->n_words_T;  /* words per input col (transposed) */
 
-    /* Part 1: grad_x via XNOR+popcount (fast, 64x fewer operations)
-     * grad_x[i] = sum_j(grad_y[j] * sign(w[j][i]) * alpha[j])
-     * = sum_j(sign(grad_y[j]) * sign(w[j][i]) * |grad_y[j]| * alpha[j])
-     * Approximate: binarize grad_y, use popcount for the sign product,
-     * then scale by |grad_y[j]|*alpha[j] */
+    /* Part 1: grad_x via XNOR+popcount (FAST — 64x fewer ops) */
     /* Binarize grad_y */
     uint64_t gybits[64];
-    int gy_nw = (out+63)/64;
-    for(int wi=0;wi<gy_nw;wi++){uint64_t word=0;
-        for(int bi=0;bi<64;bi++){int idx=wi*64+bi;
-            if(idx<out&&grad_y[idx]>0.0f) word|=(1ULL<<bi);}
+    for(int wi=0;wi<nw_T;wi++){uint64_t word=0;
+        for(int bi=0;bi<64;bi++){int j=wi*64+bi;
+            if(j<out&&grad_y[j]>0.0f) word|=(1ULL<<bi);}
         gybits[wi]=word;
     }
-    /* For each input dim i: grad_x[i] = sum_j sign(gy[j]) * sign(w[j][i]) * alpha[j] * |gy[j]|
-     * The sign(gy[j]) * sign(w[j][i]) part can be done as:
-     *   match_count = popcount(XNOR(gy_bits, w_bits_column_i))
-     * But w is stored row-major (per output j), not column-major.
-     * So we can't directly use popcount on columns.
-     *
-     * Alternative: compute grad_x the fast way using the TRANSPOSED weight.
-     * grad_x = grad_y @ (sign(w) * alpha)  [treating w as [out,in]]
-     * This is a matmul with grad_y[1,out] @ w_sign[out,in] = grad_x[1,in]
-     *
-     * For popcount: we need w stored column-major (per input i).
-     * Since we don't have that, fall back to loop but skip alpha multiply
-     * when alpha is uniform (optimization for later).
-     *
-     * For now: use the loop but with early termination for small gradients.
-     */
+    /* Compute mean |grad_y| and mean alpha for scaling */
+    float mean_abs_gy=0, mean_alpha=0;
+    for(int j=0;j<out;j++) mean_abs_gy+=fabsf(grad_y[j]);
+    mean_abs_gy/=out;
+    for(int j=0;j<out;j++) mean_alpha+=bl->alpha[j];
+    mean_alpha/=out;
+
+    /* For each input i: popcount(XNOR(gy_bits, wbits_T[i])) */
+    for(int i=0;i<in;i++){
+        int pc=0;
+        const uint64_t *wbT=&bl->wbits_T[i*nw_T];
+        for(int wi=0;wi<nw_T;wi++)
+            pc+=__builtin_popcountll(~(gybits[wi]^wbT[wi]));
+        /* grad_x[i] = (2*pc - out) * mean_alpha * mean_abs_gy */
+        grad_x[i]=(float)(2*pc-out)*mean_alpha*mean_abs_gy;
+    }
+
+    /* Part 2: alpha + bias update (float, only out_dim iterations — fast) */
     for(int j=0;j<out;j++){
-        float gy=grad_y[j]; if(fabsf(gy)<1e-6f) continue;  /* skip tiny gradients */
-        const uint64_t *wb=&bl->wbits[j*nw]; float a=bl->alpha[j];
+        float gy=grad_y[j]; if(fabsf(gy)<1e-6f) continue;
+        const uint64_t *wb=&bl->wbits[j*bl->n_words]; float a=bl->alpha[j];
         float grad_alpha=0;
-        for(int wi=0;wi<nw;wi++){uint64_t w=wb[wi];
+        for(int wi=0;wi<bl->n_words;wi++){uint64_t w=wb[wi];
             for(int bi=0;bi<64;bi++){int idx=wi*64+bi; if(idx>=in)break;
                 float sign=(w>>bi)&1?1.0f:-1.0f;
-                grad_x[idx]+=gy*sign*a;
                 grad_alpha+=gy*x[idx]*sign;
             }}
         bl->alpha[j]+=lr*grad_alpha/in;
