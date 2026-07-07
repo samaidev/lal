@@ -1208,6 +1208,35 @@ float *lal_server_get_hidden(void) {
     return g_final_ln;
 }
 
+/* === LAL three-layer fusion (level 2): .lal logic-layer sampling filter ===
+ *
+ * Hook into the top-k sampling pool: after the server computes keep_mask
+ * (which tokens survive top-k + top-p filtering), this function is called so
+ * a .lal-compiled logic program can remove tokens that violate semantic rules
+ * (grammar constraints, repetition bans, context-dependent bans, etc.).
+ *
+ * Weak fallback: returns 0 (no filtering) when no .lal filter is linked.
+ * Link with a .lal-compiled object defining a strong lal_filter_topk to
+ * activate rule-based sampling constraints. Zero-intrusion when unlinked.
+ *
+ * keep_mask: in/out, length n_vocab (1 = keep, 0 = drop). The .lal program
+ *   zeroes entries for tokens it wants to ban.
+ * n_vocab: array length (VOCAB_SIZE for GPT-2).
+ * last_token: most recently generated token id (-1 at sequence start).
+ * recent_tokens: array of recently generated token ids.
+ * n_recent: length of recent_tokens.
+ *
+ * Returns: number of tokens dropped (for logging). */
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent)
+    __attribute__((weak));
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent) {
+    (void)keep_mask; (void)n_vocab; (void)last_token;
+    (void)recent_tokens; (void)n_recent;
+    return 0;  /* no .lal filter linked — sampling unchanged */
+}
+
 /* KV cache for real causal self-attention.
  * Per layer: K and V for all positions [n_ctx, n_embd].
  * Total: 12 layers × 2 (K+V) × 1024 × 768 × 4 bytes = 72 MB.
@@ -1769,6 +1798,24 @@ static int gpt2_forward_token(int token_id, int position) {
             /* top-p disabled: keep everything that survived top-k. */
             for (int v = 0; v < VOCAB_SIZE; v++)
                 if (g_logits[v] >= threshold) keep_mask[v] = 1;
+        }
+
+        /* === LAL fusion level 2: .lal logic-layer filter on top-k pool ===
+         * Hand keep_mask to the .lal program (if linked) so it can drop
+         * tokens violating semantic rules. Weak symbol → no-op when unlinked.
+         * Called after top-k/top-p narrowing, before softmax+sample, so
+         * banned tokens get zero probability. */
+        {
+            int last = (g_n_recent > 0) ? g_recent_tokens[g_n_recent - 1] : -1;
+            lal_filter_topk(keep_mask, VOCAB_SIZE, last, g_recent_tokens, g_n_recent);
+            /* Safety: if the filter dropped everything, restore the top-k
+             * pool (avoid empty-sample crash). Scan for any survivor. */
+            int any_kept = 0;
+            for (int v = 0; v < VOCAB_SIZE; v++) if (keep_mask[v]) { any_kept = 1; break; }
+            if (!any_kept) {
+                for (int v = 0; v < VOCAB_SIZE; v++)
+                    if (g_logits[v] >= threshold) keep_mask[v] = 1;
+            }
         }
 
         /* Apply softmax over the surviving (kept) tokens, with temperature. */
