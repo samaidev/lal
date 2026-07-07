@@ -701,8 +701,14 @@ int main(int argc, char **argv) {
     printf("[*] loading model (float, AVX2 SIMD)...\n");
     fflush(stdout);
 
-    g_tensors = tensor_load_all("prebuilt/gpt2_weights.bin", &g_n_tensors);
-    if (!g_tensors) { fprintf(stderr, "[!] failed to load weights\n"); return 1; }
+    /* Weight + tokenizer paths: env var override, else relative to cwd */
+    const char *weight_path = getenv("LAL_WEIGHTS");
+    if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
+    const char *tokenizer_path = getenv("LAL_TOKENIZER");
+    if (!tokenizer_path) tokenizer_path = "prebuilt/gpt2_tokenizer.bin";
+
+    g_tensors = tensor_load_all(weight_path, &g_n_tensors);
+    if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
 
     g_wte = tensor_get(g_tensors, g_n_tensors, "wte.weight");
@@ -733,10 +739,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    g_logits = aligned_alloc(32, VOCAB_SIZE * sizeof(float));
-    if (!g_logits) { fprintf(stderr, "[!] OOM allocating logits\n"); return 1; }
+    g_logits = NULL;
+    if (posix_memalign((void **)&g_logits, 32, VOCAB_SIZE * sizeof(float)) != 0 || !g_logits) {
+        fprintf(stderr, "[!] OOM allocating logits\n"); return 1;
+    }
 
-    load_tokenizer("prebuilt/gpt2_tokenizer.bin");
+    load_tokenizer(tokenizer_path);
     printf("[*] tokenizer loaded (%d entries, hash table %d slots)\n", VOCAB_SIZE, HASH_CAPACITY);
     fflush(stdout);
 
