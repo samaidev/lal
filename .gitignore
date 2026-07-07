@@ -17,3 +17,4 @@ prebuilt/gpt2_binary_finetuned.bin
 skills/
 upload/
 .env
+prebuilt/gpt2_binary.bin

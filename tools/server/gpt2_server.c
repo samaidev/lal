@@ -182,6 +182,141 @@ typedef struct {
 } GPT2Layer;
 static GPT2Layer g_layers[N_LAYER];
 
+/* === Binary layer (XNOR+popcount) — used when --binary flag is set ===
+ *
+ * Memory savings: 498 MB float → 13 MB binary (38x for the 12 transformer layers).
+ * wte/wpe stay float (lookup tables, can't binarize without hurting accuracy).
+ *
+ * Forward: y[j] = (2 * popcount(XNOR(x_bits, wbits[j])) - in_dim) * alpha[j] + bias[j]
+ *   where x_bits = sign(x) packed into uint64s
+ *   One popcount instruction processes 64 multiplications → 32x FLOP reduction.
+ */
+typedef struct {
+    uint64_t *wbits;   /* [out_dim, n_words] — sign(w) packed, row-major per output */
+    float    *alpha;   /* [out_dim] — per-output scale = mean|w| */
+    float    *bias;    /* [out_dim] */
+    int       in_dim, out_dim, n_words;
+} SrvBinLayer;
+
+typedef struct {
+    SrvBinLayer c_attn;    /* [n, 3n] */
+    SrvBinLayer c_proj;    /* [n, n]  */
+    SrvBinLayer mlp_fc;    /* [n, m]  */
+    SrvBinLayer mlp_proj;  /* [m, n]  */
+    float *ln1_w, *ln1_b;
+    float *ln2_w, *ln2_b;
+} BinGPT2Layer;
+static BinGPT2Layer g_bin_layers[N_LAYER];
+static int g_binary_mode = 0;   /* set by --binary flag */
+
+/* Binarize input x[in_dim] → packed bits x_bits[n_words] */
+static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_words) {
+    for (int wi = 0; wi < n_words; wi++) {
+        uint64_t word = 0;
+        for (int bi = 0; bi < 64; bi++) {
+            int idx = wi * 64 + bi;
+            if (idx < in_dim && x[idx] > 0.0f) word |= (1ULL << bi);
+        }
+        x_bits[wi] = word;
+    }
+}
+
+/* Binary forward: y[out_dim] = (2*popcount(XNOR(x_bits, wbits[j])) - in_dim) * alpha[j] + bias[j]
+ * Uses __builtin_popcountll — portable across x86 and ARM (ARM falls back to
+ * software popcount, still much faster than 64 scalar multiplications). */
+static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
+    /* Binarize input once */
+    uint64_t x_bits[16];  /* max in_dim = 3072 → 48 words; we stack-alloc 16 for n=768 (12 words) */
+    /* For mlp_proj (in_dim=3072), we need 48 words — use heap */
+    int n_words = bl->n_words;
+    uint64_t *xb;
+    if (n_words <= 16) {
+        xb = x_bits;
+    } else {
+        xb = malloc(n_words * sizeof(uint64_t));
+    }
+    binarize_input(x, xb, bl->in_dim, n_words);
+
+    for (int j = 0; j < bl->out_dim; j++) {
+        const uint64_t *wb = bl->wbits + (size_t)j * n_words;
+        int pc = 0;
+        for (int wi = 0; wi < n_words; wi++) {
+            pc += __builtin_popcountll(~(xb[wi] ^ wb[wi]));
+        }
+        /* dot = (2*pc - in_dim) * alpha — XNOR gives count of matching signs */
+        y[j] = (float)(2 * pc - bl->in_dim) * bl->alpha[j] + bl->bias[j];
+    }
+    if (n_words > 16) free(xb);
+}
+
+/* Load GB2L binary weight file directly (no float weights in memory!) */
+static int load_binary_weights(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[!] cannot open %s\n", path); return -1; }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "GB2L", 4) != 0) {
+        fprintf(stderr, "[!] bad magic in %s\n", path); fclose(f); return -1;
+    }
+
+    unsigned int hdr[5];
+    if (fread(hdr, 4, 5, f) != 5) { fclose(f); return -1; }
+    int n_layer = hdr[0], n_embd = hdr[1], mlp_dim = hdr[2], vocab = hdr[3], n_ctx = hdr[4];
+    if (n_layer != N_LAYER || n_embd != N_EMBD || mlp_dim != MLP_DIM ||
+        vocab != VOCAB_SIZE || n_ctx != 1024) {
+        fprintf(stderr, "[!] config mismatch in %s\n", path); fclose(f); return -1;
+    }
+
+    /* Read embeddings (float — kept as-is) */
+    g_wte = malloc((size_t)vocab * n_embd * sizeof(float));
+    g_wpe = malloc((size_t)n_ctx * n_embd * sizeof(float));
+    g_ln_f_w = malloc(n_embd * sizeof(float));
+    g_ln_f_b = malloc(n_embd * sizeof(float));
+    fread(g_wte, sizeof(float), (size_t)vocab * n_embd, f);
+    fread(g_wpe, sizeof(float), (size_t)n_ctx * n_embd, f);
+    fread(g_ln_f_w, sizeof(float), n_embd, f);
+    fread(g_ln_f_b, sizeof(float), n_embd, f);
+
+    /* Per-layer binary weights + LayerNorm (float) */
+    for (int l = 0; l < n_layer; l++) {
+        BinGPT2Layer *L = &g_bin_layers[l];
+
+        /* LayerNorm weights (float, [n_embd] each) */
+        L->ln1_w = malloc(n_embd * sizeof(float));
+        L->ln1_b = malloc(n_embd * sizeof(float));
+        L->ln2_w = malloc(n_embd * sizeof(float));
+        L->ln2_b = malloc(n_embd * sizeof(float));
+        fread(L->ln1_w, sizeof(float), n_embd, f);
+        fread(L->ln1_b, sizeof(float), n_embd, f);
+        fread(L->ln2_w, sizeof(float), n_embd, f);
+        fread(L->ln2_b, sizeof(float), n_embd, f);
+
+        /* 4 binary matrices per layer */
+        SrvBinLayer *mats[] = {&L->c_attn, &L->c_proj, &L->mlp_fc, &L->mlp_proj};
+        for (int mi = 0; mi < 4; mi++) {
+            SrvBinLayer *bl = mats[mi];
+            unsigned int mhdr[4];
+            if (fread(mhdr, 4, 4, f) != 4) { fclose(f); return -1; }
+            bl->out_dim = mhdr[0];
+            bl->in_dim  = mhdr[1];
+            bl->n_words = mhdr[2];
+            /* Read wbits: [out_dim * n_words] uint64s */
+            bl->wbits = malloc((size_t)bl->out_dim * bl->n_words * sizeof(uint64_t));
+            fread(bl->wbits, sizeof(uint64_t),
+                  (size_t)bl->out_dim * bl->n_words, f);
+            /* Read alpha + bias */
+            bl->alpha = malloc(bl->out_dim * sizeof(float));
+            bl->bias  = malloc(bl->out_dim * sizeof(float));
+            fread(bl->alpha, sizeof(float), bl->out_dim, f);
+            fread(bl->bias,  sizeof(float), bl->out_dim, f);
+        }
+    }
+
+    fclose(f);
+    g_binary_mode = 1;
+    return 0;
+}
+
 /* ========================================================================
  * Hash-table tokenizer (length-bucketed open-addressing)
  * Bucket key = (length, hash(token_bytes)) → token_id
@@ -624,37 +759,44 @@ static int gpt2_forward_token(int token_id, int position) {
 
     /* Layers */
     for (int l = 0; l < N_LAYER; l++) {
-        GPT2Layer *L = &g_layers[l];
+        if (g_binary_mode) {
+            /* Binary forward: XNOR + popcount (32x fewer FLOPs per layer) */
+            BinGPT2Layer *L = &g_bin_layers[l];
 
-        /* ln_1 */
-        layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
+            layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
+            bin_matmul(g_ln1, &L->c_attn, g_qkv);
+            memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            bin_matmul(g_attn_out, &L->c_proj, g_proj);
+            for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
-        /* c_attn: [n] → [3n] */
-        matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
+            layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
+            bin_matmul(g_ln2, &L->mlp_fc, g_fc);
+            for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
+            bin_matmul(g_fc, &L->mlp_proj, g_mlp_out);
+            for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
+        } else {
+            /* Float forward: AVX2/NEON SIMD matmul */
+            GPT2Layer *L = &g_layers[l];
 
-        /* Simplified attention: attn_out = V */
-        memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
+            matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
+            memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
+            matmul_avx2(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
+            for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
-        /* c_proj: [n] → [n] */
-        matmul_avx2(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
-        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
-
-        /* ln_2 */
-        layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
-
-        /* mlp.c_fc: [n] → [m] */
-        matmul_avx2(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
-        for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
-
-        /* mlp.c_proj: [m] → [n] */
-        matmul_avx2(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
-        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
+            layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
+            matmul_avx2(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
+            for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
+            matmul_avx2(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
+            for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
+        }
     }
 
     /* Final norm */
     layer_norm_simd(g_final_ln, g_x, g_ln_f_w, g_ln_f_b, N_EMBD);
 
     /* LM head: logits = wte @ final_ln  (tied embeddings)
+     * wte stays float in both modes (binarizing embeddings hurts accuracy).
      * Use pruned version if --prune-vocab was set, else full parallel. */
     if (g_active_vocab && g_n_active_vocab < VOCAB_SIZE) {
         lm_head_pruned(g_logits, g_final_ln, g_wte, g_active_vocab, g_n_active_vocab, N_EMBD);
@@ -809,10 +951,14 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     int port = 8080;
-    /* Parse args: [port] [--prune-vocab FRAC]
+    int use_binary = 0;
+    /* Parse args: [port] [--binary] [--prune-vocab FRAC]
+     * --binary: use XNOR+popcount binary mode (13MB weights, 32x fewer FLOPs)
      * FRAC in [0, 0.9]: fraction of vocab (smallest-norm rows) to drop. */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--binary") == 0) {
+            use_binary = 1;
+        } else if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
             g_prune_frac = (float)atof(argv[++i]);
             if (g_prune_frac < 0.0f) g_prune_frac = 0.0f;
             if (g_prune_frac > 0.9f) g_prune_frac = 0.9f;
@@ -829,53 +975,70 @@ int main(int argc, char **argv) {
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
 
-    printf("[*] LAL GPT-2 Server (SIMD-optimized, %d thread%s, %ld cores detected)\n",
+    printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
+           use_binary ? "BINARY XNOR+popcount" : "float SIMD",
            g_n_threads, g_n_threads > 1 ? "s" : "", ncpu);
     if (g_prune_frac > 0.0f) {
         printf("[*] vocab pruning: dropping %.0f%% smallest-norm rows (%d → %d active)\n",
                g_prune_frac * 100.0f, VOCAB_SIZE,
                (int)((1.0f - g_prune_frac) * VOCAB_SIZE));
     }
-    printf("[*] loading model (float, AVX2 SIMD)...\n");
-    fflush(stdout);
 
-    /* Weight + tokenizer paths: env var override, else relative to cwd */
-    const char *weight_path = getenv("LAL_WEIGHTS");
-    if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
     const char *tokenizer_path = getenv("LAL_TOKENIZER");
     if (!tokenizer_path) tokenizer_path = "prebuilt/gpt2_tokenizer.bin";
 
-    g_tensors = tensor_load_all(weight_path, &g_n_tensors);
-    if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
-    printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
+    if (use_binary) {
+        /* Binary mode: load GB2L file directly (169 MB total, no float weights) */
+        const char *bin_path = getenv("LAL_BINARY");
+        if (!bin_path) bin_path = "prebuilt/gpt2_binary.bin";
+        printf("[*] loading binary weights from %s...\n", bin_path);
+        fflush(stdout);
+        struct timespec tl0, tl1;
+        clock_gettime(CLOCK_MONOTONIC, &tl0);
+        if (load_binary_weights(bin_path) != 0) return 1;
+        clock_gettime(CLOCK_MONOTONIC, &tl1);
+        double ldt = (tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9;
+        printf("[*] binary weights loaded in %.2fs (12 layers, XNOR+popcount)\n", ldt);
+        fflush(stdout);
+    } else {
+        printf("[*] loading float weights...\n");
+        fflush(stdout);
+        /* Weight path: env var override, else relative to cwd */
+        const char *weight_path = getenv("LAL_WEIGHTS");
+        if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
 
-    g_wte = tensor_get(g_tensors, g_n_tensors, "wte.weight");
-    g_wpe = tensor_get(g_tensors, g_n_tensors, "wpe.weight");
-    g_ln_f_w = tensor_get(g_tensors, g_n_tensors, "ln_f.weight");
-    g_ln_f_b = tensor_get(g_tensors, g_n_tensors, "ln_f.bias");
-    if (!g_wte || !g_wpe || !g_ln_f_w || !g_ln_f_b) {
-        fprintf(stderr, "[!] missing top-level tensors\n"); return 1;
-    }
+        g_tensors = tensor_load_all(weight_path, &g_n_tensors);
+        if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
+        printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
 
-    char key[128];
-    for (int l = 0; l < N_LAYER; l++) {
-        GPT2Layer *L = &g_layers[l];
-        sprintf(key, "h.%d.ln_1.weight",     l); L->ln1_w      = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.ln_1.bias",       l); L->ln1_b      = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.attn.c_attn.weight", l); L->c_attn_w   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.attn.c_attn.bias",   l); L->c_attn_b   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.attn.c_proj.weight", l); L->c_proj_w   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.attn.c_proj.bias",   l); L->c_proj_b   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.ln_2.weight",     l); L->ln2_w      = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.ln_2.bias",       l); L->ln2_b      = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.mlp.c_fc.weight", l); L->mlp_fc_w   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.mlp.c_fc.bias",   l); L->mlp_fc_b   = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.mlp.c_proj.weight", l); L->mlp_proj_w = tensor_get(g_tensors, g_n_tensors, key);
-        sprintf(key, "h.%d.mlp.c_proj.bias",   l); L->mlp_proj_b = tensor_get(g_tensors, g_n_tensors, key);
-        if (!L->ln1_w || !L->c_attn_w || !L->c_proj_w || !L->ln2_w || !L->mlp_fc_w || !L->mlp_proj_w) {
-            fprintf(stderr, "[!] missing tensors for layer %d\n", l); return 1;
+        g_wte = tensor_get(g_tensors, g_n_tensors, "wte.weight");
+        g_wpe = tensor_get(g_tensors, g_n_tensors, "wpe.weight");
+        g_ln_f_w = tensor_get(g_tensors, g_n_tensors, "ln_f.weight");
+        g_ln_f_b = tensor_get(g_tensors, g_n_tensors, "ln_f.bias");
+        if (!g_wte || !g_wpe || !g_ln_f_w || !g_ln_f_b) {
+            fprintf(stderr, "[!] missing top-level tensors\n"); return 1;
         }
-    }
+
+        char key[128];
+        for (int l = 0; l < N_LAYER; l++) {
+            GPT2Layer *L = &g_layers[l];
+            sprintf(key, "h.%d.ln_1.weight",     l); L->ln1_w      = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.ln_1.bias",       l); L->ln1_b      = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.attn.c_attn.weight", l); L->c_attn_w   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.attn.c_attn.bias",   l); L->c_attn_b   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.attn.c_proj.weight", l); L->c_proj_w   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.attn.c_proj.bias",   l); L->c_proj_b   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.ln_2.weight",     l); L->ln2_w      = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.ln_2.bias",       l); L->ln2_b      = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.mlp.c_fc.weight", l); L->mlp_fc_w   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.mlp.c_fc.bias",   l); L->mlp_fc_b   = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.mlp.c_proj.weight", l); L->mlp_proj_w = tensor_get(g_tensors, g_n_tensors, key);
+            sprintf(key, "h.%d.mlp.c_proj.bias",   l); L->mlp_proj_b = tensor_get(g_tensors, g_n_tensors, key);
+            if (!L->ln1_w || !L->c_attn_w || !L->c_proj_w || !L->ln2_w || !L->mlp_fc_w || !L->mlp_proj_w) {
+                fprintf(stderr, "[!] missing tensors for layer %d\n", l); return 1;
+            }
+        }
+    }  /* end else (float mode) */
 
     g_logits = NULL;
     if (posix_memalign((void **)&g_logits, 32, VOCAB_SIZE * sizeof(float)) != 0 || !g_logits) {
