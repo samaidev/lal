@@ -940,6 +940,14 @@ static inline float gelu_fast(float x) {
     return 0.5f * x * (1.0f + tanhf(t));
 }
 
+/* NOTE: a SIMD-vectorized gelu_simd() was tried (Padé[2/2] tanh approx to
+ * avoid scalar tanhf) but the approximation diverged for |t| > ~2.5, which
+ * GELU's argument t = c0*(x + 0.044715*x³) reaches at moderate x. This
+ * corrupted MLP activations and produced word-salad output. Reverted to
+ * scalar gelu_fast. A correct SIMD GELU would need either a vectorized tanh
+ * (range-reduction + high-degree polynomial) or the exact sigmoid form —
+ * left as future work. */
+
 /* ========================================================================
  * GPT-2 forward (single-token, no attention — uses V as attention output)
  * This mirrors the simplified attention in lal_runtime.c (trans_layer_forward
