@@ -23,7 +23,7 @@ endif
 CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall
 LALC ?= $(PYTHON) compiler/lal.py
 
-.PHONY: all train server demos verify clean
+.PHONY: all train server float-subset demos verify clean
 
 all: demos train
 
@@ -44,6 +44,19 @@ prebuilt/gpt2_server: tools/server/gpt2_server.c tools/server/frontend.html \
 	              runtime/lal_runtime.c runtime/lal_runtime.h
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
 	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread
+
+# === Float subset extractor for --mixed-precision on memory-constrained devices ===
+# Extracts only layers 0 and 11 (24 tensors, ~54 MB) from the full 498 MB
+# gpt2_weights.bin, in the same GPW2 format, so the tablet can run
+# --mixed-precision without downloading the full float file.
+#   LAL_FLOAT_SUBSET=prebuilt/gpt2_float_subset.bin ./gpt2_server --mixed-precision
+float-subset: scripts/extract_float_subset prebuilt/gpt2_float_subset.bin
+
+scripts/extract_float_subset: scripts/extract_float_subset.c
+	$(CC) -O2 -o $@ $<
+
+prebuilt/gpt2_float_subset.bin: scripts/extract_float_subset prebuilt/gpt2_weights.bin
+	./scripts/extract_float_subset prebuilt/gpt2_weights.bin $@
 
 # === Compile LAL demos ===
 demos: prebuilt/demos/demo

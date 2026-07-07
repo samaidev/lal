@@ -12,6 +12,11 @@ build/
 # Large binary weight files (regenerate with tools/)
 prebuilt/gpt2_weights.bin
 prebuilt/gpt2_binary_finetuned.bin
+prebuilt/gpt2_float_subset.bin
+
+# Built standalone tools (regenerate via make)
+scripts/extract_float_subset
+scripts/build_corpus
 
 # Not part of project
 skills/
