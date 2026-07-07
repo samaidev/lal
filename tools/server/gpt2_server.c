@@ -475,15 +475,78 @@ static void lm_head_parallel(float *logits, const float *x, const float *wte,
 
 /* Pruned LM head: only compute logits for active vocab rows.
  * Skips rows with smallest L2 norm (set via g_prune_frac).
- * Non-active logits are set to -INFINITY so argmax never picks them. */
+ * Non-active logits are set to -INFINITY so argmax never picks them.
+ *
+ * active_vocab[] must be sorted ascending by vocab index for sequential
+ * wte memory access (prefetcher-friendly). */
 static void lm_head_pruned(float *logits, const float *x, const float *wte,
                            const int *active_vocab, int n_active, int n_embd) {
     /* Initialize all logits to -INFINITY */
     for (int v = 0; v < VOCAB_SIZE; v++) logits[v] = -1e30f;
 
-    /* Compute logits only for active vocab rows.
-     * Each row is a dense 768-dim dot product — SIMD friendly. */
-    for (int vi = 0; vi < n_active; vi++) {
+    /* Process 8 active rows at a time when they're consecutive in wte
+     * (which is often the case after sorting by index). This reuses the
+     * 8-wide SIMD pattern from lm_head_avx2 for the common case. */
+    int vi = 0;
+    while (vi + 8 <= n_active) {
+        /* Check if next 8 active rows are consecutive in vocab */
+        int v0 = active_vocab[vi];
+        int consecutive = 1;
+        for (int k = 1; k < 8; k++) {
+            if (active_vocab[vi + k] != v0 + k) { consecutive = 0; break; }
+        }
+        if (consecutive) {
+            /* Use the fast 8-wide SIMD path (same as lm_head_avx2) */
+            v8f acc0 = v8f_zero(), acc1 = v8f_zero(), acc2 = v8f_zero(), acc3 = v8f_zero();
+            v8f acc4 = v8f_zero(), acc5 = v8f_zero(), acc6 = v8f_zero(), acc7 = v8f_zero();
+            const float *w0 = wte + (size_t)(v0+0) * n_embd;
+            const float *w1 = wte + (size_t)(v0+1) * n_embd;
+            const float *w2 = wte + (size_t)(v0+2) * n_embd;
+            const float *w3 = wte + (size_t)(v0+3) * n_embd;
+            const float *w4 = wte + (size_t)(v0+4) * n_embd;
+            const float *w5 = wte + (size_t)(v0+5) * n_embd;
+            const float *w6 = wte + (size_t)(v0+6) * n_embd;
+            const float *w7 = wte + (size_t)(v0+7) * n_embd;
+            int i = 0;
+            for (; i + 8 <= n_embd; i += 8) {
+                v8f xv = v8f_load(x + i);
+                acc0 = v8f_fmadd(xv, v8f_load(w0 + i), acc0);
+                acc1 = v8f_fmadd(xv, v8f_load(w1 + i), acc1);
+                acc2 = v8f_fmadd(xv, v8f_load(w2 + i), acc2);
+                acc3 = v8f_fmadd(xv, v8f_load(w3 + i), acc3);
+                acc4 = v8f_fmadd(xv, v8f_load(w4 + i), acc4);
+                acc5 = v8f_fmadd(xv, v8f_load(w5 + i), acc5);
+                acc6 = v8f_fmadd(xv, v8f_load(w6 + i), acc6);
+                acc7 = v8f_fmadd(xv, v8f_load(w7 + i), acc7);
+            }
+            float s0 = v8f_hsum(acc0), s1 = v8f_hsum(acc1);
+            float s2 = v8f_hsum(acc2), s3 = v8f_hsum(acc3);
+            float s4 = v8f_hsum(acc4), s5 = v8f_hsum(acc5);
+            float s6 = v8f_hsum(acc6), s7 = v8f_hsum(acc7);
+            for (; i < n_embd; i++) {
+                float xv = x[i];
+                s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+                s4 += xv * w4[i]; s5 += xv * w5[i]; s6 += xv * w6[i]; s7 += xv * w7[i];
+            }
+            logits[v0+0]=s0; logits[v0+1]=s1; logits[v0+2]=s2; logits[v0+3]=s3;
+            logits[v0+4]=s4; logits[v0+5]=s5; logits[v0+6]=s6; logits[v0+7]=s7;
+            vi += 8;
+        } else {
+            /* Fall back to single-row scalar+SIMD */
+            int v = active_vocab[vi];
+            const float *w = wte + (size_t)v * n_embd;
+            v8f acc = v8f_zero();
+            int i = 0;
+            for (; i + 8 <= n_embd; i += 8)
+                acc = v8f_fmadd(v8f_load(x + i), v8f_load(w + i), acc);
+            float s = v8f_hsum(acc);
+            for (; i < n_embd; i++) s += x[i] * w[i];
+            logits[v] = s;
+            vi++;
+        }
+    }
+    /* Tail */
+    for (; vi < n_active; vi++) {
         int v = active_vocab[vi];
         const float *w = wte + (size_t)v * n_embd;
         v8f acc = v8f_zero();
@@ -547,6 +610,11 @@ static int prune_cmp_desc(const void *a, const void *b) {
     if (na < nb) return 1;   /* descending: larger norm first */
     if (na > nb) return -1;
     return 0;
+}
+static int *g_prune_idx_ref = NULL;
+static int prune_cmp_idx_asc(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);  /* ascending by vocab index */
 }
 
 static int gpt2_forward_token(int token_id, int position) {
@@ -845,7 +913,11 @@ int main(int argc, char **argv) {
         g_prune_norm_ref = row_norm;
         qsort(vocab_idx, VOCAB_SIZE, sizeof(int), prune_cmp_desc);
 
-        /* Keep top (1 - prune_frac) */
+        /* Keep top (1 - prune_frac), then RE-SORT by vocab index for sequential
+         * memory access. Random-order access to wte rows kills cache performance
+         * on ARM (LPDDR3 with small L2 cache). Sequential access lets the
+         * prefetcher stream weights, which more than compensates for the
+         * scalar loop overhead vs the 8-wide SIMD lm_head_avx2. */
         g_n_active_vocab = (int)((1.0f - g_prune_frac) * VOCAB_SIZE);
         if (g_n_active_vocab < 1) g_n_active_vocab = 1;
         g_active_vocab = malloc(g_n_active_vocab * sizeof(int));
@@ -853,6 +925,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < g_n_active_vocab; i++) {
             g_active_vocab[i] = vocab_idx[i];
         }
+        /* Re-sort by vocab index ascending (restore sequential wte access) */
+        g_prune_idx_ref = g_active_vocab;
+        qsort(g_active_vocab, g_n_active_vocab, sizeof(int), prune_cmp_idx_asc);
 
         /* Stats: report the cutoff norm */
         float cutoff_sq = row_norm[vocab_idx[g_n_active_vocab - 1]];
