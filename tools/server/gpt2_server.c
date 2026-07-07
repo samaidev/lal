@@ -254,6 +254,24 @@ static int g_mixed_precision = 0;
 static int   g_ternary_act       = 0;
 static float g_ternary_threshold = 0.5f;
 
+/* BWN mode (--bwn, implies --binary): Binary-Weights-Network — keep activations
+ * as float, only weights are sign-quantized (sign(w) packed in wbits). This is
+ * the training-faithful mode: STE training (tools/train_binary_gpt2.py) uses
+ * BWN forward (sign(W) * x_float * alpha), so inference under --bwn matches the
+ * training activation distribution exactly. Plain --binary mode is BNN+K-norm
+ * (binarizes activations to sign(x) too) — faster (XNOR+popcount 64x) but
+ * mathematically NOT equivalent to BWN unless all |x_i| are equal, which causes
+ * the BWN→BNN drift that distorts STE-trained models.
+ *
+ * Trade-off: --bwn loses the XNOR+popcount speedup (activations are float), but
+ * (a) recovers quality via training-inference alignment, and (b) feeds clean
+ * float hidden state into lal_server_get_hidden() — the three-layer fusion
+ * level-1 bridge REQUIRES this for the .lal logic layer to reason over a
+ * meaningful representation. Use --bwn for fusion/correctness, --binary for
+ * max speed on tablet. Composes with --mixed-precision (which already keeps
+ * layer 0 + 11 float, so g_final_ln is clean there regardless). */
+static int g_bwn_mode = 0;
+
 /* Binarize input x[in_dim] → packed bits x_bits[n_words] */
 static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_words) {
     for (int wi = 0; wi < n_words; wi++) {
@@ -296,6 +314,37 @@ static void ternarize_input(const float *x, uint64_t *x_sign, uint64_t *x_mask,
     }
 }
 
+/* BWN matmul: activations stay float, weights are sign(w) packed in wbits.
+ * y[j] = alpha[j] * sum_i(x[i] * sign(w[j,i])) + bias[j]
+ *      = alpha[j] * (2 * sum_{i: w[j,i]=+1} x[i] - sum_all x[i]) + bias[j]
+ * The "2*partial - total" form only iterates set bits (~in_dim/2), so it's
+ * faster than a naive per-element sign multiply. Mathematically identical to
+ * the STE training forward (sign(W) * x_float * alpha) — no activation
+ * binarization, no K-norm approximation. Defined before bin_matmul so the
+ * BWN branch can call it without a forward declaration. */
+static void bin_matmul_bwn(const float *x, const SrvBinLayer *bl, float *y) {
+    int n_words = bl->n_words;
+    /* total = sum of all x[i] (computed once, reused per output j) */
+    float total = 0.0f;
+    for (int i = 0; i < bl->in_dim; i++) total += x[i];
+
+    for (int j = 0; j < bl->out_dim; j++) {
+        const uint64_t *wb = bl->wbits + (size_t)j * n_words;
+        float partial = 0.0f;  /* sum of x[i] where w[j,i] bit is set (sign +1) */
+        for (int wi = 0; wi < n_words; wi++) {
+            uint64_t w = wb[wi];
+            int base = wi * 64;
+            while (w) {
+                int bi = __builtin_ctzll(w);
+                int idx = base + bi;
+                if (idx < bl->in_dim) partial += x[idx];
+                w &= w - 1;  /* clear lowest set bit */
+            }
+        }
+        y[j] = bl->alpha[j] * (2.0f * partial - total) + bl->bias[j];
+    }
+}
+
 /* Binary forward (XNOR-Net style):
  *   y[j] = mean(|x|) * alpha[j] * (2*popcount(XNOR(x_bits, wbits[j])) - in_dim) + bias[j]
  *
@@ -312,6 +361,13 @@ static void ternarize_input(const float *x, uint64_t *x_sign, uint64_t *x_mask,
  */
 static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     int n_words = bl->n_words;
+
+    /* BWN: training-faithful path, activations stay float. Skip the BNN+K-norm
+     * binarize-input path entirely. See g_bwn_mode doc above. */
+    if (g_bwn_mode) {
+        bin_matmul_bwn(x, bl, y);
+        return;
+    }
 
     /* Compute mean(|x|) over the active elements — the input scale factor.
      * In ternary mode, "active" means survivors (|x| >= threshold); the
@@ -2143,6 +2199,14 @@ int main(int argc, char **argv) {
              * affects binary layers (in --binary or --mixed-precision mode);
              * float layers are untouched. Composes with STE + mixed-precision. */
             g_ternary_act = 1;
+        } else if (strcmp(argv[i], "--bwn") == 0) {
+            /* Binary-Weights-Network: activations stay float, only weights are
+             * sign-quantized. Training-faithful — matches STE forward exactly.
+             * Implies --binary (needs binary weight file). Use this for the
+             * three-layer fusion bridge (lal_server_get_hidden returns clean
+             * float hidden) and for max quality with STE-trained models. */
+            use_binary = 1;
+            g_bwn_mode = 1;
         } else if (strcmp(argv[i], "--ternary-threshold") == 0 && i + 1 < argc) {
             g_ternary_threshold = (float)atof(argv[++i]);
             if (g_ternary_threshold < 0.0f) g_ternary_threshold = 0.0f;
@@ -2180,7 +2244,8 @@ int main(int argc, char **argv) {
 #endif
 
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
-           use_binary ? "BINARY XNOR+popcount" : "float SIMD",
+           g_bwn_mode ? "BINARY-WEIGHTS (BWN, training-faithful)"
+                      : (use_binary ? "BINARY XNOR+popcount" : "float SIMD"),
            g_n_threads, g_n_threads > 1 ? "s" : "", ncpu);
     if (g_prune_frac > 0.0f) {
         printf("[*] vocab pruning: dropping %.0f%% smallest-norm rows (%d → %d active)\n",
