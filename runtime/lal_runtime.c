@@ -740,18 +740,48 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
     for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
     float K = abs_sum / in;
 
+    /* LUT-based sign unpack (matches tools/server/gpt2_server.c 51c115b):
+     * 256-entry table, byte → 8 floats of ±1. 8KB, fits L1.
+     * Each iteration extracts 1 byte from wbits, loads 8 sign floats,
+     * dots with 8 x floats. 8x unrolled loop auto-vectorizes to SIMD.
+     * ~8x faster than scalar bit-by-bit extraction. */
+    static float sign_lut[256][8];
+    static int lut_init = 0;
+    if (!lut_init) {
+        for (int b = 0; b < 256; b++)
+            for (int i = 0; i < 8; i++)
+                sign_lut[b][i] = (b >> i) & 1 ? 1.0f : -1.0f;
+        lut_init = 1;
+    }
+
     for (int j = 0; j < out; j++) {
         const uint64_t *wb = &bl->wbits[j * nw];
         float s = 0.0f;
-        /* Unpack sign bits and accumulate sign * x[i] */
         for (int wi = 0; wi < nw; wi++) {
             uint64_t w = wb[wi];
             int base = wi * 64;
-            int limit = (base + 64 < in) ? 64 : (in - base);
-            for (int bi = 0; bi < limit; bi++) {
-                /* sign(W[j,base+bi]) = +1 if bit set, -1 if clear */
-                float sign_w = (w >> bi) & 1ULL ? 1.0f : -1.0f;
-                s += sign_w * x[base + bi];
+            /* Process 8 bytes (8×8=64 bits) per word, 8 floats at a time */
+            for (int bi = 0; bi < 8; bi++) {
+                int idx = base + bi * 8;
+                uint8_t byte = (uint8_t)((w >> (bi * 8)) & 0xFF);
+                const float *sw = sign_lut[byte];
+                if (idx + 7 < in) {
+                    /* 8x unrolled dot product — auto-vectorizes to SIMD */
+                    s += x[idx+0] * sw[0];
+                    s += x[idx+1] * sw[1];
+                    s += x[idx+2] * sw[2];
+                    s += x[idx+3] * sw[3];
+                    s += x[idx+4] * sw[4];
+                    s += x[idx+5] * sw[5];
+                    s += x[idx+6] * sw[6];
+                    s += x[idx+7] * sw[7];
+                } else {
+                    /* Tail: handle remaining elements (< 8) */
+                    for (int k = 0; k < 8; k++) {
+                        int i = idx + k;
+                        if (i < in) s += x[i] * sw[k];
+                    }
+                }
             }
         }
         y[j] = s * bl->alpha[j] * K + bl->bias[j];
