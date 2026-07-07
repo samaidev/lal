@@ -250,6 +250,9 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     clip_array(x, n, 10.0f);
 }
 
+/* Global flag: use STE backward (updates w_float + repacks wbits) */
+int g_use_ste = 0;
+
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                           ModelConfig *cfg, float lr) {
     int n = cfg->n_embd, m = cfg->mlp_dim;
@@ -257,16 +260,19 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
     static float g_mlp[4096], g_hidden[4096], g_norm2[4096], g_proj[4096];
     static float g_attn[4096], g_qkv[4096*3], g_norm1[4096], g_pre[4096];
 
+    /* Choose backward function based on STE flag */
+    #define BIN_BW(gx, gy, x, bl, lr) \
+        (g_use_ste ? bin_backward_ste(gx, gy, x, bl, lr) : bin_backward(gx, gy, x, bl, lr))
+
     /* MLP backward */
     for (int i = 0; i < n; i++) g_mlp[i] = grad_x[i] * rs;
-    bin_backward(g_hidden, g_mlp, act->mlp_hidden, &tl->mlp_down, lr);
+    BIN_BW(g_hidden, g_mlp, act->mlp_hidden, &tl->mlp_down, lr);
     if (cfg->act_type == ACT_SWIGLU) {
         for (int i = 0; i < m; i++) g_hidden[i] *= silu_grad(act->mlp_hidden[i]);
-        /* Backward through gate and up (simplified) */
-        bin_backward(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
+        BIN_BW(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
     } else {
         for (int i = 0; i < m; i++) g_hidden[i] *= gelu_grad(act->mlp_hidden[i]);
-        bin_backward(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
+        BIN_BW(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
     }
     norm_backward(g_pre, g_norm2, act->x_pre_norm2, tl->norm2_w,
                   act->norm2_cache, cfg->norm_type, n);
@@ -274,10 +280,10 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
 
     /* Attention backward */
     for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs;
-    bin_backward(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
+    BIN_BW(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
     memset(g_qkv, 0, 3 * n * sizeof(float));
     memcpy(g_qkv + 2 * n, g_attn, n * sizeof(float));
-    bin_backward(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
+    BIN_BW(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
     norm_backward(g_pre, g_norm1, act->x_pre_norm1, tl->norm1_w,
                   act->norm1_cache, cfg->norm_type, n);
     for (int i = 0; i < n; i++) grad_x[i] += g_pre[i] * rs;
@@ -475,6 +481,11 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
     bl->wbits_T = calloc(in_dim * bl->n_words_T, sizeof(uint64_t));
     bl->alpha = calloc(out_dim, sizeof(float));
     bl->bias = bias ? malloc(out_dim * sizeof(float)) : calloc(out_dim, sizeof(float));
+    bl->w_float = malloc((size_t)in_dim * out_dim * sizeof(float));  /* STE */
+
+    /* Copy float weights for STE updates */
+    for (int i = 0; i < in_dim * out_dim; i++)
+        bl->w_float[i] = W[i];
 
     /* Row-major: pack sign(w[j][i]) per output j */
     for (int j = 0; j < out_dim; j++) {
@@ -507,7 +518,47 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
 
 void bin_layer_free(BinLayer *bl) {
     free(bl->wbits); free(bl->wbits_T); free(bl->alpha); free(bl->bias);
+    free(bl->w_float);
     bl->wbits = NULL; bl->wbits_T = NULL; bl->alpha = NULL; bl->bias = NULL;
+    bl->w_float = NULL;
+}
+
+/* Re-pack wbits and wbits_T from sign(w_float).
+ * Called after STE updates w_float to keep the binary weights in sync. */
+static void bin_layer_repack(BinLayer *bl) {
+    int in = bl->in_dim, out = bl->out_dim;
+    /* w_float is [in, out] row-major (same as input W) */
+
+    /* Row-major: wbits[j][wi] = pack sign(w_float[i*out+j]) for i in 64-blocks */
+    for (int j = 0; j < out; j++) {
+        for (int wi = 0; wi < bl->n_words; wi++) {
+            uint64_t word = 0;
+            for (int bi = 0; bi < 64; bi++) {
+                int idx = wi * 64 + bi;
+                if (idx < in && bl->w_float[idx * out + j] > 0.0f) word |= (1ULL << bi);
+            }
+            bl->wbits[j * bl->n_words + wi] = word;
+        }
+    }
+
+    /* Col-major (transposed): wbits_T[i][wi] = pack sign(w_float[i*out+j]) */
+    for (int i = 0; i < in; i++) {
+        for (int wi = 0; wi < bl->n_words_T; wi++) {
+            uint64_t word = 0;
+            for (int bi = 0; bi < 64; bi++) {
+                int j = wi * 64 + bi;
+                if (j < out && bl->w_float[i * out + j] > 0.0f) word |= (1ULL << bi);
+            }
+            bl->wbits_T[i * bl->n_words_T + wi] = word;
+        }
+    }
+
+    /* Recompute alpha = mean(|w_float|) per output */
+    for (int j = 0; j < out; j++) {
+        float abs_sum = 0;
+        for (int i = 0; i < in; i++) abs_sum += fabsf(bl->w_float[i * out + j]);
+        bl->alpha[j] = abs_sum / in;
+    }
 }
 
 /* ========================================================================
@@ -609,6 +660,96 @@ void bin_backward(float *grad_x, const float *grad_y, const float *x,
         if (bl->alpha[j] < 0.001f) bl->alpha[j] = 0.001f;
         if (bl->alpha[j] > 1.0f) bl->alpha[j] = 1.0f;
         bl->bias[j] -= lr * gy;
+    }
+}
+
+/* STE (Straight-Through Estimator) backward pass.
+ *
+ * Key difference from bin_backward: this updates w_float (the full-precision
+ * weights) using the gradient, treating sign() as identity. After the update,
+ * wbits is re-packed from sign(w_float) via bin_layer_repack().
+ *
+ * This allows the binary weights to actually change during training, which
+ * is impossible with bin_backward (it only updates alpha and bias).
+ *
+ * STE gradient: d(loss)/d(w_float) = d(loss)/d(sign(w)) * d(sign(w))/d(w)
+ *                                  = grad_y * x * 1  (STE: sign'(w) = 1)
+ * So: w_float[i,j] -= lr * grad_y[j] * x[i]
+ *
+ * Memory note: w_float is [in_dim, out_dim] row-major, same as input W.
+ * This adds ~in*out*4 bytes per layer (e.g. 768*2304*4 = 7MB for c_attn).
+ * Total for 12 layers × 4 matrices ≈ 339 MB extra during training.
+ * For inference, w_float can be freed (set to NULL after training). */
+void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
+                      BinLayer *bl, float lr) {
+    int in = bl->in_dim, out = bl->out_dim;
+
+    /* Part 1: grad_x = grad_y @ w (using binary weights, same as bin_backward) */
+    int nw_T = bl->n_words_T;
+    uint64_t gybits[64];
+    for (int wi = 0; wi < nw_T; wi++) {
+        uint64_t word = 0;
+        for (int bi = 0; bi < 64; bi++) {
+            int j = wi * 64 + bi;
+            if (j < out && grad_y[j] > 0.0f) word |= (1ULL << bi);
+        }
+        gybits[wi] = word;
+    }
+    float mean_abs_gy = 0, mean_alpha = 0;
+    for (int j = 0; j < out; j++) mean_abs_gy += fabsf(grad_y[j]);
+    mean_abs_gy /= out;
+    for (int j = 0; j < out; j++) mean_alpha += bl->alpha[j];
+    mean_alpha /= out;
+    for (int i = 0; i < in; i++) {
+        int pc = 0;
+        const uint64_t *wbT = &bl->wbits_T[i * nw_T];
+        for (int wi = 0; wi < nw_T; wi++)
+            pc += __builtin_popcountll(~(gybits[wi] ^ wbT[wi]));
+        grad_x[i] = (float)(2 * pc - out) * mean_alpha * mean_abs_gy;
+    }
+
+    /* Part 2: STE update — w_float[i,j] -= lr * grad_y[j] * x[i]
+     * This is the real gradient w.r.t. the dot product y = x @ w.
+     * STE treats sign(w) as if it were w for gradient purposes. */
+    if (bl->w_float) {
+        for (int j = 0; j < out; j++) {
+            float gy = grad_y[j];
+            if (fabsf(gy) < 1e-8f) continue;
+            for (int i = 0; i < in; i++) {
+                bl->w_float[i * out + j] -= lr * gy * x[i];
+            }
+            /* Update bias */
+            bl->bias[j] -= lr * gy;
+        }
+        /* Re-pack binary weights from updated w_float */
+        bin_layer_repack(bl);
+    } else {
+        /* No w_float — fall back to alpha-only update */
+        float mean_abs_x = 0;
+        for (int i = 0; i < in; i++) mean_abs_x += fabsf(x[i]);
+        mean_abs_x /= in;
+        uint64_t xbits[64];
+        for (int wi = 0; wi < bl->n_words; wi++) {
+            uint64_t word = 0;
+            for (int bi = 0; bi < 64; bi++) {
+                int idx = wi * 64 + bi;
+                if (idx < in && x[idx] > 0.0f) word |= (1ULL << bi);
+            }
+            xbits[wi] = word;
+        }
+        for (int j = 0; j < out; j++) {
+            float gy = grad_y[j];
+            if (fabsf(gy) < 1e-6f) continue;
+            int pc = 0;
+            const uint64_t *wb = &bl->wbits[j * bl->n_words];
+            for (int wi = 0; wi < bl->n_words; wi++)
+                pc += __builtin_popcountll(~(xbits[wi] ^ wb[wi]));
+            float grad_alpha = (float)(2 * pc - in) * mean_abs_x;
+            bl->alpha[j] += lr * grad_alpha * gy / in;
+            if (bl->alpha[j] < 0.001f) bl->alpha[j] = 0.001f;
+            if (bl->alpha[j] > 1.0f) bl->alpha[j] = 1.0f;
+            bl->bias[j] -= lr * gy;
+        }
     }
 }
 

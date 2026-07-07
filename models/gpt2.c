@@ -8,6 +8,7 @@
  */
 #define _POSIX_C_SOURCE 199309L
 #include <time.h>
+#include <string.h>
 #include "../runtime/lal_runtime.h"
 
 /* === GPT-2 config — this is the ONLY model-specific code === */
@@ -47,9 +48,18 @@ static int encode(const char *t, int *tk) {
 int main(int argc, char **argv) {
     int n_steps = argc > 1 ? atoi(argv[1]) : 200;
     float lr = argc > 2 ? atof(argv[2]) : 0.05;
+    int use_ste = 0;
+    /* Parse --ste flag */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--ste") == 0) use_ste = 1;
+    }
 
     printf("[*] LAL Training — GPT-2 (model-agnostic runtime, no PyTorch)\n");
-    printf("[*] steps:%d lr:%f\n", n_steps, lr);
+    printf("[*] steps:%d lr:%f ste:%d\n", n_steps, lr, use_ste);
+    if (use_ste) {
+        g_use_ste = 1;
+        printf("[*] STE mode: binary weights will be updated via Straight-Through Estimator\n");
+    }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);

@@ -67,6 +67,7 @@ typedef struct {
     uint64_t *wbits_T;
     float    *alpha;
     float    *bias;
+    float    *w_float;   /* STE: full-precision weights for gradient update */
     int       in_dim, out_dim, n_words, n_words_T;
 } BinLayer;
 
@@ -77,6 +78,20 @@ void bin_forward(float *y, const float *x, const BinLayer *bl);
 void bin_forward_float(float *y, const float *x, const BinLayer *bl);
 void bin_backward(float *grad_x, const float *grad_y, const float *x,
                   BinLayer *bl, float lr);
+
+/* STE (Straight-Through Estimator) backward pass.
+ * Updates w_float using gradient, then re-binarizes wbits from sign(w_float).
+ * This is the key to recovering accuracy lost by binarization:
+ *   - Forward uses sign(w) (binary)
+ *   - Backward treats sign() as identity, so gradient flows to w_float
+ *   - After update, wbits = sign(w_float) is recomputed
+ * Call this instead of bin_backward for STE fine-tuning. */
+void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
+                      BinLayer *bl, float lr);
+
+/* Global flag: set to 1 to use STE backward in trans_layer_backward.
+ * Models can set this before calling model_backward(). */
+extern int g_use_ste;
 
 /* ========================================================================
  * Level 1: Standard NN Operations (operator level)
