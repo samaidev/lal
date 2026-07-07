@@ -1098,10 +1098,33 @@ static void dflash_attention(float *attn_out, const float *qkv,
     /* Temporary buffer for dequantized row (turboquant only) */
     float k_row[N_EMBD], v_row[N_EMBD];
 
+    /* SIMD-vectorized dflash. head_dim=64 is a multiple of 8, so the v8f
+     * loops have no tail. The three scalar dot-products / accumulations
+     * become v8f_fmadd + v8f_hsum. This is the hot path on ARMv7 tablets
+     * (binary + --dflash): 12 layers × 12 heads × seq_len × 3 passes ×
+     * 64 scalar MACs → NEON 4-wide cuts it ~3-4x. Also speeds up the x86
+     * float dflash path ~2x via AVX2 8-wide.
+     *
+     * Pass 1 fuses max + sum_exp into a single pass over K (halves K reads
+     * and dequant calls vs the original two-pass). The catch: sum_exp needs
+     * (score - max_score), but max isn't known until the pass completes. We
+     * store the scaled scores in a small stack array (≤1024 floats = 4 KB)
+     * and apply the softmax subtract in a second tiny loop. */
+    static float scores[1024];
+
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
+        /* Load Q once per head — reused across all j iterations. */
+        v8f q0 = v8f_load(Q_h + 0);
+        v8f q1 = v8f_load(Q_h + 8);
+        v8f q2 = v8f_load(Q_h + 16);
+        v8f q3 = v8f_load(Q_h + 24);
+        v8f q4 = v8f_load(Q_h + 32);
+        v8f q5 = v8f_load(Q_h + 40);
+        v8f q6 = v8f_load(Q_h + 48);
+        v8f q7 = v8f_load(Q_h + 56);
 
-        /* Pass 1: find max_score */
+        /* Pass 1: compute all scaled scores, track max. */
         float max_score = -1e30f;
         for (int j = 0; j < seq_len; j++) {
             const float *K_jh;
@@ -1112,47 +1135,42 @@ static void dflash_attention(float *attn_out, const float *qkv,
             } else {
                 K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
             }
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
-            dot *= scale;
+            v8f k0 = v8f_load(K_jh + 0);
+            v8f k1 = v8f_load(K_jh + 8);
+            v8f k2 = v8f_load(K_jh + 16);
+            v8f k3 = v8f_load(K_jh + 24);
+            v8f k4 = v8f_load(K_jh + 32);
+            v8f k5 = v8f_load(K_jh + 40);
+            v8f k6 = v8f_load(K_jh + 48);
+            v8f k7 = v8f_load(K_jh + 56);
+            v8f acc = v8f_zero();
+            acc = v8f_fmadd(q0, k0, acc);
+            acc = v8f_fmadd(q1, k1, acc);
+            acc = v8f_fmadd(q2, k2, acc);
+            acc = v8f_fmadd(q3, k3, acc);
+            acc = v8f_fmadd(q4, k4, acc);
+            acc = v8f_fmadd(q5, k5, acc);
+            acc = v8f_fmadd(q6, k6, acc);
+            acc = v8f_fmadd(q7, k7, acc);
+            float dot = v8f_hsum(acc) * scale;
+            scores[j] = dot;
             if (dot > max_score) max_score = dot;
         }
 
-        /* Compute sum_exp */
+        /* sum_exp (reuses stored scores — no K re-read). */
         float sum_exp = 0.0f;
-        for (int j = 0; j < seq_len; j++) {
-            const float *K_jh;
-            if (use_tq) {
-                turboquant_dequantize(k_row, g_k_cache_q[layer_idx] + (size_t)j * N_EMBD,
-                                      g_k_scale[layer_idx][j], N_EMBD);
-                K_jh = k_row + h * head_dim;
-            } else {
-                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
-            }
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
-            dot *= scale;
-            sum_exp += expf(dot - max_score);
-        }
+        for (int j = 0; j < seq_len; j++)
+            sum_exp += expf(scores[j] - max_score);
         float inv_sum = 1.0f / (sum_exp + 1e-12f);
 
-        /* Pass 2: accumulate V */
+        /* Pass 2: accumulate V. Score is read back from scores[] (avoids a
+         * third K read / dequant). V accumulation is vectorized. */
         float *out_h = attn_out + h * head_dim;
-        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        v8f o0 = v8f_zero(), o1 = v8f_zero(), o2 = v8f_zero(), o3 = v8f_zero();
+        v8f o4 = v8f_zero(), o5 = v8f_zero(), o6 = v8f_zero(), o7 = v8f_zero();
         for (int j = 0; j < seq_len; j++) {
-            const float *K_jh;
-            if (use_tq) {
-                turboquant_dequantize(k_row, g_k_cache_q[layer_idx] + (size_t)j * N_EMBD,
-                                      g_k_scale[layer_idx][j], N_EMBD);
-                K_jh = k_row + h * head_dim;
-            } else {
-                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
-            }
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
-            dot *= scale;
-            float weight = expf(dot - max_score) * inv_sum;
-
+            float weight = expf(scores[j] - max_score) * inv_sum;
+            v8f wv = v8f_set1(weight);
             const float *V_jh;
             if (use_tq) {
                 turboquant_dequantize(v_row, g_v_cache_q[layer_idx] + (size_t)j * N_EMBD,
@@ -1161,8 +1179,23 @@ static void dflash_attention(float *attn_out, const float *qkv,
             } else {
                 V_jh = g_v_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
             }
-            for (int d = 0; d < head_dim; d++) out_h[d] += weight * V_jh[d];
+            o0 = v8f_fmadd(wv, v8f_load(V_jh + 0),  o0);
+            o1 = v8f_fmadd(wv, v8f_load(V_jh + 8),  o1);
+            o2 = v8f_fmadd(wv, v8f_load(V_jh + 16), o2);
+            o3 = v8f_fmadd(wv, v8f_load(V_jh + 24), o3);
+            o4 = v8f_fmadd(wv, v8f_load(V_jh + 32), o4);
+            o5 = v8f_fmadd(wv, v8f_load(V_jh + 40), o5);
+            o6 = v8f_fmadd(wv, v8f_load(V_jh + 48), o6);
+            o7 = v8f_fmadd(wv, v8f_load(V_jh + 56), o7);
         }
+        v8f_store(out_h + 0,  o0);
+        v8f_store(out_h + 8,  o1);
+        v8f_store(out_h + 16, o2);
+        v8f_store(out_h + 24, o3);
+        v8f_store(out_h + 32, o4);
+        v8f_store(out_h + 40, o5);
+        v8f_store(out_h + 48, o6);
+        v8f_store(out_h + 56, o7);
     }
 }
 
