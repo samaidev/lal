@@ -1006,13 +1006,11 @@ int main(int argc, char **argv) {
 
     /* Auto-detect thread count.
      * On ARM Android, pthread_create with lm_head_avx2 crashes (likely NEON
-     * register save/restore issue in bionic). Force single-threaded on ARM
-     * and rely on --prune-vocab to reduce LM head work. */
+     * register save/restore issue in bionic). Force single-threaded on ARM.
+     * Vocab pruning is OFF by default for quality — use --prune-vocab to enable. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 #if defined(__ARM_ARCH) || defined(__arm__) || defined(__aarch64__)
-    g_n_threads = 1;  /* ARM: single-threaded, use --prune-vocab for speed */
-    /* Auto-enable 50% vocab pruning on ARM if not specified */
-    if (g_prune_frac == 0.0f) g_prune_frac = 0.5f;
+    g_n_threads = 1;  /* ARM: single-threaded (pthread+NEON crashes) */
 #else
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
