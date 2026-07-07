@@ -1223,7 +1223,7 @@ static int8_t *g_k_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode)
 static int8_t *g_v_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode) */
 static float  *g_k_scale[N_LAYER];     /* [n_ctx] per-row scale for K (turboquant) */
 static float  *g_v_scale[N_LAYER];     /* [n_ctx] per-row scale for V (turboquant) */
-static int    g_use_real_attention = 0;  /* set by --real-attention */
+static int    g_srv_real_attention = 0;  /* set by --real-attention */
 static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attention) */
 static int    g_use_turboquant = 0;     /* set by --turboquant (KV cache int8 quant) */
 static int    g_skip_lm_head = 0;       /* internal: skip LM head during prefill (optimization) */
@@ -1597,7 +1597,7 @@ static int gpt2_forward_token(int token_id, int position) {
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
 
             /* Attention: dflash (tiled) > real_attention (standard) > V-copy */
-            if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
+            if ((g_srv_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
                     dflash_attention(g_attn_out, g_qkv, position, l);
                 } else {
@@ -1623,7 +1623,7 @@ static int gpt2_forward_token(int token_id, int position) {
             matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
             /* Attention: dflash > real_attention_simd > real_attention > V-copy */
-            if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
+            if ((g_srv_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
                     dflash_attention(g_attn_out, g_qkv, position, l);
                 } else {
@@ -1924,7 +1924,7 @@ static void handle_request(int client_fd) {
          * the KV cache. The last prompt token's forward gives us the logits
          * for the first generated token, so we start generation from there. */
         int first_gen_position = total - 1;  /* position of last prompt token */
-        if (g_use_real_attention || g_use_dflash) {
+        if (g_srv_real_attention || g_use_dflash) {
             /* Forward prompt tokens to fill KV cache.
              * Optimization: skip LM head for all but the last prompt token
              * (only the last one needs logits for generating the first new
@@ -2068,7 +2068,7 @@ static void handle_request(int client_fd) {
 
         /* Prefill KV cache for real attention (same as /generate). */
         int first_gen_position = total - 1;
-        if (g_use_real_attention || g_use_dflash) {
+        if (g_srv_real_attention || g_use_dflash) {
             for (int t = 0; t < n_input; t++)
                 gpt2_forward_token(all_tokens[t], t);
         }
@@ -2141,10 +2141,10 @@ int main(int argc, char **argv) {
             use_binary = 1;
             g_mixed_precision = 1;
         } else if (strcmp(argv[i], "--real-attention") == 0) {
-            g_use_real_attention = 1;
+            g_srv_real_attention = 1;
         } else if (strcmp(argv[i], "--dflash") == 0) {
             g_use_dflash = 1;
-            g_use_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
+            g_srv_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
         } else if (strcmp(argv[i], "--bwn") == 0) {
             g_use_bwn = 1;
         } else if (strcmp(argv[i], "--turboquant") == 0) {
@@ -2331,7 +2331,7 @@ int main(int argc, char **argv) {
     /* Allocate KV cache for real attention.
      * Float: 72 MB (12 layers × 2 × 1024 × 768 × 4B)
      * TurboQuant (int8): 18 MB (4x compression) + 96 KB for per-row scales */
-    if (g_use_real_attention || g_use_dflash) {
+    if (g_srv_real_attention || g_use_dflash) {
         if (g_use_turboquant) {
             printf("[*] allocating TurboQuant KV cache (int8, 18 MB)...\n");
         } else {
@@ -2354,12 +2354,12 @@ int main(int argc, char **argv) {
                 g_v_cache[l] = malloc((size_t)1024 * N_EMBD * sizeof(float));
                 if (!g_k_cache[l] || !g_v_cache[l]) {
                     fprintf(stderr, "[!] OOM allocating KV cache for layer %d\n", l);
-                    g_use_real_attention = 0;
+                    g_srv_real_attention = 0;
                     break;
                 }
             }
         }
-        if (g_use_real_attention || g_use_dflash) {
+        if (g_srv_real_attention || g_use_dflash) {
             if (g_use_turboquant) {
                 printf("[*] TurboQuant KV cache allocated — int8 quantized attention\n");
             } else {

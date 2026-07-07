@@ -117,6 +117,13 @@ extern int g_use_ste;
  * very tight latency budget AND can verify quality is still acceptable. */
 extern int g_use_bnn_fast_path;
 
+/* Global flag: set to 1 to use real causal multi-head self-attention with
+ * KV cache in trans_layer_forward (replaces the degenerate V-copy).
+ * Off by default for backward compatibility. When on, Model.k_cache and
+ * Model.v_cache must be allocated — call model_kv_cache_alloc() or set the
+ * flag before model_load(). */
+extern int g_use_real_attention;
+
 /* ========================================================================
  * Level 1: Standard NN Operations (operator level)
  * ======================================================================== */
@@ -178,6 +185,11 @@ typedef struct {
     BinLayer mlp_down;    /* MLP down projection */
     float *norm1_w, *norm1_b;  /* first norm weight/bias */
     float *norm2_w, *norm2_b;  /* second norm weight/bias */
+    /* KV cache pointers (set by model_load when g_use_real_attention is on).
+     * Each points to Model-owned [n_ctx * n_embd] float array.
+     * NULL in legacy V-copy mode. */
+    float *_kv_k;
+    float *_kv_v;
 } TransLayer;
 
 /* Per-layer activation cache (for backward) */
@@ -220,10 +232,61 @@ TransAct *trans_act_alloc(ModelConfig *cfg);
 void trans_act_free(TransAct *acts, int n_layer);
 
 /* ========================================================================
+ * Level 2: Causal Multi-Head Self-Attention (KV cache)
+ * ========================================================================
+ * Replaces the degenerate `memcpy(attn_out, v, n)` in trans_layer_forward.
+ * Mirrors tools/server/gpt2_server.c:real_attention semantics:\n *   - Stores K, V at current position into per-layer cache
+ *   - Multi-head QK^T dot product with 1/sqrt(head_dim) scaling
+ *   - Causal mask (only attend to positions 0..seq_pos)
+ *   - Softmax with max subtraction (numerical stability)
+ *   - Weighted sum of V
+ *
+ * KV cache is owned by Model (k_cache/v_cache arrays, [n_layer][n_ctx*n_embd]).
+ * Allocated in model_load when g_use_real_attention is on, or via
+ * model_kv_cache_alloc(). Freed in model_free.
+ *
+ * Backward: NOT YET IMPLEMENTED. trans_layer_backward still does pass-through
+ *   (memcpy g_qkv+2n, g_attn). This means gradient flow through attention
+ *   is incorrect — Q, K gradients are zero. Sufficient for inference but
+ *   training with attention enabled will not learn Q/K properly. TODO. */
+void attention_forward(float *attn_out, const float *qkv,
+                       int n_embd, int n_head,
+                       int seq_pos,
+                       float *k_cache_layer, float *v_cache_layer);
+
+/* Forward decl — model_kv_cache_alloc/free defined after Model struct below */
+struct Model;
+void model_kv_cache_alloc(struct Model *m);
+void model_kv_cache_free(struct Model *m);
+
+/* ========================================================================
+ * Level 2: Causal Multi-Head Self-Attention (KV cache)
+ * ========================================================================
+ * Replaces the degenerate `memcpy(attn_out, v, n)` in trans_layer_forward.
+ * Mirrors tools/server/gpt2_server.c:real_attention semantics:
+ *   - Stores K, V at current position into per-layer cache
+ *   - Multi-head QK^T dot product with 1/sqrt(head_dim) scaling
+ *   - Causal mask (only attend to positions 0..seq_pos)
+ *   - Softmax with max subtraction (numerical stability)
+ *   - Weighted sum of V
+ *
+ * KV cache is owned by Model (k_cache/v_cache arrays, [n_layer][n_ctx*n_embd]).
+ * Allocated in model_load, freed in model_free.
+ *
+ * Backward: NOT YET IMPLEMENTED. trans_layer_backward still does pass-through
+ *   (memcpy g_qkv+2n, g_attn). This means gradient flow through attention
+ *   is incorrect — Q, K gradients are zero. Sufficient for inference but
+ *   training with attention enabled will not learn Q/K properly. TODO. */
+void attention_forward(float *attn_out, const float *qkv,
+                       int n_embd, int n_head,
+                       int seq_pos,
+                       float *k_cache_layer, float *v_cache_layer);
+
+/* ========================================================================
  * Level 3: Full Model (highest level — just config + weight keys)
  * ======================================================================== */
 
-typedef struct {
+typedef struct Model {
     ModelConfig cfg;
     Tensor *tensors;
     int n_tensors;
@@ -234,8 +297,11 @@ typedef struct {
     float *final_ln;         /* cached final norm output */
     float *x_before_final;   /* cached for backward */
     float final_mean, final_std_inv;
+    /* KV cache for real causal attention — [n_layer] pointers, each
+     * [n_ctx * n_embd] floats. NULL when g_use_real_attention is 0. */
+    float **k_cache;
+    float **v_cache;
 } Model;
-
 /* Load a model from a GPW2 weight file.
  * key_prefix: "h." for GPT-2, "model.layers." for LLaMA/Qwen
  * This is the ONLY function a new model needs to customize. */

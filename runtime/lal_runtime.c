@@ -95,6 +95,8 @@ void trans_layer_init(TransLayer *tl, Tensor *tensors, int n_tensors,
                       const char *norm1_w_key, const char *norm1_b_key,
                       const char *norm2_w_key, const char *norm2_b_key) {
     int n = cfg->n_embd, m = cfg->mlp_dim;
+    tl->_kv_k = NULL;
+    tl->_kv_v = NULL;
     char full_key[256];
 
     if (cfg->qkv_merged) {
@@ -229,6 +231,16 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
 
     /* Simplified attention: V copy (full attention in future) */
     memcpy(act->attn_out, act->v, n * sizeof(float));
+    /* Attention: real causal multi-head (KV cache) if flag is on and cache
+     * is allocated, else legacy V-copy (degenerate, no token mixing).
+     * [FIX 致命2] The V-copy was a placeholder — see attention_forward(). */
+    if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
+        attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                          tl->_kv_k, tl->_kv_v);
+    } else {
+        /* Legacy V-copy (degenerate, no QK mixing). */
+        memcpy(act->attn_out, act->v, n * sizeof(float));
+    }
     if (g_use_bnn_fast_path) bin_forward_bnn(act->proj_out, act->attn_out, &tl->attn_o);
     else                     bin_forward     (act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
@@ -271,6 +283,11 @@ int g_use_ste = 0;
 /* Global flag: use legacy BNN fast path (binarizes x too). Off by default —
  * BNN causes train/inference mismatch. Enable only for max-speed-low-quality. */
 int g_use_bnn_fast_path = 0;
+
+/* Global flag: use real causal multi-head self-attention with KV cache.
+ * Off by default — backward compat with V-copy. When on, trans_layer_forward
+ * calls attention_forward() instead of memcpy(act->attn_out, act->v, n). */
+int g_use_real_attention = 0;
 
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                           ModelConfig *cfg, float lr) {
@@ -343,6 +360,101 @@ void trans_act_free(TransAct *acts, int n_layer) {
 /* ========================================================================
  * Level 3: Full Model
  * ======================================================================== */
+
+/* ----- Causal Multi-Head Self-Attention (KV cache) -----
+ * Replaces the degenerate V-copy in trans_layer_forward.
+ * Mirrors tools/server/gpt2_server.c:real_attention (scalar version).
+ *
+ * Layout:
+ *   qkv:        [3 * n_embd]  — Q | K | V concatenated, single token
+ *   k_cache_layer / v_cache_layer: [n_ctx * n_embd] — filled position-by-position
+ *   attn_out:   [n_embd]      — output, weighted sum of V across heads
+ *
+ * Causal: position seq_pos attends only to positions 0..seq_pos (inclusive).
+ * Multi-head: n_head heads, head_dim = n_embd / n_head (must divide evenly).
+ */
+void attention_forward(float *attn_out, const float *qkv,
+                       int n_embd, int n_head,
+                       int seq_pos,
+                       float *k_cache_layer, float *v_cache_layer) {
+    int head_dim = n_embd / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *Q = qkv;                  /* [n_embd] */
+    const float *K_new = qkv + n_embd;
+    const float *V_new = qkv + 2 * n_embd;
+
+    /* Store current K, V into cache at position seq_pos */
+    memcpy(k_cache_layer + (size_t)seq_pos * n_embd, K_new, n_embd * sizeof(float));
+    memcpy(v_cache_layer + (size_t)seq_pos * n_embd, V_new, n_embd * sizeof(float));
+
+    /* Stack scratch — max n_ctx per head. 1024 is GPT-2 default; if n_ctx
+     * grows beyond this, switch to malloc. */
+    float scores[1024];
+    float attn_weights[1024];
+
+    for (int h = 0; h < n_head; h++) {
+        const float *Q_h = Q + h * head_dim;
+        /* scores[j] = Q_h · K[j, h] * scale, j = 0..seq_pos (causal) */
+        float max_score = -1e30f;
+        int n_attend = seq_pos + 1;  /* positions 0..seq_pos inclusive */
+        if (n_attend > 1024) n_attend = 1024;  /* clip to scratch size */
+        for (int j = 0; j < n_attend; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * n_embd + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[j] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+        /* Softmax with max subtraction (numerical stability) */
+        float sum_exp = 0.0f;
+        for (int j = 0; j < n_attend; j++) {
+            float e = expf(scores[j] - max_score);
+            attn_weights[j] = e;
+            sum_exp += e;
+        }
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+        for (int j = 0; j < n_attend; j++) attn_weights[j] *= inv_sum;
+        /* Weighted sum: out_h[d] = sum_j attn_weights[j] * V[j, h, d] */
+        float *out_h = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        for (int j = 0; j < n_attend; j++) {
+            float w = attn_weights[j];
+            const float *V_jh = v_cache_layer + (size_t)j * n_embd + h * head_dim;
+            for (int d = 0; d < head_dim; d++) out_h[d] += w * V_jh[d];
+        }
+    }
+}
+
+void model_kv_cache_alloc(Model *m) {
+    if (m->k_cache) return;  /* idempotent */
+    int n_layer = m->cfg.n_layer;
+    size_t per_layer = (size_t)m->cfg.n_ctx * m->cfg.n_embd * sizeof(float);
+    m->k_cache = calloc(n_layer, sizeof(float *));
+    m->v_cache = calloc(n_layer, sizeof(float *));
+    for (int l = 0; l < n_layer; l++) {
+        m->k_cache[l] = calloc(1, per_layer);
+        m->v_cache[l] = calloc(1, per_layer);
+        /* Wire into TransLayer so trans_layer_forward can find them */
+        if (m->layers) {
+            m->layers[l]._kv_k = m->k_cache[l];
+            m->layers[l]._kv_v = m->v_cache[l];
+        }
+    }
+}
+
+void model_kv_cache_free(Model *m) {
+    if (!m->k_cache) return;
+    for (int l = 0; l < m->cfg.n_layer; l++) {
+        free(m->k_cache[l]);
+        free(m->v_cache[l]);
+    }
+    free(m->k_cache);
+    free(m->v_cache);
+    m->k_cache = NULL;
+    m->v_cache = NULL;
+}
 
 void model_load(Model *m, const char *weight_path, ModelConfig cfg,
                 const char *layer_prefix, int qkv_merged) {
@@ -434,6 +546,11 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
 
     m->final_ln = malloc(cfg.n_embd * sizeof(float));
     m->x_before_final = malloc(cfg.n_embd * sizeof(float));
+    m->k_cache = NULL;
+    m->v_cache = NULL;
+    /* Auto-allocate KV cache if real attention is requested at load time.
+     * Callers can also call model_kv_cache_alloc() later to enable it. */
+    if (g_use_real_attention) model_kv_cache_alloc(m);
 }
 
 float model_forward(Model *m, const int *tokens, int n_tokens) {
@@ -484,6 +601,7 @@ void model_free(Model *m) {
     trans_act_free(m->acts, m->cfg.n_layer);
     free(m->final_ln);
     free(m->x_before_final);
+    model_kv_cache_free(m);
     tensor_free_all(m->tensors, m->n_tensors);
 }
 
