@@ -1147,24 +1147,25 @@ _QUANTIZE_MODE = None
 # v0.8: parallel emission mode — emit wide SIMD for linear layers
 _PARALLEL_MODE = False
 # v0.9: binary mode — binarize weights to {-1,+1}, use XNOR+popcount dot product
-# This is the "bitplane parallel" approach: 64 multiplications per popcount instruction.
 _BINARY_MODE = False
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False) -> str:
+# v0.11: train mode — compile forward + backward + update (no PyTorch needed)
+_TRAIN_MODE = False
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False, train=False) -> str:
     """Compile a rule (and any rules it calls) to specialized C.
 
     quantize: None for float32, or "int8"/"int4" for quantized concept data.
-    parallel: if True, emit wide SIMD (AVX2/NEON) for linear layers — 8 outputs
-              per instruction instead of serial loop. This realizes the "parallel
-              logic" model: all output dimensions computed simultaneously.
-    binarize: if True, binarize weights to {-1,+1} and use XNOR+popcount dot
-              products. This is the "bitplane parallel" approach: 64 multiplications
-              per popcount instruction — true bit-level parallelism.
+    parallel: if True, emit wide SIMD (AVX2/NEON) for linear layers.
+    binarize: if True, binarize weights to {-1,+1} and use XNOR+popcount.
+    train: if True, compile forward + backward + update (v0.11). Generates
+           a complete training loop in C — no PyTorch needed. The rule body
+           must contain loss(), grad(), and update() calls.
     """
-    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE, _BINARY_MODE
-    _SIMD_HELPERS_NEEDED = set()  # reset for this compilation
+    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE, _BINARY_MODE, _TRAIN_MODE
+    _SIMD_HELPERS_NEEDED = set()
     _QUANTIZE_MODE = quantize
     _PARALLEL_MODE = parallel
     _BINARY_MODE = binarize
+    _TRAIN_MODE = train
 
     concept_map = {c.name: c.vec for c in concepts}
     bound_map = {b.name: b.dims for b in bounds}
@@ -1350,14 +1351,89 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     for rn in sorted(rules_to_emit):
         variants = rule_groups.get(rn, [rule_map[rn]])
         for idx, r in enumerate(variants):
-            # Emit the variant, but with a mangled name.
-            lines.extend(_emit_rule(r, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, name_suffix=f"_v{idx}"))
+            # v0.11: In train mode, if a rule contains loss/grad/update,
+            # emit it as a training function (forward + backward + update).
+            if _TRAIN_MODE and any(
+                isinstance(s.expr, (ELoss, EGrad, EUpdate)) or
+                (s.var == "__stmt__" and isinstance(s.expr, EUpdate))
+                for s in r.body
+            ):
+                lines.extend(_emit_train_rule(r, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, vec_dim))
+                lines.append("")
+            else:
+                lines.extend(_emit_rule(r, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, name_suffix=f"_v{idx}"))
+                lines.append("")
+        # Emit the dispatcher for this rule name (skip for train rules)
+        if not (_TRAIN_MODE and any(
+            isinstance(s.expr, (ELoss, EGrad, EUpdate)) or
+            (s.var == "__stmt__" and isinstance(s.expr, EUpdate))
+            for s in variants[0].body
+        )):
+            lines.extend(_emit_rule_dispatcher(rn, variants, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, vec_dim))
             lines.append("")
-        # Emit the dispatcher for this rule name.
-        lines.extend(_emit_rule_dispatcher(rn, variants, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, vec_dim))
-        lines.append("")
 
-    # main() — calls the entry rule.
+    # main() — in train mode, runs a training loop; otherwise calls entry rule.
+    if _TRAIN_MODE:
+        # In train mode, we need a different output order:
+        # 1. Global param arrays (BEFORE the train function so it can access them)
+        # 2. Train function (already emitted above in the rule emission loop)
+        # 3. Training data globals
+        # 4. main() with training loop
+
+        # But the train function was already emitted above. We need to prepend
+        # the globals BEFORE it. Since we can't insert in the middle of `lines`,
+        # we'll use a different approach: emit a forward declaration and pass
+        # params as arguments to the train function.
+
+        # Actually, the simplest fix: emit the global arrays BEFORE the rules.
+        # We'll rebuild the output with globals prepended.
+        global_lines = []
+        for c in sorted(concepts, key=lambda x: x.name):
+            arr = ", ".join(f"{v:.6f}f" for v in c.vec)
+            global_lines.append(f"float concept_{c.name}[{len(c.vec)}] = {{{arr}}};")
+        # Also declare gradient arrays as globals
+        for c in sorted(concepts, key=lambda x: x.name):
+            global_lines.append(f"float grad_{c.name}[{len(c.vec)}] = {{0}};")
+        global_lines.append("")
+
+        # Training data globals
+        entry_rule = rule_map[rule_name]
+        train_data = []
+        for p in entry_rule.params:
+            if p in concept_map:
+                train_data.append(f"concept_{p}")
+            else:
+                train_data.append(f"train_{p}")
+                global_lines.append(f"float train_{p}[1] = {{0.8f}};  /* dummy training data */")
+        global_lines.append("")
+
+        # Prepend globals to existing lines (before the train function)
+        # Find where the train function starts and insert before it
+        # Actually, just prepend to the whole output
+        lines = global_lines + lines
+
+        # Now append main()
+        lines.append("int main(int argc, char** argv) {")
+        lines.append(f'    printf("[*] LAL training mode (no PyTorch)\\n");')
+        lines.append(f"    int n_steps = argc > 1 ? atoi(argv[1]) : 100;")
+        lines.append(f'    printf("[*] steps: %d\\n", n_steps);')
+        lines.append(f"    for (int step = 0; step < n_steps; step++) {{")
+        for c in concepts:
+            lines.append(f"        for (int i = 0; i < {len(c.vec)}; i++) grad_{c.name}[i] = 0.0f;")
+        param_args = ", ".join(train_data)
+        lines.append(f"        float loss = rule_{rule_name}_train({param_args});")
+        lines.append(f'        if (step % 10 == 0) printf("  step %d  loss=%.6f\\n", step, loss);')
+        lines.append(f"    }}")
+        lines.append(f'    printf("[*] training done\\n");')
+        for c in sorted(concepts, key=lambda x: x.name):
+            lines.append(f'    printf("  {c.name}: ");')
+            lines.append(f"    for (int i = 0; i < {len(c.vec)}; i++) printf(\"%.4f \", concept_{c.name}[i]);")
+            lines.append(f'    printf("\\n");')
+        lines.append(f"    return 0;")
+        lines.append("}")
+        lines.append("")
+        return "\n".join(lines)
+
     lines.append("int main(int argc, char** argv) {")
     lines.append(f"    float q[{vec_dim}];")
     lines.append(f"    if (argc < {vec_dim+1}) {{")
@@ -2534,6 +2610,192 @@ def _emit_rule_dispatcher(rule_name, variants, concept_map, bound_map, memory_ma
     return lines
 
 
+def _emit_train_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, vec_dim):
+    """Compile a training rule: forward + loss + backward + update.
+
+    The rule body must contain:
+      - Forward computation (linear, dot, etc.)
+      - loss(type, logits, target)
+      - grad(loss_var, param_name) for each param
+      - update(param, grad, lr) for each param
+
+    Generates a C function that runs one training step. The caller wraps
+    it in a loop with different (x, target) pairs.
+
+    Architecture:
+      1. Forward pass: emit normal forward code, recording each statement
+      2. Loss: emit loss computation
+      3. Backward pass: for each forward statement (in reverse), emit the
+         dual backward statement using the chain rule
+      4. Update: emit param[i] -= lr * grad[i]
+    """
+    lines = []
+    lines.append(f"/* === TRAIN RULE: {rule.name} (forward + backward + update) === */")
+    # The training function takes: input x, target, and returns loss
+    # It also modifies params in place (via update)
+    n = vec_dim
+    param_sig = ", ".join([f"float* {p}" for p in rule.params])
+    lines.append(f"float rule_{rule.name}_train({param_sig}) {{")
+
+    # Track variable types and gradients
+    var_types: Dict[str, str] = {}
+    forward_stmts = []  # list of (var, expr) for forward pass
+    loss_var = None
+    grad_stmts = []     # list of (loss_var, param_name) for backward
+    update_stmts = []   # list of (param_name, grad_var, lr) for update
+
+    # Separate forward, loss, grad, update statements
+    for stmt in rule.body:
+        if isinstance(stmt.expr, ELoss):
+            loss_var = stmt.var
+            forward_stmts.append(stmt)
+        elif isinstance(stmt.expr, EGrad):
+            grad_stmts.append(stmt)
+        elif isinstance(stmt.expr, EUpdate):
+            update_stmts.append(stmt)
+        elif stmt.var == "__stmt__":
+            # bare update/grad statement
+            if isinstance(stmt.expr, EUpdate):
+                update_stmts.append(Stmt("", stmt.expr))
+        else:
+            forward_stmts.append(stmt)
+
+    # === 1. FORWARD PASS ===
+    lines.append("    /* --- FORWARD --- */")
+
+    # In train mode, declare gradient arrays for all params
+    for c in sorted(concept_map.keys()):
+        pdim = len(concept_map[c])
+        lines.append(f"    float grad_{c}[{pdim}] = {{0}};")
+
+    for stmt in forward_stmts:
+        if isinstance(stmt.expr, ELoss):
+            # Emit loss computation
+            lines.append(f"    /* loss: {stmt.expr.loss_type} */")
+            logits_var = stmt.expr.logits.name if isinstance(stmt.expr.logits, EVar) else "y"
+            target_name = stmt.expr.target.name if isinstance(stmt.expr.target, EVar) else "t"
+            target_c = f"{target_name}[0]" if target_name in rule.params else target_name
+            logits_c = logits_var
+            if stmt.expr.loss_type == "mse":
+                lines.append(f"    float {stmt.var} = ({logits_c} - {target_c}) * ({logits_c} - {target_c});")
+                lines.append(f"    float grad_{logits_c} = 2.0f * ({logits_c} - {target_c});")
+            elif stmt.expr.loss_type == "cross_entropy":
+                lines.append(f"    float {stmt.var} = -({target_c} * logf({logits_c} + 1e-7f) + (1.0f - {target_c}) * logf(1.0f - {logits_c} + 1e-7f));")
+                lines.append(f"    float grad_{logits_c} = ({logits_c} - {target_c}) / ({logits_c} * (1.0f - {logits_c}) + 1e-7f);")
+            var_types[stmt.var] = "scalar"
+        else:
+            # For dot relates in train mode: if x is a rule param (not concept),
+            # emit the dot product manually using x[i] and concept_w[i]
+            if isinstance(stmt.expr, ERelateCall):
+                r = relate_map[stmt.expr.name]
+                if r.op == "dot":
+                    a0, a1 = stmt.expr.args[0], stmt.expr.args[1]
+                    # Find which is the concept and which is the param
+                    if isinstance(a1, EVar) and a1.name in concept_names:
+                        x_var, w_name = a0.name, a1.name
+                    elif isinstance(a0, EVar) and a0.name in concept_names:
+                        x_var, w_name = a1.name, a0.name
+                    else:
+                        continue
+                    # Emit dot product: y = sum(x[i] * concept_w[i])
+                    if r.bound_name:
+                        dims = bound_map[r.bound_name]
+                        terms = [f"{x_var}[{d}] * concept_{w_name}[{d}]" for d in dims]
+                    else:
+                        terms = [f"{x_var}[{d}] * concept_{w_name}[{d}]" for d in range(vec_dim)]
+                    lines.append(f"    float {stmt.var} = {' + '.join(terms)};")
+                    var_types[stmt.var] = "scalar"
+                    continue
+            # Normal forward statement
+            is_vec = _expr_is_vector(stmt.expr, relate_map, rule_map)
+            if is_vec:
+                out_dim = vec_dim
+                if isinstance(stmt.expr, ERelateCall):
+                    r = relate_map[stmt.expr.name]
+                    if r.op == "linear" and r.weight_data:
+                        out_dim = len(r.weight_data)
+                lines.append(f"    float {stmt.var}[{out_dim}] = {{0}};")
+                _emit_vector_expr(lines, stmt.var, stmt.expr, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule.params, var_types, max_recursion_depth, vec_dim)
+                var_types[stmt.var] = "vector"
+            else:
+                ctype, cexpr = _emit_scalar_expr(stmt.expr, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule.params, var_types, max_recursion_depth)
+                lines.append(f"    {ctype} {stmt.var} = {cexpr};")
+                var_types[stmt.var] = "scalar"
+
+    # === 2. BACKWARD PASS (reverse order) ===
+    lines.append("    /* --- BACKWARD --- */")
+    for stmt in reversed(forward_stmts):
+        if isinstance(stmt.expr, ELoss):
+            continue  # loss backward already emitted above
+        if isinstance(stmt.expr, ERelateCall):
+            r = relate_map[stmt.expr.name]
+            if r.op == "dot":
+                # Forward: y = dot(x, w) → y = sum(x[i] * w[i])
+                # Backward: grad_w[i] += grad_y * x[i]
+                # (grad_x not needed if x is input, not a param)
+                a0, a1 = stmt.expr.args[0], stmt.expr.args[1]
+                if isinstance(a1, EVar) and a1.name in concept_names:
+                    x_var, w_name = a0.name, a1.name
+                elif isinstance(a0, EVar) and a0.name in concept_names:
+                    x_var, w_name = a1.name, a0.name
+                else:
+                    continue
+                lines.append(f"    /* backward dot({x_var}, {w_name}) → {stmt.var} */")
+                # x is a rule param (float*), so use x[i] directly
+                # w is concept_w (mutable array in train mode)
+                if r.bound_name:
+                    dims = bound_map[r.bound_name]
+                    for d in dims:
+                        lines.append(f"    grad_{w_name}[{d}] += grad_{stmt.var} * {x_var}[{d}];")
+                else:
+                    for d in range(vec_dim):
+                        lines.append(f"    grad_{w_name}[{d}] += grad_{stmt.var} * {x_var}[{d}];")
+            elif r.op == "linear":
+                # Forward: y[j] = sum(x[i] * w[j][i]) + b[j]
+                # Backward: grad_x[i] += sum_j(grad_y[j] * w[j][i])
+                #           grad_w[j][i] += grad_y[j] * x[i]
+                #           grad_b[j] += grad_y[j]
+                a = stmt.expr.args[0]
+                x_var = a.name if isinstance(a, EVar) else "x"
+                lines.append(f"    /* backward linear: {stmt.var} = linear({x_var}) */")
+                w = r.weight_data
+                out_dim = len(w)
+                in_dim = len(w[0]) if out_dim > 0 else 0
+                # grad_x[i] += sum_j grad_y[j] * w[j][i]
+                for i in range(in_dim):
+                    terms = [f"grad_{stmt.var}[{j}] * {w[j][i]:.6f}f" for j in range(out_dim) if w[j][i] != 0.0]
+                    if terms:
+                        lines.append(f"    grad_{x_var}[{i}] += {' + '.join(terms)};")
+                # grad_w[j][i] += grad_y[j] * x[i] — stored in grad arrays
+                for j in range(out_dim):
+                    for i in range(in_dim):
+                        if w[j][i] != 0.0:
+                            lines.append(f"    grad_{r.name}_w[{j}*{in_dim}+{i}] += grad_{stmt.var}[{j}] * {x_var}[{i}];")
+
+    # === 3. UPDATE ===
+    lines.append("    /* --- UPDATE --- */")
+    for stmt in update_stmts:
+        if isinstance(stmt.expr, EUpdate):
+            u = stmt.expr
+            lines.append(f"    /* update {u.param_name} with lr={u.lr} */")
+            # Find the param's dimension
+            if u.param_name in concept_map:
+                pdim = len(concept_map[u.param_name])
+            else:
+                pdim = vec_dim
+            lines.append(f"    for (int i = 0; i < {pdim}; i++) {{")
+            lines.append(f"        concept_{u.param_name}[i] -= {u.lr}f * grad_{u.param_name}[i];")
+            lines.append(f"    }}")
+
+    # Return loss
+    if loss_var:
+        lines.append(f"    return {loss_var};")
+    else:
+        lines.append(f"    return 0.0f;")
+    lines.append("}")
+    return lines
+
+
 def _resolve_vec_arg(arg, concept_names, rule_params, var_types):
     """Return the C expression that names a vector (for indexing into)."""
     if isinstance(arg, EVar):
@@ -2576,20 +2838,21 @@ def main():
                     help="emit parallel SIMD linear layers (AVX2/NEON, 8 outputs per instruction)")
     ap.add_argument("--binarize", action="store_true",
                     help="binarize weights to {-1,+1}, use XNOR+popcount (64 muls per instruction)")
+    ap.add_argument("--train", action="store_true",
+                    help="compile forward + backward + update (training mode, no PyTorch)")
     args = ap.parse_args()
 
     with open(args.input) as f:
         source = f.read()
 
-    # Set _BINARY_MODE before parsing so the linear parser knows to load
-    # weights without pruning (binarization happens at emission time).
+    # Set _BINARY_MODE before parsing
     global _BINARY_MODE
     _BINARY_MODE = args.binarize
 
     concepts, bounds, memories, relates, rules = parse(source, args.input)
     c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule,
                           quantize=args.quantize, parallel=args.parallel,
-                          binarize=args.binarize)
+                          binarize=args.binarize, train=args.train)
 
     if args.output:
         with open(args.output, "w") as f:

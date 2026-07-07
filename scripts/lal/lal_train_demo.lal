@@ -1,0 +1,19 @@
+# lal_train_demo.lal — LAL training demo (v0.11).
+#
+# Learn w so that dot(x, w) ≈ target.
+# Compiled entirely by LAL into C — no PyTorch.
+#
+# The training function takes x (input) and t (target) as params.
+# It computes y = dot(x, w), loss = (y-t)^2, and updates w.
+
+param w = [0.5, -0.3, 0.2, 0.1]
+
+bound all = [0, 1, 2, 3]
+
+relate predict(x, ww) = dot(x, ww) @ all
+
+rule train(x, t):
+    y = predict(x, w)
+    l = loss(mse, y, t)
+    update(w, grad_l, 0.01)
+    output(l)
