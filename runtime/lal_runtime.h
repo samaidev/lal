@@ -74,8 +74,26 @@ typedef struct {
 void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
                     int in_dim, int out_dim);
 void bin_layer_free(BinLayer *bl);
+
+/* bin_forward (BWN, default): x stays float, only W is binarized.
+ * Matches Python STE training (tools/train_binary_gpt2.py) so train/inference
+ * distributions are aligned. Applies XNOR-Net K-norm scaling
+ *   K = ||x||_1 / in_dim
+ * to preserve input magnitude information.
+ *
+ * y[j] = (sum_i sign(W[j,i]) * x[i]) * alpha[j] * K + bias[j] */
 void bin_forward(float *y, const float *x, const BinLayer *bl);
+
+/* bin_forward_bnn (legacy fast path): binarizes BOTH x and W via XNOR+popcount.
+ * ~64x faster than BWN on long vectors but loses input magnitude → quality
+ * collapse after a few layers. Kept as opt-in for max-speed-low-quality mode.
+ * Use ONLY when you can prove BNN quality is acceptable for your task. */
+void bin_forward_bnn(float *y, const float *x, const BinLayer *bl);
+
+/* bin_forward_float: same as BWN but without K-norm (legacy interface).
+ * Kept for backward compat with callers that don't want K scaling. */
 void bin_forward_float(float *y, const float *x, const BinLayer *bl);
+
 void bin_backward(float *grad_x, const float *grad_y, const float *x,
                   BinLayer *bl, float lr);
 
@@ -92,6 +110,12 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
 /* Global flag: set to 1 to use STE backward in trans_layer_backward.
  * Models can set this before calling model_backward(). */
 extern int g_use_ste;
+
+/* Global flag: set to 1 to use the legacy BNN fast path (bin_forward_bnn) in
+ * trans_layer_forward instead of the BWN default. Off by default — BNN causes
+ * train/inference mismatch and quality collapse. Only enable if you have a
+ * very tight latency budget AND can verify quality is still acceptable. */
+extern int g_use_bnn_fast_path;
 
 /* ========================================================================
  * Level 1: Standard NN Operations (operator level)
