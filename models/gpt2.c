@@ -55,8 +55,9 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     Model model;
-    model_load(&model, "/home/z/my-project/prebuilt/gpt2_weights.bin",
-               gpt2_config(), "h.%d.", 1);
+    const char *weight_path = getenv("LAL_WEIGHTS");
+    if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
+    model_load(&model, weight_path, gpt2_config(), "h.%d.", 1);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("[*] load: %.1fs\n", (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);

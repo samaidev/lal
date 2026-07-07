@@ -21,7 +21,6 @@
  */
 #define _POSIX_C_SOURCE 199309L
 #define _GNU_SOURCE
-#include <immintrin.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +31,76 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/stat.h>
+
+/* Portable SIMD: AVX2 on x86_64, NEON on ARM, scalar fallback otherwise. */
+#if defined(__x86_64__) || defined(__i386__)
+  #include <immintrin.h>
+  #define LAL_HAVE_AVX2 1
+  typedef __m256        v8f;
+  #define v8f_zero()         _mm256_setzero_ps()
+  #define v8f_set1(x)        _mm256_set1_ps(x)
+  #define v8f_load(p)        _mm256_loadu_ps(p)
+  #define v8f_store(p, v)    _mm256_storeu_ps((p), (v))
+  #define v8f_add(a, b)      _mm256_add_ps((a), (b))
+  #define v8f_sub(a, b)      _mm256_sub_ps((a), (b))
+  #define v8f_mul(a, b)      _mm256_mul_ps((a), (b))
+  #define v8f_fmadd(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+  /* horizontal sum of 8 lanes */
+  static inline float v8f_hsum(v8f v) {
+    float t[8]; _mm256_storeu_ps(t, v);
+    return t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+  }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+  #include <arm_neon.h>
+  #define LAL_HAVE_NEON 1
+  /* NEON works on 4 floats at a time (128-bit), so we use v4f internally
+   * but the API names stay v8f for source-level compatibility — we just
+   * process two v4f halves per "logical 8-wide" op. */
+  typedef float32x4_t v4f;
+  typedef struct { v4f lo, hi; } v8f;
+  #define v8f_zero()         ((v8f){ vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) })
+  static inline v8f v8f_set1(float x) { v8f r; r.lo = vdupq_n_f32(x); r.hi = vdupq_n_f32(x); return r; }
+  static inline v8f v8f_load(const float *p) {
+    v8f r; r.lo = vld1q_f32(p); r.hi = vld1q_f32(p + 4); return r;
+  }
+  static inline void v8f_store(float *p, v8f v) {
+    vst1q_f32(p, v.lo); vst1q_f32(p + 4, v.hi);
+  }
+  static inline v8f v8f_add(v8f a, v8f b) { v8f r; r.lo = vaddq_f32(a.lo, b.lo); r.hi = vaddq_f32(a.hi, b.hi); return r; }
+  static inline v8f v8f_sub(v8f a, v8f b) { v8f r; r.lo = vsubq_f32(a.lo, b.lo); r.hi = vsubq_f32(a.hi, b.hi); return r; }
+  static inline v8f v8f_mul(v8f a, v8f b) { v8f r; r.lo = vmulq_f32(a.lo, b.lo); r.hi = vmulq_f32(a.hi, b.hi); return r; }
+  #if defined(__aarch64__)
+    /* AArch64 has FMA intrinsic */
+    static inline v8f v8f_fmadd(v8f a, v8f b, v8f c) {
+      v8f r; r.lo = vfmaq_f32(c.lo, a.lo, b.lo); r.hi = vfmaq_f32(c.hi, a.hi, b.hi); return r;
+    }
+  #else
+    /* ARMv7 NEON: no FMA, use mul+add (clang may still fuse) */
+    static inline v8f v8f_fmadd(v8f a, v8f b, v8f c) {
+      v8f r; r.lo = vaddq_f32(vmulq_f32(a.lo, b.lo), c.lo); r.hi = vaddq_f32(vmulq_f32(a.hi, b.hi), c.hi); return r;
+    }
+  #endif
+  static inline float v8f_hsum(v8f v) {
+    float32x2_t lo2 = vadd_f32(vget_low_f32(v.lo), vget_high_f32(v.lo));
+    float32x2_t hi2 = vadd_f32(vget_low_f32(v.hi), vget_high_f32(v.hi));
+    float32x2_t s   = vadd_f32(lo2, hi2);
+    return vget_lane_f32(vpadd_f32(s, s), 0);
+  }
+#else
+  #define LAL_HAVE_SCALAR 1
+  /* Pure scalar fallback — process 8 floats at a time with a loop */
+  typedef struct { float v[8]; } v8f;
+  static inline v8f v8f_zero() { v8f r; for (int i=0;i<8;i++) r.v[i]=0; return r; }
+  static inline v8f v8f_set1(float x) { v8f r; for (int i=0;i<8;i++) r.v[i]=x; return r; }
+  static inline v8f v8f_load(const float *p) { v8f r; for (int i=0;i<8;i++) r.v[i]=p[i]; return r; }
+  static inline void v8f_store(float *p, v8f v) { for (int i=0;i<8;i++) p[i]=v.v[i]; }
+  static inline v8f v8f_add(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]+b.v[i]; return r; }
+  static inline v8f v8f_sub(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]-b.v[i]; return r; }
+  static inline v8f v8f_mul(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]; return r; }
+  static inline v8f v8f_fmadd(v8f a, v8f b, v8f c) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]+c.v[i]; return r; }
+  static inline float v8f_hsum(v8f v) { float s=0; for (int i=0;i<8;i++) s+=v.v[i]; return s; }
+#endif
+
 #include "runtime/lal_runtime.h"
 
 #define VOCAB_SIZE 50257
@@ -244,36 +313,34 @@ static int decode_token(int token_id, char *out, int max_len) {
 /* LayerNorm (GPT-2 style) */
 static void layer_norm_simd(float *out, const float *x, const float *w, const float *b, int n) {
     /* mean */
-    __m256 sum_v = _mm256_setzero_ps();
+    v8f sum_v = v8f_zero();
     int i = 0;
     float tail_sum = 0;
-    for (; i + 8 <= n; i += 8) sum_v = _mm256_add_ps(sum_v, _mm256_loadu_ps(x + i));
-    float tmp[8]; _mm256_storeu_ps(tmp, sum_v);
-    float mean = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    for (; i + 8 <= n; i += 8) sum_v = v8f_add(sum_v, v8f_load(x + i));
+    float mean = v8f_hsum(sum_v);
     for (; i < n; i++) tail_sum += x[i];
     mean = (mean + tail_sum) / n;
 
     /* var */
-    __m256 mean_v = _mm256_set1_ps(mean);
-    __m256 var_v = _mm256_setzero_ps();
+    v8f mean_v = v8f_set1(mean);
+    v8f var_v = v8f_zero();
     i = 0; float tail_var = 0;
     for (; i + 8 <= n; i += 8) {
-        __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), mean_v);
-        var_v = _mm256_fmadd_ps(d, d, var_v);
+        v8f d = v8f_sub(v8f_load(x + i), mean_v);
+        var_v = v8f_fmadd(d, d, var_v);
     }
-    _mm256_storeu_ps(tmp, var_v);
-    float var = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    float var = v8f_hsum(var_v);
     for (; i < n; i++) { float d = x[i] - mean; tail_var += d*d; }
     var = (var + tail_var) / n;
 
     float std_inv = 1.0f / sqrtf(var + 1e-5f);
-    __m256 std_v = _mm256_set1_ps(std_inv);
-    __m256 mean_v2 = _mm256_set1_ps(mean);
+    v8f std_v = v8f_set1(std_inv);
+    v8f mean_v2 = v8f_set1(mean);
     i = 0;
     for (; i + 8 <= n; i += 8) {
-        __m256 xn = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), mean_v2), std_v);
-        __m256 wn = _mm256_mul_ps(xn, _mm256_loadu_ps(w + i));
-        _mm256_storeu_ps(out + i, _mm256_add_ps(wn, _mm256_loadu_ps(b + i)));
+        v8f xn = v8f_mul(v8f_sub(v8f_load(x + i), mean_v2), std_v);
+        v8f wn = v8f_mul(xn, v8f_load(w + i));
+        v8f_store(out + i, v8f_add(wn, v8f_load(b + i)));
     }
     for (; i < n; i++) {
         float xn = (x[i] - mean) * std_inv;
@@ -288,13 +355,13 @@ static void matmul_avx2(float *y, const float *x, const float *W, const float *b
                         int in_dim, int out_dim) {
     int j = 0;
     for (; j + 8 <= out_dim; j += 8) {
-        __m256 acc = b ? _mm256_loadu_ps(b + j) : _mm256_setzero_ps();
+        v8f acc = b ? v8f_load(b + j) : v8f_zero();
         for (int i = 0; i < in_dim; i++) {
-            __m256 xi = _mm256_set1_ps(x[i]);
-            __m256 w  = _mm256_loadu_ps(W + (size_t)i * out_dim + j);
-            acc = _mm256_fmadd_ps(xi, w, acc);
+            v8f xi = v8f_set1(x[i]);
+            v8f w  = v8f_load(W + (size_t)i * out_dim + j);
+            acc = v8f_fmadd(xi, w, acc);
         }
-        _mm256_storeu_ps(y + j, acc);
+        v8f_store(y + j, acc);
     }
     for (; j < out_dim; j++) {
         float s = b ? b[j] : 0.0f;
@@ -309,10 +376,10 @@ static void lm_head_avx2(float *logits, const float *x, const float *wte,
                          int vocab, int n_embd) {
     int v = 0;
     for (; v + 8 <= vocab; v += 8) {
-        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-        __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
-        __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+        v8f acc0 = v8f_zero(), acc1 = v8f_zero();
+        v8f acc2 = v8f_zero(), acc3 = v8f_zero();
+        v8f acc4 = v8f_zero(), acc5 = v8f_zero();
+        v8f acc6 = v8f_zero(), acc7 = v8f_zero();
         const float *w0 = wte + (size_t)(v+0) * n_embd;
         const float *w1 = wte + (size_t)(v+1) * n_embd;
         const float *w2 = wte + (size_t)(v+2) * n_embd;
@@ -323,30 +390,20 @@ static void lm_head_avx2(float *logits, const float *x, const float *wte,
         const float *w7 = wte + (size_t)(v+7) * n_embd;
         int i = 0;
         for (; i + 8 <= n_embd; i += 8) {
-            __m256 xv = _mm256_loadu_ps(x + i);
-            acc0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w0 + i), acc0);
-            acc1 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w1 + i), acc1);
-            acc2 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w2 + i), acc2);
-            acc3 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w3 + i), acc3);
-            acc4 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w4 + i), acc4);
-            acc5 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w5 + i), acc5);
-            acc6 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w6 + i), acc6);
-            acc7 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w7 + i), acc7);
+            v8f xv = v8f_load(x + i);
+            acc0 = v8f_fmadd(xv, v8f_load(w0 + i), acc0);
+            acc1 = v8f_fmadd(xv, v8f_load(w1 + i), acc1);
+            acc2 = v8f_fmadd(xv, v8f_load(w2 + i), acc2);
+            acc3 = v8f_fmadd(xv, v8f_load(w3 + i), acc3);
+            acc4 = v8f_fmadd(xv, v8f_load(w4 + i), acc4);
+            acc5 = v8f_fmadd(xv, v8f_load(w5 + i), acc5);
+            acc6 = v8f_fmadd(xv, v8f_load(w6 + i), acc6);
+            acc7 = v8f_fmadd(xv, v8f_load(w7 + i), acc7);
         }
-        /* horizontal sum each acc */
-        float t0[8], t1[8], t2[8], t3[8], t4[8], t5[8], t6[8], t7[8];
-        _mm256_storeu_ps(t0, acc0); _mm256_storeu_ps(t1, acc1);
-        _mm256_storeu_ps(t2, acc2); _mm256_storeu_ps(t3, acc3);
-        _mm256_storeu_ps(t4, acc4); _mm256_storeu_ps(t5, acc5);
-        _mm256_storeu_ps(t6, acc6); _mm256_storeu_ps(t7, acc7);
-        float s0=t0[0]+t0[1]+t0[2]+t0[3]+t0[4]+t0[5]+t0[6]+t0[7];
-        float s1=t1[0]+t1[1]+t1[2]+t1[3]+t1[4]+t1[5]+t1[6]+t1[7];
-        float s2=t2[0]+t2[1]+t2[2]+t2[3]+t2[4]+t2[5]+t2[6]+t2[7];
-        float s3=t3[0]+t3[1]+t3[2]+t3[3]+t3[4]+t3[5]+t3[6]+t3[7];
-        float s4=t4[0]+t4[1]+t4[2]+t4[3]+t4[4]+t4[5]+t4[6]+t4[7];
-        float s5=t5[0]+t5[1]+t5[2]+t5[3]+t5[4]+t5[5]+t5[6]+t5[7];
-        float s6=t6[0]+t6[1]+t6[2]+t6[3]+t6[4]+t6[5]+t6[6]+t6[7];
-        float s7=t7[0]+t7[1]+t7[2]+t7[3]+t7[4]+t7[5]+t7[6]+t7[7];
+        float s0 = v8f_hsum(acc0), s1 = v8f_hsum(acc1);
+        float s2 = v8f_hsum(acc2), s3 = v8f_hsum(acc3);
+        float s4 = v8f_hsum(acc4), s5 = v8f_hsum(acc5);
+        float s6 = v8f_hsum(acc6), s7 = v8f_hsum(acc7);
         /* tail */
         for (; i < n_embd; i++) {
             float xv = x[i];
@@ -358,12 +415,11 @@ static void lm_head_avx2(float *logits, const float *x, const float *wte,
     }
     for (; v < vocab; v++) {
         const float *w = wte + (size_t)v * n_embd;
-        __m256 acc = _mm256_setzero_ps();
+        v8f acc = v8f_zero();
         int i = 0;
         for (; i + 8 <= n_embd; i += 8)
-            acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(w + i), acc);
-        float t[8]; _mm256_storeu_ps(t, acc);
-        float s = t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+            acc = v8f_fmadd(v8f_load(x + i), v8f_load(w + i), acc);
+        float s = v8f_hsum(acc);
         for (; i < n_embd; i++) s += x[i] * w[i];
         logits[v] = s;
     }
