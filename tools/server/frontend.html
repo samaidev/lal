@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAL GPT-2</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    max-width: 920px;
+    margin: 40px auto;
+    padding: 0 20px;
+    background: #0f0f1e;
+    color: #e8e8f0;
+    line-height: 1.5;
+  }
+  h1 { color: #fff; font-weight: 600; margin-bottom: 4px; }
+  h1 span { color: #e94560; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .stat-bar {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    margin-bottom: 16px; font-size: 12px;
+  }
+  .chip {
+    background: #1a1a2e; border: 1px solid #2a2a44;
+    padding: 6px 12px; border-radius: 6px; color: #aab;
+  }
+  .chip b { color: #e94560; }
+  .box {
+    background: #16213e; border: 1px solid #1f2647;
+    border-radius: 12px; padding: 20px; margin: 12px 0;
+  }
+  textarea {
+    width: 100%; min-height: 80px;
+    background: #0f1a36; color: #fff;
+    border: 1px solid #2a3a5e; border-radius: 8px;
+    padding: 12px; font-size: 14px; font-family: ui-monospace, Menlo, monospace;
+    resize: vertical; outline: none;
+  }
+  textarea:focus { border-color: #e94560; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .label { color: #e94560; font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  input[type=number] {
+    background: #0f1a36; color: #fff;
+    border: 1px solid #2a3a5e; border-radius: 6px;
+    padding: 8px 12px; width: 80px; font-size: 14px;
+    outline: none;
+  }
+  input[type=number]:focus { border-color: #e94560; }
+  button {
+    background: #e94560; color: #fff; border: none;
+    padding: 10px 28px; border-radius: 8px;
+    font-size: 14px; font-weight: 500;
+    cursor: pointer; transition: all 0.15s;
+    margin-left: auto;
+  }
+  button:hover:not(:disabled) { background: #ff5577; transform: translateY(-1px); }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  #output {
+    white-space: pre-wrap; word-wrap: break-word;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 14px; line-height: 1.7;
+    min-height: 60px; color: #d8d8e8;
+  }
+  .placeholder { color: #555; font-style: italic; }
+  .status { font-size: 12px; color: #6ab0ff; margin-top: 12px; }
+  .status.error { color: #ff6b6b; }
+  .cursor::after {
+    content: '▊'; color: #e94560;
+    animation: blink 1s infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .preset {
+    display: inline-block; background: #0f1a36;
+    border: 1px solid #2a3a5e; color: #8ab;
+    padding: 4px 10px; border-radius: 4px; font-size: 12px;
+    margin: 2px; cursor: pointer; transition: all 0.15s;
+  }
+  .preset:hover { border-color: #e94560; color: #e94560; }
+</style>
+</head>
+<body>
+<h1>LAL <span>GPT-2</span></h1>
+<div class="sub">Pure C inference • No PyTorch • AVX2 SIMD • Hash-table tokenizer • 124M params</div>
+
+<div class="stat-bar">
+  <span class="chip">Backend: <b>C + libc only</b></span>
+  <span class="chip">Weights: <b>498 MB float</b></span>
+  <span class="chip">Port: <b id="port">8080</b></span>
+</div>
+
+<div class="box">
+  <div class="label">Prompt</div>
+  <textarea id="prompt" spellcheck="false">The quick brown fox</textarea>
+  <div style="margin-top: 8px;">
+    <span class="label" style="font-size: 11px;">Try:</span>
+    <span class="preset" onclick="setPreset(this)">The quick brown fox</span>
+    <span class="preset" onclick="setPreset(this)">In a galaxy far, far away</span>
+    <span class="preset" onclick="setPreset(this)">Once upon a time</span>
+    <span class="preset" onclick="setPreset(this)">To be, or not to be</span>
+  </div>
+  <div class="controls">
+    <span class="label">Tokens</span>
+    <input type="number" id="ntok" value="20" min="1" max="100">
+    <button id="btn" onclick="generate()">Generate</button>
+  </div>
+</div>
+
+<div class="box">
+  <div class="label">Output</div>
+  <div id="output"><span class="placeholder">Waiting for input...</span></div>
+  <div id="status" class="status"></div>
+</div>
+
+<script>
+function setPreset(el) {
+  document.getElementById('prompt').value = el.textContent;
+}
+
+async function generate() {
+  const p = document.getElementById('prompt').value;
+  const n = parseInt(document.getElementById('ntok').value);
+  const btn = document.getElementById('btn');
+  const out = document.getElementById('output');
+  const st  = document.getElementById('status');
+
+  btn.disabled = true;
+  out.innerHTML = '<span class="cursor"> </span>';
+  st.className = 'status';
+  st.textContent = 'Generating...';
+  const t0 = performance.now();
+
+  try {
+    const r = await fetch('/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: p, n_tokens: n })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    out.textContent = d.text;
+    st.textContent = `Generated ${d.n_tokens} tokens in ${d.time}s  •  ${d.tokens_per_sec} tok/s  •  round-trip ${dt}s`;
+  } catch (e) {
+    out.innerHTML = '<span class="placeholder">Error</span>';
+    st.className = 'status error';
+    st.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+}
+
+document.getElementById('prompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { generate(); }
+});
+</script>
+</body>
+</html>

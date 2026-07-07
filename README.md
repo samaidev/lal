@@ -13,7 +13,13 @@ lal/
 ├── models/
 │   └── gpt2.c               # GPT-2 model (uses lal_runtime)
 ├── demos/                   # LAL programs (.lal files)
-├── tools/                   # Weight export, PyTorch STE, verification
+├── tools/
+│   ├── server/              # GPT-2 web frontend (HTTP server + HTML UI)
+│   │   ├── gpt2_server.c    # AVX2 SIMD inference + hash tokenizer
+│   │   ├── frontend.html    # Browser UI
+│   │   └── README.md        # Why two inference paths (binary vs. float)
+│   ├── export_*.py          # Weight export from PyTorch checkpoints
+│   └── verify.py            # End-to-end correctness check
 ├── prebuilt/                # Pre-built binaries (open out of the box!)
 └── docs/                    # Design docs
 ```
@@ -24,12 +30,16 @@ lal/
 # GPT-2 training (no PyTorch, pure C, 3.4ms/step)
 ./prebuilt/gpt2_train 10000 0.05    # 10000 steps in 35 seconds
 
+# GPT-2 web server (browser frontend, AVX2 SIMD, 96 ms/token)
+./prebuilt/gpt2_server             # opens http://localhost:8080
+
 # Compile a LAL program
 python3 compiler/lal.py demos/basic/demo.lal classify demo.c
 gcc -O3 -o demo demo.c -lm
 
 # Build from source
 make train    # builds prebuilt/gpt2_train
+make server   # builds prebuilt/gpt2_server
 make demos    # builds demo binaries
 ```
 
@@ -46,9 +56,11 @@ The runtime is model-agnostic. GPT-2 is just one example.
 
 | Task | Metric | Value |
 |---|---|---|
-| GPT-2 training (LAL native) | 10000 steps, pure C | 35s, 3.4ms/step, loss 5.5→0.3 |
+| GPT-2 training (LAL native, binary) | 10000 steps, pure C | 35s, 3.4ms/step, loss 5.5→0.3 |
 | vs PyTorch | speedup | 250x |
 | Weight compression | binary (sign+alpha) | 44x (498MB → 11.3MB) |
+| GPT-2 web server (float, AVX2 SIMD) | inference, single-core | 96 ms/token (10.4 tok/s) |
+| vs original scalar server | speedup | ~5x (490 → 96 ms/token) |
 
 ## License
 
