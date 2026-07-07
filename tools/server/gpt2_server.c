@@ -762,7 +762,6 @@ static int gpt2_forward_token(int token_id, int position) {
         fprintf(stderr, "[!] bad position=%d, clamping to 0\n", position);
         position = 0;
     }
-    fprintf(stderr, "[d]   forward: token=%d pos=%d embedding\n", token_id, position); fflush(stderr);
     /* Embedding */
     for (int i = 0; i < N_EMBD; i++)
         g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
@@ -772,21 +771,15 @@ static int gpt2_forward_token(int token_id, int position) {
         if (g_binary_mode) {
             /* Binary forward: XNOR + popcount (32x fewer FLOPs per layer) */
             BinGPT2Layer *L = &g_bin_layers[l];
-            fprintf(stderr, "[d]   layer %d ln1\n", l); fflush(stderr);
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
-            fprintf(stderr, "[d]   layer %d c_attn\n", l); fflush(stderr);
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
             memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
-            fprintf(stderr, "[d]   layer %d c_proj\n", l); fflush(stderr);
             bin_matmul(g_attn_out, &L->c_proj, g_proj);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
-            fprintf(stderr, "[d]   layer %d ln2\n", l); fflush(stderr);
             layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
-            fprintf(stderr, "[d]   layer %d mlp_fc\n", l); fflush(stderr);
             bin_matmul(g_ln2, &L->mlp_fc, g_fc);
             for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
-            fprintf(stderr, "[d]   layer %d mlp_proj\n", l); fflush(stderr);
             bin_matmul(g_fc, &L->mlp_proj, g_mlp_out);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
         } else {
@@ -808,13 +801,11 @@ static int gpt2_forward_token(int token_id, int position) {
     }
 
     /* Final norm */
-    fprintf(stderr, "[d]   final norm\n"); fflush(stderr);
     layer_norm_simd(g_final_ln, g_x, g_ln_f_w, g_ln_f_b, N_EMBD);
 
     /* LM head: logits = wte @ final_ln  (tied embeddings)
      * wte stays float in both modes (binarizing embeddings hurts accuracy).
      * Use pruned version if --prune-vocab was set, else full parallel. */
-    fprintf(stderr, "[d]   lm_head\n"); fflush(stderr);
     if (g_active_vocab && g_n_active_vocab < VOCAB_SIZE) {
         lm_head_pruned(g_logits, g_final_ln, g_wte, g_active_vocab, g_n_active_vocab, N_EMBD);
     } else {
@@ -822,13 +813,11 @@ static int gpt2_forward_token(int token_id, int position) {
     }
 
     /* Argmax */
-    fprintf(stderr, "[d]   argmax\n"); fflush(stderr);
     int best = 0;
     float best_val = g_logits[0];
     for (int v = 1; v < VOCAB_SIZE; v++) {
         if (g_logits[v] > best_val) { best_val = g_logits[v]; best = v; }
     }
-    fprintf(stderr, "[d]   forward done, best=%d\n", best); fflush(stderr);
     return best;
 }
 
@@ -876,7 +865,6 @@ static void handle_request(int client_fd) {
         write(client_fd, body, body_len);
         free(html);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/generate") == 0) {
-        fprintf(stderr, "[d] POST /generate received\n"); fflush(stderr);
         char *body = strstr(buf, "\r\n\r\n");
         if (!body) { close(client_fd); return; }
         body += 4;
@@ -920,16 +908,12 @@ static void handle_request(int client_fd) {
         static int all_tokens[1024];
         memcpy(all_tokens, input_tokens, n_input * sizeof(int));
         int total = n_input;
-        fprintf(stderr, "[d] starting generation: n_input=%d n_tokens=%d\n", n_input, n_tokens); fflush(stderr);
         for (int gen = 0; gen < n_tokens; gen++) {
-            fprintf(stderr, "[d] gen=%d total=%d calling forward\n", gen, total); fflush(stderr);
             int next = gpt2_forward_token(all_tokens[total - 1], total - 1);
-            fprintf(stderr, "[d] gen=%d got token=%d\n", gen, next); fflush(stderr);
             output_tokens[gen] = next;
             all_tokens[total++] = next;
             if (total >= 1024) { n_tokens = gen + 1; break; }
         }
-        fprintf(stderr, "[d] generation done, building response\n"); fflush(stderr);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
@@ -1000,10 +984,16 @@ int main(int argc, char **argv) {
     /* Auto-detect thread count.
      * NOTE: LM head is memory-bound (154MB weight reads/token), so threading
      * only helps on 4+ core machines with multiple memory channels.
-     * On 2-core systems, single-threaded is faster (avoids cache contention). */
+     * On 2-core systems, single-threaded is faster (avoids cache contention).
+     * On ARM Android, pthread default stack can be too small for lm_head_avx2's
+     * 8 accumulator registers → force single-threaded to avoid segfault. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+#if defined(__ARM_ARCH) || defined(__arm__) || defined(__aarch64__)
+    g_n_threads = 1;  /* ARM: single-threaded for safety */
+#else
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
+#endif
 
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
            use_binary ? "BINARY XNOR+popcount" : "float SIMD",
