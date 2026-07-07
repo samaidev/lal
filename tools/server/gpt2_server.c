@@ -752,6 +752,7 @@ static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attent
 static int    g_use_turboquant = 0;     /* set by --turboquant (runtime int8 quant) */
 static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
 static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
+static float  g_top_p = 0.0f;           /* top-p (nucleus) sampling, 0=off; applied after top-k */
 static float  g_rep_penalty = 1.1f;     /* repetition penalty, 1.0=off */
 static int    g_recent_tokens[256];     /* ring buffer of recent tokens */
 static int    g_n_recent = 0;           /* count of recent tokens (up to 256) */
@@ -929,6 +930,73 @@ static void real_attention(float *attn_out, const float *qkv, int layer_idx,
     }
 }
 
+/* SIMD version of real_attention for the float path (AVX2/NEON/scalar auto).
+ * Same semantics as real_attention(); LAL-Bot approved keeping the scalar
+ * version for the binary branch and calling this one from float. The QK dot
+ * product and the V weighted accumulation are the hot loops — both vectorized
+ * 8 floats at a time via the project's v8f helpers. */
+static void real_attention_simd(float *attn_out, const float *qkv, int layer_idx,
+                                int position, float *k_cache_layer, float *v_cache_layer) {
+    const int head_dim = N_EMBD / N_HEAD;          /* 64 */
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *Q = qkv;
+    const float *K_new = qkv + N_EMBD;
+    const float *V_new = qkv + 2 * N_EMBD;
+
+    /* Cache K, V for this position. */
+    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
+    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+
+    static float scores[1024];      /* max seq len */
+    static float attn_weights[1024];
+
+    for (int h = 0; h < N_HEAD; h++) {
+        const float *Q_h = Q + h * head_dim;
+
+        /* scores[j] = (Q_h · K[j,h]) * scale, vectorized. */
+        float max_score = -1e30f;
+        for (int j = 0; j <= position; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            v8f acc = v8f_zero();
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8)
+                acc = v8f_fmadd(v8f_load(Q_h + d), v8f_load(K_jh + d), acc);
+            float dot = v8f_hsum(acc);
+            for (; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[j] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+
+        /* Softmax (numerically stable). */
+        float sum_exp = 0.0f;
+        for (int j = 0; j <= position; j++) {
+            float e = expf(scores[j] - max_score);
+            attn_weights[j] = e;
+            sum_exp += e;
+        }
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+        for (int j = 0; j <= position; j++) attn_weights[j] *= inv_sum;
+
+        /* out_h = sum_j attn_weights[j] * V[j,h], vectorized accumulation. */
+        float *out_h = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        for (int j = 0; j <= position; j++) {
+            float w = attn_weights[j];
+            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            v8f wv = v8f_set1(w);
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8) {
+                v8f cur = v8f_load(out_h + d);
+                cur = v8f_fmadd(wv, v8f_load(V_jh + d), cur);
+                v8f_store(out_h + d, cur);
+            }
+            for (; d < head_dim; d++) out_h[d] += w * V_jh[d];
+        }
+    }
+}
+
 static int gpt2_forward_token(int token_id, int position) {
 
     /* Embedding: g_x = wte[token] + wpe[position].
@@ -975,13 +1043,14 @@ static int gpt2_forward_token(int token_id, int position) {
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
+            /* Attention: dflash > real_attention_simd > real_attention > V-copy */
             if ((g_use_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
                     dflash_attention(g_attn_out, g_qkv, position,
                                      g_k_cache[l], g_v_cache[l]);
                 } else {
-                    real_attention(g_attn_out, g_qkv, l, position,
-                                   g_k_cache[l], g_v_cache[l]);
+                    real_attention_simd(g_attn_out, g_qkv, l, position,
+                                        g_k_cache[l], g_v_cache[l]);
                 }
             } else {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
@@ -1048,17 +1117,81 @@ static int gpt2_forward_token(int token_id, int position) {
             logits_copy[max_v] = -1e30f;  /* remove so next pass finds next-best */
         }
 
-        /* Apply softmax over top-k tokens only, with temperature */
-        float max_logit = threshold;  /* approximate (actual max is higher) */
-        /* Re-find actual max among top-k */
+        /* Top-p (nucleus) filtering — applied AFTER top-k, BEFORE softmax.
+         * Per LAL-Bot's agreement: "--top-p 0.9, 和 top-k 40 一起用 (先 top-k 再 top-p)".
+         * Algorithm (HF-style):
+         *   1. Collect the top-k logits and their token indices.
+         *   2. Sort them descending by logit.
+         *   3. Compute softmax (with temperature) over the sorted set.
+         *   4. Accumulate probs until cumulative >= top_p; keep those, drop the rest.
+         * This further narrows the sampling set to the "nucleus" of high-prob tokens,
+         * which avoids sampling very-low-prob tokens that still made it into top-k.
+         * g_top_p == 0 means disabled (keep all top-k). */
+        int keep_mask[50257];
+        for (int v = 0; v < VOCAB_SIZE; v++) keep_mask[v] = 0;
+        if (g_top_p > 0.0f && g_top_p < 1.0f) {
+            /* Gather indices of tokens that survived top-k. */
+            static int top_idx[50257];
+            static float top_val[50257];
+            int n_top = 0;
+            for (int v = 0; v < VOCAB_SIZE; v++) {
+                if (g_logits[v] >= threshold) {
+                    top_idx[n_top] = v;
+                    top_val[n_top] = g_logits[v];
+                    n_top++;
+                }
+            }
+            /* Find actual max for numerical stability of softmax. */
+            float actual_max = -1e30f;
+            for (int i = 0; i < n_top; i++)
+                if (top_val[i] > actual_max) actual_max = top_val[i];
+
+            /* Compute temperature-scaled softmax probs over the top-k set. */
+            float sum_exp = 0.0f;
+            for (int i = 0; i < n_top; i++) {
+                top_val[i] = expf((top_val[i] - actual_max) / g_temperature);
+                sum_exp += top_val[i];
+            }
+            float inv = 1.0f / (sum_exp + 1e-12f);
+            for (int i = 0; i < n_top; i++) top_val[i] *= inv;
+
+            /* Sort descending by prob. n_top is small (<= top_k, typically 40),
+             * so a simple insertion sort is fine and avoids qsort overhead. */
+            for (int i = 1; i < n_top; i++) {
+                float vp = top_val[i]; int vi = top_idx[i];
+                int j = i - 1;
+                while (j >= 0 && top_val[j] < vp) {
+                    top_val[j + 1] = top_val[j];
+                    top_idx[j + 1] = top_idx[j];
+                    j--;
+                }
+                top_val[j + 1] = vp;
+                top_idx[j + 1] = vi;
+            }
+
+            /* Keep tokens until cumulative prob >= top_p. HF keeps the first token
+             * that crosses the threshold (so the nucleus is never empty). */
+            float cum = 0.0f;
+            for (int i = 0; i < n_top; i++) {
+                keep_mask[top_idx[i]] = 1;
+                cum += top_val[i];
+                if (cum >= g_top_p) break;
+            }
+        } else {
+            /* top-p disabled: keep everything that survived top-k. */
+            for (int v = 0; v < VOCAB_SIZE; v++)
+                if (g_logits[v] >= threshold) keep_mask[v] = 1;
+        }
+
+        /* Apply softmax over the surviving (kept) tokens, with temperature. */
         float actual_max = -1e30f;
         for (int v = 0; v < VOCAB_SIZE; v++) {
-            if (g_logits[v] >= threshold && g_logits[v] > actual_max) actual_max = g_logits[v];
+            if (keep_mask[v] && g_logits[v] > actual_max) actual_max = g_logits[v];
         }
 
         float sum_exp = 0.0f;
         for (int v = 0; v < VOCAB_SIZE; v++) {
-            if (g_logits[v] >= threshold) {
+            if (keep_mask[v]) {
                 logits_copy[v] = expf((g_logits[v] - actual_max) / g_temperature);
                 sum_exp += logits_copy[v];
             } else {
@@ -1168,6 +1301,7 @@ static void handle_request(int client_fd) {
          * a request without these fields keeps using the CLI config. */
         float saved_temp = g_temperature;
         int   saved_topk = g_top_k;
+        float saved_topp = g_top_p;
         float saved_rep  = g_rep_penalty;
         p = strstr(body, "\"temperature\"");
         if (p) { p = strchr(p, ':'); if (p) g_temperature = (float)atof(p + 1); }
@@ -1177,6 +1311,10 @@ static void handle_request(int client_fd) {
         if (p) { p = strchr(p, ':'); if (p) g_top_k = atoi(p + 1); }
         if (g_top_k < 0) g_top_k = 0;
         if (g_top_k > VOCAB_SIZE) g_top_k = VOCAB_SIZE;
+        p = strstr(body, "\"top_p\"");
+        if (p) { p = strchr(p, ':'); if (p) g_top_p = (float)atof(p + 1); }
+        if (g_top_p < 0.0f) g_top_p = 0.0f;
+        if (g_top_p > 1.0f) g_top_p = 1.0f;
         p = strstr(body, "\"repetition_penalty\"");
         if (p) { p = strchr(p, ':'); if (p) g_rep_penalty = (float)atof(p + 1); }
         if (g_rep_penalty < 1.0f) g_rep_penalty = 1.0f;
@@ -1235,6 +1373,7 @@ static void handle_request(int client_fd) {
         /* Restore CLI-default sampling params (per-request override done). */
         g_temperature = saved_temp;
         g_top_k = saved_topk;
+        g_top_p = saved_topp;
         g_rep_penalty = saved_rep;
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1293,12 +1432,16 @@ static void handle_request(int client_fd) {
 
         float saved_temp = g_temperature, saved_rep = g_rep_penalty;
         int   saved_topk = g_top_k;
+        float saved_topp = g_top_p;
         p = strstr(body, "\"temperature\"");
         if (p) { p = strchr(p, ':'); if (p) g_temperature = (float)atof(p + 1); }
         if (g_temperature < 0) g_temperature = 0; if (g_temperature > 2) g_temperature = 2;
         p = strstr(body, "\"top_k\"");
         if (p) { p = strchr(p, ':'); if (p) g_top_k = atoi(p + 1); }
         if (g_top_k < 0) g_top_k = 0; if (g_top_k > VOCAB_SIZE) g_top_k = VOCAB_SIZE;
+        p = strstr(body, "\"top_p\"");
+        if (p) { p = strchr(p, ':'); if (p) g_top_p = (float)atof(p + 1); }
+        if (g_top_p < 0) g_top_p = 0; if (g_top_p > 1) g_top_p = 1;
         p = strstr(body, "\"repetition_penalty\"");
         if (p) { p = strchr(p, ':'); if (p) g_rep_penalty = (float)atof(p + 1); }
         if (g_rep_penalty < 1) g_rep_penalty = 1; if (g_rep_penalty > 2) g_rep_penalty = 2;
@@ -1368,7 +1511,7 @@ static void handle_request(int client_fd) {
             if (total >= 1024) { n_tokens = gen + 1; break; }
         }
 
-        g_temperature = saved_temp; g_top_k = saved_topk; g_rep_penalty = saved_rep;
+        g_temperature = saved_temp; g_top_k = saved_topk; g_top_p = saved_topp; g_rep_penalty = saved_rep;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
         double tps = n_tokens / (dt > 0 ? dt : 1e-6);
@@ -1411,6 +1554,10 @@ int main(int argc, char **argv) {
             g_temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
             g_top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            g_top_p = (float)atof(argv[++i]);
+            if (g_top_p < 0.0f) g_top_p = 0.0f;
+            if (g_top_p > 1.0f) g_top_p = 1.0f;
         } else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
             g_rep_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--prune-vocab") == 0 && i + 1 < argc) {
