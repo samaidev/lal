@@ -243,6 +243,16 @@ static int g_binary_mode = 0;   /* set by --binary flag */
  * branch for the rest. */
 static int g_mixed_precision = 0;
 
+/* Ternary activation mode (--ternary-act): in binary layers, binarize_input
+ * becomes ternarize_input — small-magnitude activations (|x| < threshold) are
+ * zeroed instead of forced to ±1. Bi-Real Net showed this halves activation
+ * quantization error with negligible cost. Pure activation-domain change:
+ * weights stay sign(w), so this composes with STE (weight tuning) and
+ * mixed-precision (whole-layer float). Threshold = g_ternary_threshold *
+ * mean(|x|), default 0.5 (zero ~30% of activations near zero). */
+static int   g_ternary_act       = 0;
+static float g_ternary_threshold = 0.5f;
+
 /* Binarize input x[in_dim] → packed bits x_bits[n_words] */
 static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_words) {
     for (int wi = 0; wi < n_words; wi++) {
@@ -252,6 +262,36 @@ static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_w
             if (idx < in_dim && x[idx] > 0.0f) word |= (1ULL << bi);
         }
         x_bits[wi] = word;
+    }
+}
+
+/* Ternary activation packing (Bi-Real Net style, {-1,0,+1}):
+ * Elements with |x| < threshold are zeroed (contribute nothing); survivors
+ * keep their sign. We pack TWO bitmasks per input:
+ *   x_sign[wi] — survivor sign bit (1 if x>0, 0 if x<0); zeroed elements are 0
+ *   x_mask[wi] — survivor mask bit (1 if |x|>=threshold, 0 otherwise)
+ * The dot product over survivors = 2*matches - n_survivors, where
+ *   matches    = popcount(XNOR(x_sign, wbits) AND x_mask)
+ *   n_survivors= popcount(x_mask)  (same for all output j)
+ * This is a pure activation-domain change — weights stay binary (sign(w)),
+ * so it composes with STE (which tunes the binary weights) and with
+ * mixed-precision (which keeps whole layers in float). */
+static void ternarize_input(const float *x, uint64_t *x_sign, uint64_t *x_mask,
+                            int in_dim, int n_words, float threshold) {
+    for (int wi = 0; wi < n_words; wi++) {
+        uint64_t sign_w = 0, mask_w = 0;
+        for (int bi = 0; bi < 64; bi++) {
+            int idx = wi * 64 + bi;
+            if (idx < in_dim) {
+                float xi = x[idx];
+                if (fabsf(xi) >= threshold) {
+                    mask_w |= (1ULL << bi);          /* survivor */
+                    if (xi > 0.0f) sign_w |= (1ULL << bi);  /* sign + */
+                }
+            }
+        }
+        x_sign[wi] = sign_w;
+        x_mask[wi] = mask_w;
     }
 }
 
@@ -271,6 +311,61 @@ static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_w
  */
 static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     int n_words = bl->n_words;
+
+    /* Compute mean(|x|) over the active elements — the input scale factor.
+     * In ternary mode, "active" means survivors (|x| >= threshold); the
+     * mean over survivors keeps the dot-product magnitude correct when
+     * some elements are zeroed. */
+    float abs_sum = 0.0f;
+    for (int i = 0; i < bl->in_dim; i++) abs_sum += fabsf(x[i]);
+    float mean_abs = abs_sum / bl->in_dim;
+
+    if (g_ternary_act) {
+        /* Ternary activation path: pack sign + survivor mask, then for each
+         * output j compute matches over survivors only.
+         *   y[j] = x_scale * alpha[j] * (2*matches_j - n_survivors) + bias[j]
+         * where x_scale = mean|x| over survivors (so zeroed elements don't
+         * drag the scale down). */
+        uint64_t *x_sign, *x_mask;
+        uint64_t sign_buf[16], mask_buf[16];
+        if (n_words <= 16) {
+            x_sign = sign_buf; x_mask = mask_buf;
+        } else {
+            x_sign = malloc(n_words * sizeof(uint64_t));
+            x_mask = malloc(n_words * sizeof(uint64_t));
+        }
+        float threshold = g_ternary_threshold * mean_abs;
+        ternarize_input(x, x_sign, x_mask, bl->in_dim, n_words, threshold);
+
+        /* n_survivors and survivor |x| sum (both independent of output j). */
+        int n_survivors = 0;
+        float surv_abs_sum = 0.0f;
+        for (int wi = 0; wi < n_words; wi++) {
+            n_survivors += __builtin_popcountll(x_mask[wi]);
+        }
+        for (int i = 0; i < bl->in_dim; i++) {
+            uint64_t bit = 1ULL << (i & 63);
+            int wi = i >> 6;
+            if (x_mask[wi] & bit) surv_abs_sum += fabsf(x[i]);
+        }
+        float x_scale = (n_survivors > 0) ? (surv_abs_sum / n_survivors) : 0.0f;
+        int n_active = n_survivors;  /* replaces bl->in_dim in the (2*pc - N) term */
+
+        for (int j = 0; j < bl->out_dim; j++) {
+            const uint64_t *wb = bl->wbits + (size_t)j * n_words;
+            int matches = 0;
+            for (int wi = 0; wi < n_words; wi++) {
+                /* XNOR(sign, w) AND mask = bits where survivor AND sign matches. */
+                uint64_t xnor = ~(x_sign[wi] ^ wb[wi]);
+                matches += __builtin_popcountll(xnor & x_mask[wi]);
+            }
+            y[j] = x_scale * bl->alpha[j] * (float)(2 * matches - n_active) + bl->bias[j];
+        }
+        if (n_words > 16) { free(x_sign); free(x_mask); }
+        return;
+    }
+
+    /* Binary (±1) path — original XNOR-Net. */
     uint64_t *xb;
     uint64_t x_bits[16];  /* stack alloc for small in_dim (768 → 12 words) */
     if (n_words <= 16) {
@@ -280,11 +375,7 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     }
     binarize_input(x, xb, bl->in_dim, n_words);
 
-    /* Compute mean(|x|) — the input scale factor */
-    float abs_sum = 0.0f;
-    for (int i = 0; i < bl->in_dim; i++) abs_sum += fabsf(x[i]);
-    float x_scale = abs_sum / bl->in_dim;
-
+    float x_scale = mean_abs;  /* mean over all in_dim elements */
     for (int j = 0; j < bl->out_dim; j++) {
         const uint64_t *wb = bl->wbits + (size_t)j * n_words;
         int pc = 0;
@@ -1974,6 +2065,16 @@ int main(int argc, char **argv) {
             g_use_turboquant = 1;
         } else if (strcmp(argv[i], "--lm-head-int8") == 0) {
             g_use_lm_head_int8 = 1;
+        } else if (strcmp(argv[i], "--ternary-act") == 0) {
+            /* Ternary activation for binary layers: |x| < threshold*mean|x|
+             * is zeroed instead of forced to ±1. Bi-Real Net style. Only
+             * affects binary layers (in --binary or --mixed-precision mode);
+             * float layers are untouched. Composes with STE + mixed-precision. */
+            g_ternary_act = 1;
+        } else if (strcmp(argv[i], "--ternary-threshold") == 0 && i + 1 < argc) {
+            g_ternary_threshold = (float)atof(argv[++i]);
+            if (g_ternary_threshold < 0.0f) g_ternary_threshold = 0.0f;
+            if (g_ternary_threshold > 2.0f) g_ternary_threshold = 2.0f;
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             g_temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
