@@ -1,0 +1,210 @@
+# Training corpus for STE fine-tuning of binary GPT-2.
+# Diverse, coherent English sentences (factual + narrative), public-domain
+# / common-knowledge. One sentence per line. Aim: 8-32 BPE tokens each so the
+# tokenizer keeps them (see scripts/build_corpus.c).
+# Topics mixed: geography, science, history, daily life, narrative, technology,
+# nature, proverbs — to give the model varied contexts like GPT-2's pretraining.
+
+# --- Geography & capitals (echoes original 3, but expanded) ---
+The capital of France is Paris and it is a beautiful city.
+The capital of Japan is Tokyo which is a very busy place.
+The capital of Germany is Berlin and the people are friendly.
+The capital of Italy is Rome and the food is wonderful there.
+The capital of Spain is Madrid and the weather is often warm.
+The capital of Russia is Moscow and winters are very cold.
+The capital of China is Beijing and it has a long history.
+The capital of India is New Delhi and the streets are crowded.
+The capital of Brazil is Brasilia not Rio de Janeiro.
+The capital of Egypt is Cairo and the river Nile flows through it.
+
+# --- Science & nature ---
+Water boils at one hundred degrees Celsius at sea level.
+The Earth goes around the Sun once every year.
+Light travels very fast but sound travels much more slowly.
+Plants use sunlight to make their own food in their leaves.
+The human body has two hundred and six bones in total.
+A magnet has two ends called the north and south poles.
+Oxygen is a gas that we need to breathe to stay alive.
+The Moon causes the tides in the oceans of the Earth.
+A rainbow appears in the sky after the rain on a sunny day.
+Trees take in carbon dioxide and give out oxygen for us.
+
+# --- History ---
+The ancient Egyptians built large pyramids as tombs for kings.
+Rome was a great empire that ruled much of Europe long ago.
+The printing press was invented to make books much cheaper.
+The wheel was invented many thousands of years before cars.
+Kings and queens lived in castles with high walls and moats.
+Sailors used the stars to find their way across the oceans.
+The first computers were very large and filled whole rooms.
+People once hunted animals with spears made of wood and stone.
+Trade routes carried silk and spices between distant lands.
+Old civilizations left behind temples and writings for us to read.
+
+# --- Daily life ---
+I like to drink a cup of coffee in the early morning.
+She went to the market to buy fresh fruit and vegetables.
+The children played in the park until the sun went down.
+He fixed the broken chair with a hammer and some nails.
+We had dinner together and talked about our day at work.
+The bus was late so I had to wait in the cold rain.
+My grandmother made soup with chicken and rice for us.
+The dog ran to the door when it heard its owner coming home.
+I lost my keys and had to search the whole house for them.
+They painted the walls a soft blue color to make it calm.
+
+# --- Narrative (echoes 'Once upon a time') ---
+Once upon a time there was a kingdom by the sea.
+Once upon a time a small dragon lived on a tall mountain.
+Once upon a time a poor farmer found a bag of gold.
+Once upon a time a clever fox tricked a foolish crow.
+Once upon a time a young girl traveled far to seek her fortune.
+Once upon a time a king had three sons who could not agree.
+Once upon a time a wise old man lived deep in the forest.
+Once upon a time a knight set out to slay a terrible beast.
+Once upon a time a merchant sailed to a distant land for spice.
+Once upon a time a shepherd boy cried wolf when there was none.
+
+# --- Technology & machines ---
+Machine learning is a subset of artificial intelligence today.
+A computer stores data on a disk or in its memory chips.
+The internet connects computers all around the whole world.
+A telephone lets two people talk even when far apart.
+Cars have engines that burn fuel to make them move forward.
+A camera takes a picture by letting light fall on a sensor.
+Robots can do boring or dangerous jobs for human workers.
+Electricity flows through wires to power our lights and devices.
+A clock uses gears or crystals to keep track of the time.
+Software is the set of instructions that tells hardware what to do.
+
+# --- Weather & seasons (echoes original weather line) ---
+The weather today is sunny and warm with a gentle breeze.
+In winter the snow falls and the lakes freeze over hard.
+Spring brings new flowers and the birds return to sing.
+Summer is hot and the days are long and bright.
+Autumn leaves turn red and gold before they fall to the ground.
+A storm brings thunder and lightning and heavy rain.
+The wind blew hard all night and broke a tree branch.
+Fog covered the valley so we could not see very far ahead.
+After the rain the air smelled fresh and clean and sweet.
+The forecast said it would be cloudy but it did not rain.
+
+# --- Animals ---
+The quick brown fox jumps over the lazy dog in the yard.
+A cat can see in the dark much better than a human can.
+Horses are strong animals that can run very fast indeed.
+Fish live in water and breathe through gills on their sides.
+Birds have hollow bones so they are light enough to fly.
+A bear sleeps through the whole winter in a dark cave.
+Bees make honey from the nectar they find in the flowers.
+Lions live in groups called prides on the open grassland.
+Elephants are the largest animals that walk on the land.
+Snakes do not have legs but they move very quickly.
+
+# --- Food & cooking ---
+Bread is made from flour and water and yeast and salt.
+To make tea you pour hot water over the leaves and wait.
+Cheese is made from milk and can taste sharp or mild.
+Rice is a common food in many countries around the world.
+A good soup simmers slowly for hours on the stove.
+Apples grow on trees and can be red or green or yellow.
+Coffee beans are roasted before they are ground and brewed.
+Eggs can be boiled or fried or scrambled for breakfast.
+Sugar makes food sweet but too much of it is not healthy.
+Salt brings out the flavor of almost every dish we cook.
+
+# --- Body & health ---
+The heart pumps blood through the body all day and night.
+We use our eyes to see and our ears to hear the world.
+Brushing your teeth keeps them clean and strong and white.
+Sleep helps the body rest and the mind remember things well.
+Washing your hands stops germs from making you feel sick.
+The brain is the organ that lets us think and learn and feel.
+Muscles get stronger when you use them in exercise often.
+Bones give the body its shape and protect the soft parts.
+Food gives us the energy we need to move and to grow.
+Drinking enough water is important to stay healthy and alert.
+
+# --- Travel & places ---
+The train arrived at the station just before nine o clock.
+We packed our bags and drove to the mountains for the weekend.
+The hotel room had a view of the sea and the setting sun.
+A map helps you find your way when you are in a new place.
+The airport was crowded with people going to many cities.
+She bought a ticket and waited on the platform for the train.
+The road wound up the hill through a dense green forest.
+They took a boat across the lake to reach the small island.
+The museum was full of old paintings and strange objects.
+A guide showed us around the ruins and told us their story.
+
+# --- Work & school ---
+The teacher wrote the lesson on the board for the class.
+He studies hard every night so he can pass the exam.
+The factory makes shoes that are sold in many shops.
+She works at a hospital where she helps sick people.
+The meeting started late because the boss was stuck in traffic.
+Students raised their hands to ask the teacher a question.
+The shop opens at nine and closes at six in the evening.
+A farmer wakes early to feed the animals before the dawn.
+The team worked together to finish the project on time.
+The office was quiet because everyone had gone home already.
+
+# --- Numbers & time ---
+There are sixty seconds in a minute and sixty minutes in an hour.
+Seven days make a week and fifty two weeks make a year.
+A dozen means twelve of something like eggs or donuts.
+The clock on the wall showed that it was half past ten.
+A century is one hundred years long as we count the time.
+December has thirty one days just like July and August do.
+It takes the Earth twenty four hours to spin around once.
+The number zero was a very important idea in mathematics.
+A leap year comes every four years and has an extra day.
+The calendar helps us keep track of the days and the months.
+
+# --- Feelings & friendship ---
+She was happy when her friend came to visit her at home.
+He felt sad when his old dog had to go to the vet.
+A good friend listens when you have something to say.
+They laughed together at the funny joke the clown told.
+The child was afraid of the dark so he left a light on.
+It is kind to help someone who has fallen on the ground.
+Forgiving a friend after a fight makes the friendship strong.
+The puppy was so excited that its whole tail could not stop.
+A smile can make a bad day feel a little bit better.
+Being honest with people builds trust over a long time.
+
+# --- Proverbs & sayings ---
+A stitch in time saves nine as the old saying goes.
+Look before you leap so you do not fall into a trap.
+Do not judge a book by the cover that you first see.
+Slow and steady wins the race in the famous old tale.
+An apple a day keeps the doctor away it is often said.
+Where there is smoke there is usually a fire close by.
+The early bird catches the worm as the proverb tells us.
+Too many cooks spoil the broth when everyone wants control.
+A journey of a thousand miles begins with one small step.
+Actions speak louder than words that people often say.
+
+# --- Crafts & making things ---
+She sewed a dress from cloth she bought at the shop.
+He carved a wooden spoon from a piece of old oak.
+The potter shaped the clay into a round and tall jar.
+They built a small house from bricks and strong cement.
+A blacksmith heats iron until it is red and then he strikes.
+We folded paper into cranes to decorate the room for the party.
+The gardener planted seeds in rows across the dark soil.
+She wove a basket from thin strips of willow branch.
+He tuned the guitar until every string sounded just right.
+The painter mixed colors on the board to get the right shade.
+
+# --- Music & art ---
+The band played a song that made everyone want to dance.
+She sang a soft tune while she worked in the kitchen.
+A piano has black and white keys that you press to play.
+The violin makes a high sweet sound when the bow is drawn.
+Drums keep the beat that the other instruments follow.
+He drew a picture of the mountain with a pencil and paper.
+The choir sang together in harmony at the Sunday service.
+A flute is a long thin tube with holes along its side.
+The artist painted the sky in shades of pink and gold.
+Music can make us feel joy or sorrow without any words.
