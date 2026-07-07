@@ -983,6 +983,7 @@ static float  *g_v_scale[N_LAYER];     /* [n_ctx] per-row scale for V (turboquan
 static int    g_use_real_attention = 0;  /* set by --real-attention */
 static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attention) */
 static int    g_use_turboquant = 0;     /* set by --turboquant (KV cache int8 quant) */
+static int    g_skip_lm_head = 0;       /* internal: skip LM head during prefill (optimization) */
 static float  g_temperature = 0.8f;      /* sampling temperature, 0=argmax */
 static int    g_top_k = 40;             /* top-k sampling, 0=argmax */
 static float  g_top_p = 0.0f;           /* top-p (nucleus) sampling, 0=off; applied after top-k */
@@ -1397,6 +1398,11 @@ static int gpt2_forward_token(int token_id, int position) {
     /* Final norm */
     layer_norm_simd(g_final_ln, g_x, g_ln_f_w, g_ln_f_b, N_EMBD);
 
+    /* Prefill optimization: skip LM head for intermediate prompt tokens.
+     * Only the last prompt token needs logits (for generating the first
+     * new token). This saves 50257×768 LM head FLOPs per prefill token. */
+    if (g_skip_lm_head) return 0;  /* return dummy token (unused) */
+
     /* LM head: logits = wte @ final_ln  (tied embeddings)
      * wte stays float in both modes (binarizing embeddings hurts accuracy).
      * Path selection (mutually exclusive by design):
@@ -1670,13 +1676,15 @@ static void handle_request(int client_fd) {
          * for the first generated token, so we start generation from there. */
         int first_gen_position = total - 1;  /* position of last prompt token */
         if (g_use_real_attention || g_use_dflash) {
-            /* Forward all prompt tokens except the last (which we'll re-forward
-             * to get its logits for generation). Actually, forward ALL prompt
-             * tokens — the last one's forward fills KV cache at position n_input-1
-             * and returns the next-token prediction. */
+            /* Forward prompt tokens to fill KV cache.
+             * Optimization: skip LM head for all but the last prompt token
+             * (only the last one needs logits for generating the first new
+             * token). This saves (n_input-1) × 50257×768 FLOPs. */
             for (int t = 0; t < n_input; t++) {
+                g_skip_lm_head = (t < n_input - 1) ? 1 : 0;
                 gpt2_forward_token(all_tokens[t], t);
             }
+            g_skip_lm_head = 0;  /* restore for decode phase */
             /* After forwarding prompt, KV cache has positions 0..n_input-1.
              * The last forward (position n_input-1) already computed logits
              * for the NEXT token. We can use that directly for gen=0. */
