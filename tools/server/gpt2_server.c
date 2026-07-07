@@ -1192,6 +1192,111 @@ static void handle_request(int client_fd) {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", jpos);
         write(client_fd, header, strlen(header));
         write(client_fd, json, jpos);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/stream") == 0) {
+        /* Streaming generation via Server-Sent Events.
+         * Same params as /generate; emits one data: event per token so the
+         * frontend can render text as it is produced. */
+        char *body = strstr(buf, "\r\n\r\n");
+        if (!body) { close(client_fd); return; }
+        body += 4;
+
+        static char prompt[1024];
+        prompt[0] = '\0';
+        int n_tokens = 20;
+        char *p = strstr(body, "\"prompt\"");
+        if (p) { p = strchr(p, ':'); if (p) { p = strchr(p, '"'); if (p) { p++;
+            int i = 0; while (*p && *p != '"' && i < 1023) { if (*p == '\\') p++; prompt[i++] = *p++; }
+            prompt[i] = '\0'; } } }
+        p = strstr(body, "\"n_tokens\"");
+        if (p) { p = strchr(p, ':'); if (p) n_tokens = atoi(p + 1); }
+        if (n_tokens < 1) n_tokens = 1; if (n_tokens > 100) n_tokens = 100;
+
+        float saved_temp = g_temperature, saved_rep = g_rep_penalty;
+        int   saved_topk = g_top_k;
+        p = strstr(body, "\"temperature\"");
+        if (p) { p = strchr(p, ':'); if (p) g_temperature = (float)atof(p + 1); }
+        if (g_temperature < 0) g_temperature = 0; if (g_temperature > 2) g_temperature = 2;
+        p = strstr(body, "\"top_k\"");
+        if (p) { p = strchr(p, ':'); if (p) g_top_k = atoi(p + 1); }
+        if (g_top_k < 0) g_top_k = 0; if (g_top_k > VOCAB_SIZE) g_top_k = VOCAB_SIZE;
+        p = strstr(body, "\"repetition_penalty\"");
+        if (p) { p = strchr(p, ':'); if (p) g_rep_penalty = (float)atof(p + 1); }
+        if (g_rep_penalty < 1) g_rep_penalty = 1; if (g_rep_penalty > 2) g_rep_penalty = 2;
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        static int input_tokens[256];
+        int n_input = encode_text(prompt, input_tokens, 256);
+        if (n_input == 0) { input_tokens[0] = 464; n_input = 1; }
+        static int all_tokens[1024];
+        memcpy(all_tokens, input_tokens, n_input * sizeof(int));
+        int total = n_input;
+
+        /* Send SSE headers + the prompt as the first chunk. */
+        const char *sse_hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        write(client_fd, sse_hdr, strlen(sse_hdr));
+
+        /* Emit prompt text so the frontend shows it immediately. */
+        {
+            static char esc[2048]; int ei = 0;
+            for (int i = 0; prompt[i] && ei < 2030; i++) {
+                if (prompt[i]=='"') { esc[ei++]='\\'; esc[ei++]='"'; }
+                else if (prompt[i]=='\\') { esc[ei++]='\\'; esc[ei++]='\\'; }
+                else if (prompt[i]=='\n') { esc[ei++]='\\'; esc[ei++]='n'; }
+                else if (prompt[i]=='\r') continue;
+                else esc[ei++] = prompt[i];
+            }
+            esc[ei] = '\0';
+            static char ev[2200];
+            int el = snprintf(ev, sizeof(ev), "data: {\"prompt\":\"%s\"}\n\n", esc);
+            write(client_fd, ev, el);
+        }
+
+        /* Prefill KV cache for real attention (same as /generate). */
+        int first_gen_position = total - 1;
+        if (g_use_real_attention) {
+            for (int t = 0; t < n_input; t++)
+                gpt2_forward_token(all_tokens[t], t);
+        }
+        g_n_recent = 0;
+
+        /* Generate + stream one event per token. */
+        for (int gen = 0; gen < n_tokens; gen++) {
+            int pos = first_gen_position + gen;
+            int next = gpt2_forward_token(all_tokens[total - 1], pos);
+            all_tokens[total++] = next;
+            if (g_n_recent < 256) g_recent_tokens[g_n_recent++] = next;
+            else { memmove(g_recent_tokens, g_recent_tokens + 1, 255 * sizeof(int)); g_recent_tokens[255] = next; }
+
+            static char tok[256];
+            int tl = decode_token(next, tok, sizeof(tok) - 1);
+            tok[tl] = '\0';
+            /* JSON-escape the token fragment. */
+            static char esc[512]; int ei = 0;
+            for (int i = 0; i < tl && ei < 500; i++) {
+                if (tok[i]=='"') { esc[ei++]='\\'; esc[ei++]='"'; }
+                else if (tok[i]=='\\') { esc[ei++]='\\'; esc[ei++]='\\'; }
+                else if (tok[i]=='\n') { esc[ei++]='\\'; esc[ei++]='n'; }
+                else if (tok[i]=='\r') continue;
+                else esc[ei++] = tok[i];
+            }
+            esc[ei] = '\0';
+            static char ev[600];
+            int el = snprintf(ev, sizeof(ev), "data: {\"token\":\"%s\",\"n\":%d}\n\n", esc, gen);
+            write(client_fd, ev, el);
+            if (total >= 1024) { n_tokens = gen + 1; break; }
+        }
+
+        g_temperature = saved_temp; g_top_k = saved_topk; g_rep_penalty = saved_rep;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        double tps = n_tokens / (dt > 0 ? dt : 1e-6);
+        static char done_ev[256];
+        int el = snprintf(done_ev, sizeof(done_ev),
+            "data: {\"done\":true,\"time\":\"%.3f\",\"n_tokens\":%d,\"tokens_per_sec\":\"%.1f\"}\n\n",
+            dt, n_tokens, tps);
+        write(client_fd, done_ev, el);
     } else {
         const char *not_found = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
         write(client_fd, not_found, strlen(not_found));

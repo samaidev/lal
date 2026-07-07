@@ -159,13 +159,13 @@ async function generate() {
   const reppen = parseFloat(document.getElementById('reppen').value);
 
   btn.disabled = true;
-  out.innerHTML = '<span class="cursor"> </span>';
   st.className = 'status';
   st.textContent = 'Generating...';
   const t0 = performance.now();
 
   try {
-    const r = await fetch('/generate', {
+    /* Streaming via /stream (SSE): render each token as it arrives. */
+    const r = await fetch('/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -174,10 +174,37 @@ async function generate() {
       })
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
+
+    out.innerHTML = '<span class="cursor"> </span>';
+    let text = '';
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let stats = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      /* SSE events are separated by \n\n; process complete ones. */
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const ev = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const line = ev.startsWith('data: ') ? ev.slice(6) : null;
+        if (!line) continue;
+        const d = JSON.parse(line);
+        if (d.prompt != null) { text = d.prompt; }
+        else if (d.token != null) { text += d.token; }
+        else if (d.done) { stats = d; }
+        out.textContent = text;
+      }
+    }
     const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    out.textContent = d.text;
-    st.textContent = `Generated ${d.n_tokens} tokens in ${d.time}s  •  ${d.tokens_per_sec} tok/s  •  round-trip ${dt}s`;
+    if (stats) {
+      st.textContent = `Generated ${stats.n_tokens} tokens in ${stats.time}s  •  ${stats.tokens_per_sec} tok/s  •  round-trip ${dt}s (streamed)`;
+    } else {
+      st.textContent = `Done  •  round-trip ${dt}s`;
+    }
   } catch (e) {
     out.innerHTML = '<span class="placeholder">Error</span>';
     st.className = 'status error';
