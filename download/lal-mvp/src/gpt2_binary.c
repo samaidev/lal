@@ -87,15 +87,18 @@ static void binarize(BinLayer *bl, const float *W, const float *bias,
     }
 }
 
-/* Load and binarize all 48 layers */
+/* Load and binarize MLP layers only (mixed precision: MLP binary, attention float).
+ * Indices: 0=attn_qkv, 1=attn_proj, 2=mlp_fc, 3=mlp_proj.
+ * Only binarize indices 2 and 3 (MLP), keep 0 and 1 (attention) as float. */
 void gpt2_binary_init(const char *weight_path) {
-    printf("[*] binarizing 48 weight matrices...\n");
+    printf("[*] binarizing MLP layers (mixed precision: MLP=binary, attn=float)...\n");
     char key[64];
     const char *suffixes[4] = {"attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"};
     int in_dims[4] = {768, 768, 768, 3072};
 
     for (int layer = 0; layer < N_LAYER; layer++) {
         for (int m = 0; m < 4; m++) {
+            if (m < 2) continue;  /* skip attention (keep float) */
             sprintf(key, "h.%d.%s.weight", layer, suffixes[m]);
             int ndim, shape[4];
             float *W = load_tensor(weight_path, key, &ndim, shape);
@@ -120,7 +123,7 @@ void binary_matmul(float *y, const float *x, const BinLayer *bl) {
     int n_words = bl->n_words;
 
     /* Binarize input x into packed bits */
-    uint64_t xbits[32]; /* max 2048/64 = 32 words */
+    uint64_t xbits[64]; /* max 4096/64 = 64 words (3072 needs 48) */
     for (int wi = 0; wi < n_words; wi++) {
         uint64_t word = 0;
         for (int bi = 0; bi < 64; bi++) {

@@ -205,11 +205,7 @@ static void transformer_layer(int layer, float *x, int seq_len) {
     sprintf(key, "h.%d.attn.c_attn.bias", layer);
     float *c_attn_b = tensor_data(key);
     for (int t = 0; t < seq_len; t++)
-#ifdef BINARY
-        binary_attn_qkv(layer, qkv + t * 3 * n, ln1 + t * n);
-#else
         matmul(qkv + t * 3 * n, ln1 + t * n, c_attn_w, c_attn_b, n, 3 * n);
-#endif
 
     /* Self-attention with causal mask */
     int head_dim = n / GPT2_N_HEAD;  /* 64 */
@@ -243,11 +239,7 @@ static void transformer_layer(int layer, float *x, int seq_len) {
     sprintf(key, "h.%d.attn.c_proj.bias", layer);
     float *c_proj_b = tensor_data(key);
     for (int t = 0; t < seq_len; t++) {
-#ifdef BINARY
-        binary_attn_proj(layer, proj_tmp + t * n, attn_out + t * n);
-#else
         matmul(proj_tmp + t * n, attn_out + t * n, c_proj_w, c_proj_b, n, n);
-#endif
         for (int i = 0; i < n; i++) x[t * n + i] += proj_tmp[t * n + i];
     }
 
