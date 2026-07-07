@@ -561,7 +561,9 @@ static void lm_head_avx2(float *logits, const float *x, const float *wte,
 }
 
 /* Parallel LM head: split vocab across N_THREADS workers.
- * The LM head is ~30% of total per-token time, so 2 threads → ~15% speedup. */
+ * The LM head is ~30% of total per-token time, so 2 threads → ~15% speedup.
+ * On ARM, we set a large pthread stack (256 KB) to avoid stack overflow
+ * in lm_head_avx2's 8 accumulator registers. */
 typedef struct {
     const float *x;
     const float *wte;
@@ -584,8 +586,14 @@ static void lm_head_parallel(float *logits, const float *x, const float *wte,
         return;
     }
     pthread_t threads[8];
+    pthread_attr_t attr;
     LmHeadJob jobs[8];
     if (n_threads > 8) n_threads = 8;
+
+    /* Set 256 KB stack per thread (ARM Android default is too small) */
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+
     int chunk = (vocab + n_threads - 1) / n_threads;
     for (int t = 0; t < n_threads; t++) {
         jobs[t].x = x;
@@ -600,8 +608,9 @@ static void lm_head_parallel(float *logits, const float *x, const float *wte,
         jobs[t].vocab_end   = (jobs[t].vocab_end / 8) * 8;
         if (t == n_threads - 1) jobs[t].vocab_end = vocab;
         if (jobs[t].vocab_end <= jobs[t].vocab_start) continue;
-        pthread_create(&threads[t], NULL, lm_head_worker, &jobs[t]);
+        pthread_create(&threads[t], &attr, lm_head_worker, &jobs[t]);
     }
+    pthread_attr_destroy(&attr);
     for (int t = 0; t < n_threads; t++) {
         if (jobs[t].vocab_end > jobs[t].vocab_start)
             pthread_join(threads[t], NULL);
@@ -985,15 +994,11 @@ int main(int argc, char **argv) {
      * NOTE: LM head is memory-bound (154MB weight reads/token), so threading
      * only helps on 4+ core machines with multiple memory channels.
      * On 2-core systems, single-threaded is faster (avoids cache contention).
-     * On ARM Android, pthread default stack can be too small for lm_head_avx2's
-     * 8 accumulator registers → force single-threaded to avoid segfault. */
+     * ARM Android: we set 256KB pthread stack in lm_head_parallel to avoid
+     * stack overflow, so multi-threading is safe. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-#if defined(__ARM_ARCH) || defined(__arm__) || defined(__aarch64__)
-    g_n_threads = 1;  /* ARM: single-threaded for safety */
-#else
     g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
-#endif
 
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
            use_binary ? "BINARY XNOR+popcount" : "float SIMD",
