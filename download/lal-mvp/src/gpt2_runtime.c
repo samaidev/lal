@@ -1,5 +1,9 @@
 /* gpt2_runtime.c — C runtime for GPT-2 inference (non-linear ops + driver).
  *
+ * Supports both float and binary (XNOR+popcount) weight layers.
+ * Build float:   gcc -O3 -o gpt2 gpt2_runtime.c -lm
+ * Build binary:  gcc -O3 -o gpt2_bin gpt2_runtime.c gpt2_binary.c -lm -DBINARY
+ *
  * This file provides:
  *   - LayerNorm, GELU, softmax
  *   - Causal self-attention (with binary QKV if LAL-compiled)
@@ -17,6 +21,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+
+#ifdef BINARY
+/* Binary layer functions (from gpt2_binary.c) */
+extern void gpt2_binary_init(const char *weight_path);
+extern void binary_attn_qkv(int layer, float *out, const float *x);
+extern void binary_attn_proj(int layer, float *out, const float *x);
+extern void binary_mlp_fc(int layer, float *out, const float *x);
+extern void binary_mlp_proj(int layer, float *out, const float *x);
+#endif
 
 /* ========================================================================
  * Model config (from tokenizer header)
@@ -192,7 +205,11 @@ static void transformer_layer(int layer, float *x, int seq_len) {
     sprintf(key, "h.%d.attn.c_attn.bias", layer);
     float *c_attn_b = tensor_data(key);
     for (int t = 0; t < seq_len; t++)
+#ifdef BINARY
+        binary_attn_qkv(layer, qkv + t * 3 * n, ln1 + t * n);
+#else
         matmul(qkv + t * 3 * n, ln1 + t * n, c_attn_w, c_attn_b, n, 3 * n);
+#endif
 
     /* Self-attention with causal mask */
     int head_dim = n / GPT2_N_HEAD;  /* 64 */
@@ -226,7 +243,11 @@ static void transformer_layer(int layer, float *x, int seq_len) {
     sprintf(key, "h.%d.attn.c_proj.bias", layer);
     float *c_proj_b = tensor_data(key);
     for (int t = 0; t < seq_len; t++) {
+#ifdef BINARY
+        binary_attn_proj(layer, proj_tmp + t * n, attn_out + t * n);
+#else
         matmul(proj_tmp + t * n, attn_out + t * n, c_proj_w, c_proj_b, n, n);
+#endif
         for (int i = 0; i < n; i++) x[t * n + i] += proj_tmp[t * n + i];
     }
 
@@ -248,9 +269,17 @@ static void transformer_layer(int layer, float *x, int seq_len) {
     sprintf(key, "h.%d.mlp.c_proj.bias", layer);
     float *mlp_proj_b = tensor_data(key);
     for (int t = 0; t < seq_len; t++) {
+#ifdef BINARY
+        binary_mlp_fc(layer, fc_out + t * 4 * n, ln2 + t * n);
+#else
         matmul(fc_out + t * 4 * n, ln2 + t * n, fc_w, fc_b, n, 4 * n);
+#endif
         for (int i = 0; i < 4 * n; i++) fc_out[t * 4 * n + i] = gelu(fc_out[t * 4 * n + i]);
+#ifdef BINARY
+        binary_mlp_proj(layer, mlp_out + t * n, fc_out + t * 4 * n);
+#else
         matmul(mlp_out + t * n, fc_out + t * 4 * n, mlp_proj_w, mlp_proj_b, 4 * n, n);
+#endif
         for (int i = 0; i < n; i++) x[t * n + i] += mlp_out[t * n + i];
     }
 
@@ -449,6 +478,9 @@ int main(int argc, char **argv) {
 
     printf("[*] loading GPT-2 weights...\n");
     load_weights("/home/z/my-project/scripts/lal/gpt2_weights.bin");
+#ifdef BINARY
+    gpt2_binary_init("/home/z/my-project/scripts/lal/gpt2_weights.bin");
+#endif
     printf("[*] loading tokenizer...\n");
     load_tokenizer("/home/z/my-project/scripts/lal/gpt2_tokenizer.bin");
 
