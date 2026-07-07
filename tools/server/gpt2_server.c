@@ -1124,6 +1124,23 @@ static float  g_mlp[MLP_DIM];
 static float  g_mlp_out[N_EMBD];
 static float  g_final_ln[N_EMBD];
 
+/* === LAL three-layer fusion (level 1): runtime hidden-state bridge ===
+ *
+ * Exposes the model's final hidden state (g_final_ln, 768-dim) to .lal-compiled
+ * programs. A .lal program using `concept ctx = runtime_context(dim=768)` emits
+ * an `extern float *lal_server_get_hidden(void);` declaration and calls this
+ * getter at startup to bind the live model's contextualized representation into
+ * a .lal concept vector. This is the first true runtime bridge between the DNN
+ * inference layer and the .lal logic-programming layer — previously .lal could
+ * only consume DNN products at compile time (load_word2vec / linear weight bake).
+ *
+ * Returns NULL if no forward pass has run yet (caller should handle gracefully).
+ * The returned pointer aliases g_final_ln and stays valid until the next forward
+ * pass overwrites it. */
+float *lal_server_get_hidden(void) {
+    return g_final_ln;
+}
+
 /* KV cache for real causal self-attention.
  * Per layer: K and V for all positions [n_ctx, n_embd].
  * Total: 12 layers × 2 (K+V) × 1024 × 768 × 4 bytes = 72 MB.

@@ -55,6 +55,7 @@ from typing import List, Tuple, Optional, Union, Dict, Set
 class Concept:
     name: str
     vec: List[float]
+    is_runtime: bool = False  # runtime_context(): filled from DNN hidden state at startup
 
 @dataclass
 class Bound:
@@ -651,6 +652,21 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
+        # concept name = runtime_context(dim=N)   (live DNN hidden state, filled at startup)
+        # Three-layer fusion level 1: instead of baking a static vector at compile
+        # time, this concept is populated at runtime by calling lal_server_get_hidden()
+        # (defined in gpt2_server.c, returns the model's 768-dim final hidden state).
+        # The emitted C declares a mutable array + an extern getter, and main() fills
+        # it before any rule runs. This lets .lal memory recall operate on the model's
+        # *current* contextualized representation rather than a dead word vector.
+        m = re.match(r'concept\s+(\w+)\s*=\s*runtime_context\s*\(\s*(?:dim\s*=\s*(\d+))?\s*\)\s*$', line)
+        if m:
+            cname = m.group(1)
+            dim = int(m.group(2)) if m.group(2) else 768  # default: GPT-2 n_embd
+            concepts.append(Concept(cname, [0.0] * dim, is_runtime=True))
+            i += 1
+            continue
+
         # bound name = [...]
         m = re.match(r"bound\s+(\w+)\s*=\s*(\[.*\])\s*$", line)
         if m:
@@ -1231,10 +1247,28 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             concepts_needing_full.add(val_name)
 
     if concepts_needing_full:
+        runtime_concepts = [c for c in concepts if c.is_runtime and c.name in concepts_needing_full]
+        if runtime_concepts:
+            lines.append("/* === Runtime concept bridge (three-layer fusion level 1) ===")
+            lines.append(" * These concepts are filled at startup from the live DNN model's hidden state")
+            lines.append(" * via lal_server_get_hidden() (defined in gpt2_server.c). They are mutable")
+            lines.append(" * (non-const) and therefore bypass int8/int4 quantization. */")
+            lines.append("/* Weak fallback: when the .lal program is compiled standalone (not linked")
+            lines.append(" * against gpt2_server.c), the getter returns NULL and runtime concepts stay")
+            lines.append(" * zero-filled — graceful degradation. Link with gpt2_server.o to get the real")
+            lines.append(" * hidden state from a live GPT-2/Qwen forward pass. */")
+            lines.append("float *lal_server_get_hidden(void) __attribute__((weak));")
+            lines.append("float *lal_server_get_hidden(void) { return (float*)0; }")
+            for c in sorted(runtime_concepts, key=lambda x: x.name):
+                lines.append(f"static float concept_{c.name}[{len(c.vec)}] = {{0}};  /* filled at startup from live DNN */")
+            lines.append("")
         lines.append("/* === Concept vectors (full dim, used by VSA ops and MEMORY recall) ===")
         lines.append(" * Only concepts referenced by bind/bundle/permute/recall/unbounded-dot are emitted. */")
         for c in sorted(concepts, key=lambda x: x.name):
             if c.name not in concepts_needing_full:
+                continue
+            if c.is_runtime:
+                # Already emitted above as mutable float array (runtime-filled).
                 continue
             if _QUANTIZE_MODE == "int8":
                 q, scale = _quantize_int8(c.vec)
@@ -1435,6 +1469,17 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
         return "\n".join(lines)
 
     lines.append("int main(int argc, char** argv) {")
+    # Three-layer fusion level 1: bind runtime_context() concepts to the live
+    # DNN model's hidden state before any rule executes. If no model is linked
+    # (standalone .lal program without gpt2_server), the getter returns NULL and
+    # the concept stays zero-filled — graceful degradation.
+    runtime_concepts_for_main = [c for c in concepts if c.is_runtime]
+    if runtime_concepts_for_main:
+        lines.append("    /* === Bind runtime concepts to live DNN hidden state === */")
+        lines.append("    float *_lal_hidden = lal_server_get_hidden();")
+        for c in sorted(runtime_concepts_for_main, key=lambda x: x.name):
+            lines.append(f"    if (_lal_hidden) memcpy(concept_{c.name}, _lal_hidden, {len(c.vec)} * sizeof(float));")
+        lines.append("")
     lines.append(f"    float q[{vec_dim}];")
     lines.append(f"    if (argc < {vec_dim+1}) {{")
     lines.append(f'        fprintf(stderr, "usage: {rn} v0 v1 ... v{vec_dim-1}\\n");')
@@ -1572,6 +1617,11 @@ def _collect_concepts_needing_full(expr, relate_map, concept_names, needed, memo
         for _, e in expr.items:
             _collect_concepts_needing_full(e, relate_map, concept_names, needed, memory_map)
     if isinstance(expr, ERecall):
+        # The query concept needs its full array (recall computes similarity
+        # against all memory keys). This matters for runtime_context() concepts
+        # used as recall queries — without this, the concept array is not emitted.
+        if isinstance(expr.query, EVar) and expr.query.name in concept_names:
+            needed.add(expr.query.name)
         _collect_concepts_needing_full(expr.query, relate_map, concept_names, needed, memory_map)
         if expr.memory_name in memory_map:
             for key_name, val_name in memory_map[expr.memory_name].entries:
@@ -2512,22 +2562,24 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
         mem = memory_map[e.memory_name]
         query_vec = _resolve_vec_arg(e.query, concept_names, rule_params, var_types)
         # Soft lookup: weighted average of value vectors, weighted by max(0, dot(query, key))
-        # First compute weights.
+        # Use target_var as suffix to avoid redefinition when multiple recalls
+        # appear in the same rule (e.g. baseline + context recall in fusion demo).
+        s = target_var.replace("[", "_").replace("]", "")
         n_entries = len(mem.entries)
-        lines.append(f"    float __weights[{n_entries}] = {{0}};")
-        lines.append(f"    float __total_weight = 0.0f;")
+        lines.append(f"    float __weights_{s}[{n_entries}] = {{0}};")
+        lines.append(f"    float __total_weight_{s} = 0.0f;")
         for k, (key_name, val_name) in enumerate(mem.entries):
             # weight = max(0, dot(query, concept_key))
             terms = [f"{query_vec}[{d}] * concept_{key_name}[{d}]" for d in range(vec_dim)]
             dot_expr = " + ".join(terms)
-            lines.append(f"    __weights[{k}] = ({dot_expr});")
-            lines.append(f"    if (__weights[{k}] < 0.0f) __weights[{k}] = 0.0f;")
-            lines.append(f"    __total_weight += __weights[{k}];")
+            lines.append(f"    __weights_{s}[{k}] = ({dot_expr});")
+            lines.append(f"    if (__weights_{s}[{k}] < 0.0f) __weights_{s}[{k}] = 0.0f;")
+            lines.append(f"    __total_weight_{s} += __weights_{s}[{k}];")
         # If total_weight is near zero, leave target as zeros.
-        lines.append(f"    if (__total_weight > 1e-9f) {{")
+        lines.append(f"    if (__total_weight_{s} > 1e-9f) {{")
         for d in range(vec_dim):
-            terms = [f"__weights[{k}] * concept_{mem.entries[k][1]}[{d}]" for k in range(n_entries)]
-            lines.append(f"        {target_var}[{d}] = ({' + '.join(terms)}) / __total_weight;")
+            terms = [f"__weights_{s}[{k}] * concept_{mem.entries[k][1]}[{d}]" for k in range(n_entries)]
+            lines.append(f"        {target_var}[{d}] = ({' + '.join(terms)}) / __total_weight_{s};")
         lines.append(f"    }}")
         return
     if isinstance(e, ECall) and e.func == "if":

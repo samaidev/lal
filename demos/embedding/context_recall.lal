@@ -1,0 +1,77 @@
+# context_recall.lal — THREE-LAYER FUSION LEVEL 1 DEMO
+#
+# This is the first .lal program to consume a LIVE DNN model's hidden state at
+# runtime (rather than compile-time baked vectors). The `runtime_context()`
+# concept is filled at startup by lal_server_get_hidden() — when this program
+# is linked against gpt2_server.o, `ctx` becomes the model's 768-dim final
+# hidden state (its contextualized understanding of the current prompt).
+#
+# Task: recall the semantic category of the LIVE model context (ctx), classifying
+# it into royal / geo / animal / vehicle via centroid similarity. This proves
+# the .lal logic layer can reason over what the DNN is currently "thinking about".
+#
+# Standalone (no server linked): ctx is zero-filled (weak fallback), so the
+# context-derived recall degrades gracefully (all sims=0, argmax returns first).
+# Linked with gpt2_server.o: ctx is real, context recall is meaningful.
+#
+# Build (standalone, ctx=zeros):
+#   python3 compiler/lal.py demos/embedding/context_recall.lal main ctx_recall.c
+#   gcc -O2 -o ctx_recall ctx_recall.c -lm
+#   ./ctx_recall <768 floats>  # argv query (baseline only; ctx=zeros standalone)
+#
+# Build (linked with live server — the real fusion):
+#   gcc -O2 -c ctx_recall.c -o ctx_recall.o
+#   gcc -O2 -c tools/server/gpt2_server.c -o gpt2_server.o ... -lm
+#   # link ctx_recall.o + gpt2_server.o — strong lal_server_get_hidden() wins
+
+concept ctx = runtime_context(dim=768)
+
+# === Category centroids (3 representative words per category, 768-dim) ===
+concept royal_1   = load_word2vec("prebuilt/gpt2_embeddings.txt", "king")
+concept royal_2   = load_word2vec("prebuilt/gpt2_embeddings.txt", "queen")
+concept royal_3   = load_word2vec("prebuilt/gpt2_embeddings.txt", "prince")
+
+concept geo_1     = load_word2vec("prebuilt/gpt2_embeddings.txt", "Paris")
+concept geo_2     = load_word2vec("prebuilt/gpt2_embeddings.txt", "Rome")
+concept geo_3     = load_word2vec("prebuilt/gpt2_embeddings.txt", "Tokyo")
+
+concept animal_1  = load_word2vec("prebuilt/gpt2_embeddings.txt", "cat")
+concept animal_2  = load_word2vec("prebuilt/gpt2_embeddings.txt", "dog")
+concept animal_3  = load_word2vec("prebuilt/gpt2_embeddings.txt", "horse")
+
+concept vehicle_1 = load_word2vec("prebuilt/gpt2_embeddings.txt", "car")
+concept vehicle_2 = load_word2vec("prebuilt/gpt2_embeddings.txt", "truck")
+concept vehicle_3 = load_word2vec("prebuilt/gpt2_embeddings.txt", "bus")
+
+# === Fact memory: each centroid maps to itself (nearest-neighbor recall) ===
+memory facts = [
+    royal_1: royal_1,
+    royal_2: royal_2,
+    royal_3: royal_3,
+    geo_1: geo_1,
+    geo_2: geo_2,
+    geo_3: geo_3,
+    animal_1: animal_1,
+    animal_2: animal_2,
+    animal_3: animal_3,
+    vehicle_1: vehicle_1,
+    vehicle_2: vehicle_2,
+    vehicle_3: vehicle_3
+]
+
+relate sim(a, b) = dot(a, b)
+
+rule main(query):
+    # Baseline: recall using the argv-supplied query word
+    baseline = recall(facts, query)
+    # FUSION (level 1): recall using the live DNN model's context (ctx).
+    # ctx comes from lal_server_get_hidden(), not argv — this is the bridge.
+    context_cat = recall(facts, ctx)
+    # Classify which category the live context points to
+    best = argmax {
+        royal:   sim(context_cat, royal_1) + sim(context_cat, royal_2) + sim(context_cat, royal_3),
+        geo:     sim(context_cat, geo_1) + sim(context_cat, geo_2) + sim(context_cat, geo_3),
+        animal:  sim(context_cat, animal_1) + sim(context_cat, animal_2) + sim(context_cat, animal_3),
+        vehicle: sim(context_cat, vehicle_1) + sim(context_cat, vehicle_2) + sim(context_cat, vehicle_3)
+    }
+    output(best)
