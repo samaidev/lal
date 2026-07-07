@@ -151,14 +151,39 @@ TRAIN_TEXTS = [
     "The capital of Spain is Madrid.",
     "The capital of Russia is Moscow.",
     "The capital of China is Beijing.",
+    "The capital of Korea is Seoul.",
+    "The capital of India is New Delhi.",
     "Hello, how are you doing today?",
+    "Hello, how are you doing?",
+    "I am fine, thank you for asking.",
     "Once upon a time, there was a great kingdom.",
+    "Once upon a time, there was a beautiful princess.",
+    "Once upon a time, in a land far away.",
     "The weather today is sunny and warm.",
+    "The weather today is cold and rainy.",
     "Machine learning is a subset of artificial intelligence.",
+    "Deep learning uses neural networks with many layers.",
     "The quick brown fox jumps over the lazy dog.",
     "In the beginning, there was nothing but darkness.",
     "The world is a place of great wonder and beauty.",
-] * 20  # repeat to get more data
+    "Science is the pursuit of knowledge and understanding.",
+    "Mathematics is the language of the universe.",
+    "The sun rises in the east and sets in the west.",
+    "Water boils at 100 degrees Celsius at sea level.",
+    "The Earth revolves around the Sun.",
+    "Photosynthesis converts sunlight into chemical energy.",
+    "The speed of light is approximately 300000 kilometers per second.",
+    "I think, therefore I am.",
+    "To be, or not to be, that is the question.",
+    "All animals are equal, but some animals are more equal than others.",
+    "The only thing we have to fear is fear itself.",
+    "Ask not what your country can do for you.",
+    "I have a dream that one day this nation will rise up.",
+    "The unexamined life is not worth living.",
+    "Knowledge is power.",
+    "A journey of a thousand miles begins with a single step.",
+    "The best way to predict the future is to create it.",
+] * 10  # repeat to get more data
 
 
 def main():
@@ -217,7 +242,7 @@ def main():
     # Training loop
     SEQ_LEN = 32
     BATCH_SIZE = 1
-    N_STEPS = 200
+    N_STEPS = 300
     
     print(f"[*] training: {N_STEPS} steps, seq_len={SEQ_LEN}, batch={BATCH_SIZE}")
     print(f"[*] est. time: ~{N_STEPS * 15}s = {N_STEPS * 15 / 60:.0f} min")
