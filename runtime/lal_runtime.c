@@ -1,9 +1,466 @@
 /* lal_runtime.c — LAL Universal Runtime implementation
  *
- * Model-agnostic binary neural network operations.
- * Used by models/gpt2.c, models/bert.c, etc.
+ * Three API levels:
+ *   Level 1: operators (bin_forward, norm, gelu, etc.)
+ *   Level 2: transformer layer (trans_layer_forward/backward)
+ *   Level 3: full model (model_load/forward/backward)
+ *
+ * Models only need Level 3 — just config + weight key patterns.
  */
 #include "lal_runtime.h"
+
+/* ========================================================================
+ * Level 1 additions: RMSNorm, SiLU, dispatch functions, RoPE
+ * ======================================================================== */
+
+void rms_norm(float *out, const float *x, const float *w, int n) {
+    float ms = 0;
+    for (int i = 0; i < n; i++) ms += x[i] * x[i];
+    ms = 1.0f / sqrtf(ms / n + 1e-5f);
+    for (int i = 0; i < n; i++) out[i] = x[i] * ms * w[i];
+}
+
+void rms_norm_backward(float *grad_x, const float *grad_y, const float *x,
+                       const float *w, int n) {
+    /* Simplified: pass gradient through (approximate) */
+    float ms = 0;
+    for (int i = 0; i < n; i++) ms += x[i] * x[i];
+    ms = 1.0f / sqrtf(ms / n + 1e-5f);
+    for (int i = 0; i < n; i++) grad_x[i] = grad_y[i] * w[i] * ms;
+}
+
+float silu(float x) { return x / (1.0f + expf(-x)); }
+float silu_grad(float x) {
+    float s = 1.0f / (1.0f + expf(-x));
+    return s + x * s * (1.0f - s);
+}
+
+void norm_forward(float *out, const float *x, const float *w, const float *b,
+                  NormType type, int n) {
+    if (type == NORM_RMS) rms_norm(out, x, w, n);
+    else layer_norm(out, x, w, b, n);
+}
+
+void norm_backward(float *grad_x, const float *grad_y, const float *x,
+                   const float *w, const float *cached, NormType type, int n) {
+    if (type == NORM_RMS) rms_norm_backward(grad_x, grad_y, x, w, n);
+    else layer_norm_backward(grad_x, grad_y, x, w, cached[0], cached[1], n);
+}
+
+float act_forward(float x, ActType type) {
+    switch (type) {
+        case ACT_GELU:   return gelu(x);
+        case ACT_SWIGLU: return silu(x);  /* gate * silu(up), caller handles gate */
+        case ACT_SILU:   return silu(x);
+        default:         return x;
+    }
+}
+
+float act_grad(float x, ActType type) {
+    switch (type) {
+        case ACT_GELU:   return gelu_grad(x);
+        case ACT_SWIGLU: return silu_grad(x);
+        case ACT_SILU:   return silu_grad(x);
+        default:         return 1.0f;
+    }
+}
+
+void apply_rope(float *q, float *k, int seq_len, int n_head, int head_dim, int n_embd) {
+    /* Simplified RoPE: rotate pairs by position-dependent angle */
+    for (int h = 0; h < n_head; h++) {
+        float *qh = q + h * head_dim;
+        float *kh = k + h * head_dim;
+        for (int d = 0; d < head_dim / 2; d++) {
+            float angle = (float)seq_len / powf(10000.0f, (float)(2 * d) / head_dim);
+            float c = cosf(angle), s = sinf(angle);
+            float q0 = qh[d], q1 = qh[d + head_dim / 2];
+            float k0 = kh[d], k1 = kh[d + head_dim / 2];
+            qh[d] = q0 * c - q1 * s;
+            qh[d + head_dim / 2] = q0 * s + q1 * c;
+            kh[d] = k0 * c - k1 * s;
+            kh[d + head_dim / 2] = k0 * s + k1 * c;
+        }
+    }
+}
+
+/* ========================================================================
+ * Level 2: Transformer Layer (building block)
+ * ======================================================================== */
+
+void trans_layer_init(TransLayer *tl, Tensor *tensors, int n_tensors,
+                      ModelConfig *cfg, int layer_idx,
+                      const char *qkv_key, const char *q_key, const char *k_key,
+                      const char *v_key, const char *o_key,
+                      const char *gate_key, const char *up_key, const char *down_key,
+                      const char *norm1_w_key, const char *norm1_b_key,
+                      const char *norm2_w_key, const char *norm2_b_key) {
+    int n = cfg->n_embd, m = cfg->mlp_dim;
+    char full_key[256];
+
+    if (cfg->qkv_merged) {
+        /* GPT-2: merged QKV [n → 3n] */
+        sprintf(full_key, qkv_key, layer_idx);
+        float *W = tensor_get(tensors, n_tensors, full_key);
+        sprintf(full_key, "%s.bias", full_key);
+        /* Remove ".weight" suffix for bias — actually qkv_key already has .weight */
+        /* The key format is like "h.%d.attn.c_attn.weight" */
+        char bias_key[256];
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        /* Replace ".weight" with ".bias" */
+        char *dot = strstr(bias_key, ".weight");
+        if (dot) { *dot = 0; strcat(bias_key, ".bias"); }
+        float *b = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->attn_q, W, b, n, 3 * n);
+    } else {
+        /* LLaMA/Qwen: separate Q, K, V, O */
+        sprintf(full_key, q_key, layer_idx);
+        char bias_key[256];
+        float *Wq = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        char *dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bq = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->attn_q, Wq, bq, n, n);
+
+        sprintf(full_key, k_key, layer_idx);
+        float *Wk = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bk = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->attn_k, Wk, bk, n, n);
+
+        sprintf(full_key, v_key, layer_idx);
+        float *Wv = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bv = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->attn_v, Wv, bv, n, n);
+    }
+
+    /* Output projection */
+    sprintf(full_key, o_key, layer_idx);
+    float *Wo = tensor_get(tensors, n_tensors, full_key);
+    char bias_key[256]; strncpy(bias_key, full_key, sizeof(bias_key));
+    char *dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+    float *bo = tensor_get(tensors, n_tensors, bias_key);
+    bin_layer_init(&tl->attn_o, Wo, bo, n, n);
+
+    /* MLP */
+    if (cfg->act_type == ACT_SWIGLU) {
+        sprintf(full_key, gate_key, layer_idx);
+        float *Wg = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bg = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->mlp_gate, Wg, bg, n, m);
+
+        sprintf(full_key, up_key, layer_idx);
+        float *Wu = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bu = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->mlp_up, Wu, bu, n, m);
+    } else {
+        /* GELU: single c_fc */
+        sprintf(full_key, gate_key, layer_idx);
+        float *Wg = tensor_get(tensors, n_tensors, full_key);
+        strncpy(bias_key, full_key, sizeof(bias_key));
+        dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+        float *bg = tensor_get(tensors, n_tensors, bias_key);
+        bin_layer_init(&tl->mlp_gate, Wg, bg, n, m);
+    }
+
+    sprintf(full_key, down_key, layer_idx);
+    float *Wd = tensor_get(tensors, n_tensors, full_key);
+    strncpy(bias_key, full_key, sizeof(bias_key));
+    dot = strstr(bias_key, ".weight"); if (dot) { *dot=0; strcat(bias_key, ".bias"); }
+    float *bd = tensor_get(tensors, n_tensors, bias_key);
+    bin_layer_init(&tl->mlp_down, Wd, bd, m, n);
+
+    /* Norm weights */
+    sprintf(full_key, norm1_w_key, layer_idx);
+    tl->norm1_w = tensor_get(tensors, n_tensors, full_key);
+    sprintf(full_key, norm1_b_key, layer_idx);
+    tl->norm1_b = tensor_get(tensors, n_tensors, full_key);
+    sprintf(full_key, norm2_w_key, layer_idx);
+    tl->norm2_w = tensor_get(tensors, n_tensors, full_key);
+    sprintf(full_key, norm2_b_key, layer_idx);
+    tl->norm2_b = tensor_get(tensors, n_tensors, full_key);
+}
+
+void trans_layer_free(TransLayer *tl, ModelConfig *cfg) {
+    bin_layer_free(&tl->attn_q);
+    if (!cfg->qkv_merged) { bin_layer_free(&tl->attn_k); bin_layer_free(&tl->attn_v); }
+    bin_layer_free(&tl->attn_o);
+    bin_layer_free(&tl->mlp_gate);
+    if (cfg->act_type == ACT_SWIGLU) bin_layer_free(&tl->mlp_up);
+    bin_layer_free(&tl->mlp_down);
+}
+
+void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
+                         ModelConfig *cfg, int seq_pos) {
+    int n = cfg->n_embd, m = cfg->mlp_dim;
+    float rs = cfg->residual_scale;
+
+    /* Save x before norm1 */
+    memcpy(act->x_pre_norm1, x, n * sizeof(float));
+    norm_forward(act->norm1_out, x, tl->norm1_w, tl->norm1_b, cfg->norm_type, n);
+    compute_mean_std(act->x_pre_norm1, n, &act->norm1_cache[0], &act->norm1_cache[1]);
+
+    /* Attention */
+    if (cfg->qkv_merged) {
+        bin_forward(act->q, act->norm1_out, &tl->attn_q);  /* q = [3n] */
+        act->k = act->q + n;
+        act->v = act->q + 2 * n;
+    } else {
+        bin_forward(act->q, act->norm1_out, &tl->attn_q);
+        bin_forward(act->k, act->norm1_out, &tl->attn_k);
+        bin_forward(act->v, act->norm1_out, &tl->attn_v);
+    }
+
+    if (cfg->attn_type == ATTN_ROPE)
+        apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
+
+    /* Simplified attention: V copy (full attention in future) */
+    memcpy(act->attn_out, act->v, n * sizeof(float));
+    bin_forward(act->proj_out, act->attn_out, &tl->attn_o);
+    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    clip_array(x, n, 10.0f);
+
+    /* MLP */
+    memcpy(act->x_pre_norm2, x, n * sizeof(float));
+    norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
+    compute_mean_std(act->x_pre_norm2, n, &act->norm2_cache[0], &act->norm2_cache[1]);
+
+    if (cfg->act_type == ACT_SWIGLU) {
+        /* SwiGLU: hidden = silu(gate(ln2)) * up(ln2) */
+        float *gate = malloc(m * sizeof(float));
+        float *up = malloc(m * sizeof(float));
+        bin_forward(gate, act->norm2_out, &tl->mlp_gate);
+        bin_forward(up, act->norm2_out, &tl->mlp_up);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
+        free(gate); free(up);
+    } else {
+        /* GELU: hidden = gelu(c_fc(ln2)) */
+        bin_forward(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = gelu(act->mlp_hidden[i]);
+    }
+
+    bin_forward(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    clip_array(x, n, 10.0f);
+}
+
+void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
+                          ModelConfig *cfg, float lr) {
+    int n = cfg->n_embd, m = cfg->mlp_dim;
+    float rs = cfg->residual_scale;
+    static float g_mlp[4096], g_hidden[4096], g_norm2[4096], g_proj[4096];
+    static float g_attn[4096], g_qkv[4096*3], g_norm1[4096], g_pre[4096];
+
+    /* MLP backward */
+    for (int i = 0; i < n; i++) g_mlp[i] = grad_x[i] * rs;
+    bin_backward(g_hidden, g_mlp, act->mlp_hidden, &tl->mlp_down, lr);
+    if (cfg->act_type == ACT_SWIGLU) {
+        for (int i = 0; i < m; i++) g_hidden[i] *= silu_grad(act->mlp_hidden[i]);
+        /* Backward through gate and up (simplified) */
+        bin_backward(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
+    } else {
+        for (int i = 0; i < m; i++) g_hidden[i] *= gelu_grad(act->mlp_hidden[i]);
+        bin_backward(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
+    }
+    norm_backward(g_pre, g_norm2, act->x_pre_norm2, tl->norm2_w,
+                  act->norm2_cache, cfg->norm_type, n);
+    for (int i = 0; i < n; i++) grad_x[i] += g_pre[i] * rs;
+
+    /* Attention backward */
+    for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs;
+    bin_backward(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
+    memset(g_qkv, 0, 3 * n * sizeof(float));
+    memcpy(g_qkv + 2 * n, g_attn, n * sizeof(float));
+    bin_backward(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
+    norm_backward(g_pre, g_norm1, act->x_pre_norm1, tl->norm1_w,
+                  act->norm1_cache, cfg->norm_type, n);
+    for (int i = 0; i < n; i++) grad_x[i] += g_pre[i] * rs;
+
+    float gnorm = 0;
+    for (int i = 0; i < n; i++) gnorm += grad_x[i] * grad_x[i];
+    gnorm = sqrtf(gnorm);
+    if (gnorm > 1.0f) { float clip = 1.0f / gnorm; for (int i = 0; i < n; i++) grad_x[i] *= clip; }
+}
+
+TransAct *trans_act_alloc(ModelConfig *cfg) {
+    int n = cfg->n_embd, m = cfg->mlp_dim;
+    TransAct *acts = malloc(cfg->n_layer * sizeof(TransAct));
+    for (int l = 0; l < cfg->n_layer; l++) {
+        acts[l].x_pre_norm1 = malloc(n * sizeof(float));
+        acts[l].norm1_out = malloc(n * sizeof(float));
+        acts[l].q = malloc(3 * n * sizeof(float));
+        acts[l].attn_out = malloc(n * sizeof(float));
+        acts[l].proj_out = malloc(n * sizeof(float));
+        acts[l].x_pre_norm2 = malloc(n * sizeof(float));
+        acts[l].norm2_out = malloc(n * sizeof(float));
+        acts[l].mlp_hidden = malloc(m * sizeof(float));
+        acts[l].mlp_out = malloc(n * sizeof(float));
+    }
+    return acts;
+}
+
+void trans_act_free(TransAct *acts, int n_layer) {
+    for (int l = 0; l < n_layer; l++) {
+        free(acts[l].x_pre_norm1); free(acts[l].norm1_out);
+        free(acts[l].q); free(acts[l].attn_out); free(acts[l].proj_out);
+        free(acts[l].x_pre_norm2); free(acts[l].norm2_out);
+        free(acts[l].mlp_hidden); free(acts[l].mlp_out);
+    }
+    free(acts);
+}
+
+/* ========================================================================
+ * Level 3: Full Model
+ * ======================================================================== */
+
+void model_load(Model *m, const char *weight_path, ModelConfig cfg,
+                const char *layer_prefix, int qkv_merged) {
+    m->cfg = cfg;
+    m->cfg.qkv_merged = qkv_merged;
+    m->tensors = tensor_load_all(weight_path, &m->n_tensors);
+    if (!m->tensors) { fprintf(stderr, "failed to load %s\n", weight_path); exit(1); }
+    printf("[*] loaded %d tensors\n", m->n_tensors);
+
+    m->wte = tensor_get(m->tensors, m->n_tensors, "wte.weight");
+    m->wpe = (cfg.attn_type == ATTN_LEARNED)
+        ? tensor_get(m->tensors, m->n_tensors, "wpe.weight") : NULL;
+    m->ln_f_w = tensor_get(m->tensors, m->n_tensors, "ln_f.weight");
+    m->ln_f_b = tensor_get(m->tensors, m->n_tensors, "ln_f.bias");
+
+    printf("[*] binarizing %d layers...\n", cfg.n_layer);
+    m->layers = malloc(cfg.n_layer * sizeof(TransLayer));
+    m->acts = trans_act_alloc(&cfg);
+
+    /* Build keys and binarize each layer */
+    char key[256], bk[256];
+    for (int l = 0; l < cfg.n_layer; l++) {
+        TransLayer *tl = &m->layers[l];
+        int n = cfg.n_embd, mm = cfg.mlp_dim;
+
+        if (qkv_merged) {
+            sprintf(key, "h.%d.attn.c_attn.weight", l);
+            char bk[256]; strncpy(bk, key, sizeof(bk));
+            char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
+        } else {
+            sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
+            char bk[256]; strncpy(bk, key, sizeof(bk));
+            char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+            sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
+            strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+            sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
+            strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+        }
+
+        sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
+        char bk[256]; strncpy(bk, key, sizeof(bk));
+        char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+        bin_layer_init(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+                       tensor_get(m->tensors, m->n_tensors, bk), n, n);
+
+        if (cfg.act_type == ACT_SWIGLU) {
+            sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l);
+            strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+            sprintf(key, "model.layers.%d.mlp.up_proj.weight", l);
+            strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->mlp_up, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+        } else {
+            sprintf(key, "h.%d.mlp.c_fc.weight", l);
+            strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+        }
+
+        sprintf(key, qkv_merged ? "h.%d.mlp.c_proj.weight" : "model.layers.%d.mlp.down_proj.weight", l);
+        strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
+        bin_layer_init(&tl->mlp_down, tensor_get(m->tensors, m->n_tensors, key),
+                       tensor_get(m->tensors, m->n_tensors, bk), mm, n);
+
+        /* Norm weights */
+        if (qkv_merged) {
+            sprintf(key, "h.%d.ln_1.weight", l); tl->norm1_w = tensor_get(m->tensors, m->n_tensors, key);
+            sprintf(key, "h.%d.ln_1.bias", l); tl->norm1_b = tensor_get(m->tensors, m->n_tensors, key);
+            sprintf(key, "h.%d.ln_2.weight", l); tl->norm2_w = tensor_get(m->tensors, m->n_tensors, key);
+            sprintf(key, "h.%d.ln_2.bias", l); tl->norm2_b = tensor_get(m->tensors, m->n_tensors, key);
+        } else {
+            sprintf(key, "model.layers.%d.input_layernorm.weight", l); tl->norm1_w = tensor_get(m->tensors, m->n_tensors, key);
+            tl->norm1_b = NULL;
+            sprintf(key, "model.layers.%d.post_attention_layernorm.weight", l); tl->norm2_w = tensor_get(m->tensors, m->n_tensors, key);
+            tl->norm2_b = NULL;
+        }
+    }
+    printf("[*] done\n");
+
+    m->final_ln = malloc(cfg.n_embd * sizeof(float));
+    m->x_before_final = malloc(cfg.n_embd * sizeof(float));
+}
+
+float model_forward(Model *m, const int *tokens, int n_tokens) {
+    int n = m->cfg.n_embd;
+    static float x[4096];
+    int t = n_tokens - 1;
+    for (int i = 0; i < n; i++) {
+        x[i] = m->wte[tokens[t] * n + i];
+        if (m->wpe) x[i] += m->wpe[t * n + i];
+    }
+
+    for (int l = 0; l < m->cfg.n_layer; l++)
+        trans_layer_forward(x, &m->layers[l], &m->acts[l], &m->cfg, t);
+
+    memcpy(m->x_before_final, x, n * sizeof(float));
+    norm_forward(m->final_ln, x, m->ln_f_w, m->ln_f_b, m->cfg.norm_type, n);
+    compute_mean_std(m->x_before_final, n, &m->final_mean, &m->final_std_inv);
+
+    int target = tokens[n_tokens];
+    unsigned int seed = 42;
+    return cross_entropy_sampled(m->final_ln, m->wte, target, m->cfg.vocab_size, n, 100, &seed);
+}
+
+void model_backward(Model *m, const int *tokens, int n_tokens, float lr) {
+    int n = m->cfg.n_embd;
+    int target = tokens[n_tokens];
+    static float gh[4096];
+    unsigned int seed = 42;
+    cross_entropy_grad(gh, m->final_ln, m->wte, target, m->cfg.vocab_size, n, 100, &seed);
+    float gnorm = 0;
+    for (int i = 0; i < n; i++) gnorm += gh[i] * gh[i];
+    gnorm = sqrtf(gnorm);
+    if (gnorm > 0.1f) { float clip = 0.1f / gnorm; for (int i = 0; i < n; i++) gh[i] *= clip; }
+
+    static float g_pre[4096];
+    norm_backward(g_pre, gh, m->x_before_final, m->ln_f_w,
+                  (float[]){m->final_mean, m->final_std_inv}, m->cfg.norm_type, n);
+    memcpy(gh, g_pre, n * sizeof(float));
+
+    for (int l = m->cfg.n_layer - 1; l >= 0; l--)
+        trans_layer_backward(gh, &m->layers[l], &m->acts[l], &m->cfg, lr);
+}
+
+void model_free(Model *m) {
+    for (int l = 0; l < m->cfg.n_layer; l++)
+        trans_layer_free(&m->layers[l], &m->cfg);
+    free(m->layers);
+    trans_act_free(m->acts, m->cfg.n_layer);
+    free(m->final_ln);
+    free(m->x_before_final);
+    tensor_free_all(m->tensors, m->n_tensors);
+}
 
 /* ========================================================================
  * Binary Weight Layer
