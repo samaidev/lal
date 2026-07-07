@@ -47,3 +47,11 @@ dev.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Large model weight files (regenerate with export_gpt2_weights.py)
+scripts/lal/gpt2_weights.bin
+download/lal-mvp/src/gpt2_weights.bin
+scripts/lal/gpt2_model.bin
+*.bin
+
+download/lal-mvp/src/gpt2_mlp.c

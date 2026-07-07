@@ -73,9 +73,30 @@ class Memory:
 class Relate:
     name: str
     params: List[str]                # parameter names
-    op: str                          # "dot", "bind", "bundle", "permute"
+    op: str                          # "dot", "bind", "bundle", "permute", "vadd", "vsub", "linear"
     bound_name: Optional[str]        # for dot only
     permute_k: Optional[int]         # for permute only
+    # v0.7: linear layer (compiled weight matrix, with threshold pruning)
+    weight_data: Optional[List[List[float]]] = None   # [out_dim][in_dim], pruned
+    weight_bias: Optional[List[float]] = None         # [out_dim]
+    weight_threshold: Optional[float] = None          # pruning threshold used
+
+
+@dataclass
+class WeightLayer:
+    """v0.7: A compiled weight matrix from a trained model (e.g. GPT-2).
+    The matrix is loaded at compile time, pruned by threshold, and emitted
+    as a sparse specialized linear layer — NOT a generic matmul."""
+    name: str
+    path: str                       # path to model file
+    key: str                        # weight key in the model (e.g. "h.0.mlp.c_fc")
+    threshold: float                # pruning threshold: |w| < threshold → drop
+    in_dim: int
+    out_dim: int
+    # Filled in at parse time:
+    weight: Optional[List[List[float]]] = None  # [out_dim][in_dim], pruned (zeros for dropped)
+    bias: Optional[List[float]] = None          # [out_dim]
+    n_kept: int = 0                              # number of non-zero connections after pruning
 
 @dataclass
 class Rule:
@@ -155,6 +176,82 @@ def _parse_int_list(s: str) -> List[int]:
 _EMBEDDING_CACHE: Dict[str, Dict[str, List[float]]] = {}
 # Directory of the .lal source file being parsed (for resolving relative embedding paths).
 _CURRENT_SOURCE_DIR: Optional[str] = None
+# Weight file cache: path → dict of key → (shape, flat_data)
+_WEIGHT_FILE_CACHE: Dict[str, Dict[str, Tuple[List[int], List[float]]]] = {}
+
+
+def _load_weight_file(path: str) -> Dict[str, Tuple[List[int], 'np.ndarray']]:
+    """Load a GPW2-format weight file. Returns dict: key → (shape, numpy_array).
+    Uses numpy for memory efficiency (500MB file → 500MB numpy, not 2GB Python lists)."""
+    if not os.path.isabs(path):
+        candidates = [path]
+        if _CURRENT_SOURCE_DIR:
+            candidates.append(os.path.join(_CURRENT_SOURCE_DIR, path))
+        resolved = None
+        for c in candidates:
+            if os.path.exists(c):
+                resolved = c
+                break
+        if resolved is None:
+            resolved = os.path.abspath(path)
+        path = resolved
+
+    if path not in _WEIGHT_FILE_CACHE:
+        import struct
+        import numpy as np
+        weights: Dict[str, Tuple[List[int], 'np.ndarray']] = {}
+        with open(path, "rb") as f:
+            magic = f.read(4)
+            if magic != b"GPW2":
+                raise ParseError(f"not a GPW2 weight file: {path}")
+            (n_tensors,) = struct.unpack("I", f.read(4))
+            for _ in range(n_tensors):
+                (key_len,) = struct.unpack("I", f.read(4))
+                key = f.read(key_len).decode("utf-8")
+                (ndim,) = struct.unpack("I", f.read(4))
+                shape = [struct.unpack("I", f.read(4))[0] for _ in range(ndim)]
+                n_elems = 1
+                for d in shape:
+                    n_elems *= d
+                # Read raw bytes into numpy array (memory-efficient)
+                raw = f.read(4 * n_elems)
+                arr = np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
+                weights[key] = (shape, arr)
+        _WEIGHT_FILE_CACHE[path] = weights
+    return _WEIGHT_FILE_CACHE[path]
+
+
+def _load_weight_matrix(path: str, key: str, threshold: float) -> Tuple[List[List[float]], List[float], int]:
+    """Load a 2D weight matrix [in, out] from a GPW2 file, prune by threshold,
+    and return (pruned_weight[out][in], bias[out], n_kept).
+    Uses numpy for efficient loading and pruning.
+    """
+    import numpy as np
+    weights = _load_weight_file(path)
+    if key not in weights:
+        raise ParseError(f"weight key {key!r} not found in {path}")
+    shape, arr = weights[key]  # arr is [in, out] numpy array
+    if len(shape) != 2:
+        raise ParseError(f"weight {key} has shape {shape}, expected 2D")
+    in_dim, out_dim = shape
+
+    # Prune: zero out entries below threshold
+    arr_pruned = arr.copy()
+    arr_pruned[np.abs(arr_pruned) < threshold] = 0.0
+
+    # Transpose to [out, in] and convert to nested list for the compiler
+    w_t = arr_pruned.T.tolist()  # [out_dim][in_dim]
+    n_kept = int(np.count_nonzero(arr_pruned))
+
+    # Try to load bias: key.replace(".weight", ".bias")
+    bias_key = key.replace(".weight", ".bias")
+    bias = [0.0] * out_dim
+    if bias_key in weights:
+        bshape, barr = weights[bias_key]
+        if len(bshape) == 1 and bshape[0] == out_dim:
+            bias = barr.tolist()
+
+    return w_t, bias, n_kept
 
 def _load_word2vec(path: str, word: str, dim_hint: Optional[int] = None) -> Optional[List[float]]:
     """Load a word vector from a word2vec/GloVe text-format embedding file.
@@ -578,6 +675,34 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
+        # relate name(x) = linear(x, "weights.bin", "h.0.mlp.c_fc", threshold=0.1)
+        # v0.7: compiled linear layer — loads weight at compile time, prunes by threshold
+        m = re.match(r'relate\s+(\w+)\s*\(([^)]*)\)\s*=\s*linear\(\s*(\w+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*threshold\s*=\s*([0-9.eE+-]+)\s*\)\s*$', line)
+        if m:
+            name = m.group(1)
+            params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+            x_arg = m.group(3)
+            path = m.group(4)
+            wkey = m.group(5)
+            threshold = float(m.group(6))
+            if len(params) != 1 or params[0] != x_arg:
+                raise ParseError(f"relate linear param must match arg: {line!r}")
+            # Load and prune the weight now (compile time).
+            # Auto-append ".weight" if the key doesn't have it.
+            if not wkey.endswith(".weight") and not wkey.endswith(".bias"):
+                wkey_full = wkey + ".weight"
+            else:
+                wkey_full = wkey
+            w_t, bias, n_kept = _load_weight_matrix(path, wkey_full, threshold)
+            out_dim = len(w_t)
+            in_dim = len(w_t[0]) if out_dim > 0 else 0
+            relates.append(Relate(name, params, "linear", None, None,
+                                  weight_data=w_t, weight_bias=bias, weight_threshold=threshold))
+            print(f"[*] linear {name}: {wkey} [{in_dim}→{out_dim}], threshold={threshold}, "
+                  f"kept {n_kept}/{in_dim*out_dim} ({100*n_kept/(in_dim*out_dim):.1f}%)", flush=True)
+            i += 1
+            continue
+
         # relate name(a) = permute(a, k)
         m = re.match(r"relate\s+(\w+)\s*\(([^)]*)\)\s*=\s*permute\(([^)]*)\)\s*$", line)
         if m:
@@ -785,6 +910,24 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
             if r.op == "vsub":
                 a, b = arg_vals[0], arg_vals[1]
                 return [a[i] - b[i] for i in range(len(a))]
+            if r.op == "linear":
+                # Compiled linear layer: y[j] = sum(x[i] * w[j][i]) + bias[j]
+                # w is already pruned (zeros for dropped connections)
+                x = arg_vals[0]
+                w = r.weight_data
+                bias = r.weight_bias
+                out_dim = len(w)
+                in_dim = len(w[0]) if out_dim > 0 else 0
+                y = []
+                for j in range(out_dim):
+                    s = bias[j] if bias else 0.0
+                    wj = w[j]
+                    for i in range(in_dim):
+                        wi = wj[i]
+                        if wi != 0.0:  # skip pruned
+                            s += x[i] * wi
+                    y.append(s)
+                return y
             raise RuntimeError(f"unknown relate op: {r.op}")
         if isinstance(e, ERuleCall):
             # Recursively run the called rule with the arg as input
@@ -1182,7 +1325,7 @@ def _collect_concepts_needing_full(expr, relate_map, concept_names, needed, memo
     """Collect concept names that need full-dim arrays (used by VSA ops, vadd/vsub, recall, or unbounded dot)."""
     if isinstance(expr, ERelateCall):
         r = relate_map[expr.name]
-        if r.op in ("bind", "bundle", "permute", "vadd", "vsub"):
+        if r.op in ("bind", "bundle", "permute", "vadd", "vsub", "linear"):
             for a in expr.args:
                 if isinstance(a, EVar) and a.name in concept_names:
                     needed.add(a.name)
@@ -1627,7 +1770,14 @@ def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, c
                            or stmt.expr.name in concept_names))
         is_vec = _expr_is_vector(stmt.expr, relate_map, rule_map) or is_vec_var
         if is_vec:
-            lines.append(f"    float {stmt.var}[{vec_dim}] = {{0}};")
+            # v0.7: linear layers may have out_dim != vec_dim. Determine the
+            # output dimension and declare the array accordingly.
+            out_dim = vec_dim
+            if isinstance(stmt.expr, ERelateCall):
+                r = relate_map[stmt.expr.name]
+                if r.op == "linear" and r.weight_data:
+                    out_dim = len(r.weight_data)
+            lines.append(f"    float {stmt.var}[{out_dim}] = {{0}};")
             _emit_vector_expr(lines, stmt.var, stmt.expr, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rule.params, var_types, max_recursion_depth, vec_dim)
             var_types[stmt.var] = "vector"
         else:
@@ -1654,7 +1804,7 @@ def _expr_is_vector(expr, relate_map, rule_map):
     """Does this expression produce a vector (vs a scalar)?"""
     if isinstance(expr, ERelateCall):
         r = relate_map[expr.name]
-        return r.op in ("bind", "bundle", "permute", "vadd", "vsub")
+        return r.op in ("bind", "bundle", "permute", "vadd", "vsub", "linear")
     if isinstance(expr, ERuleCall):
         return True  # rule calls return vectors
     if isinstance(expr, ERecall):
@@ -1842,6 +1992,56 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
             b_vec = _resolve_vec_arg(b, concept_names, rule_params, var_types)
             for i in range(vec_dim):
                 lines.append(f"    {target_var}[{i}] = {a_vec}[{i}] - {b_vec}[{i}];")
+            return
+        if r.op == "linear":
+            # v0.7: compiled linear layer. Emit the pruned weight as a static
+            # sparse array (CSR format: values + indices + row_ptrs), then a
+            # loop that only iterates over non-zero entries. This is the core
+            # "logic pruning" — weak connections are gone at compile time.
+            a = e.args[0]
+            a_vec = _resolve_vec_arg(a, concept_names, rule_params, var_types)
+            w = r.weight_data  # [out_dim][in_dim], pruned (zeros for dropped)
+            bias = r.weight_bias  # [out_dim]
+            out_dim = len(w)
+            in_dim = len(w[0]) if out_dim > 0 else 0
+
+            # Build CSR representation
+            values = []
+            col_idx = []
+            row_ptr = [0]
+            for j in range(out_dim):
+                wj = w[j]
+                for i in range(in_dim):
+                    if wj[i] != 0.0:
+                        values.append(wj[i])
+                        col_idx.append(i)
+                row_ptr.append(len(values))
+            nnz = len(values)
+            prune_pct = 100.0 * (1.0 - nnz / (out_dim * in_dim)) if out_dim * in_dim > 0 else 0.0
+
+            # Emit static arrays (only once per rule — use a unique prefix)
+            arr_prefix = f"_lal_{r.name}_{id(r) & 0xFFFFFF:x}"
+            lines.append(f"    /* linear {r.name}: {out_dim} outputs, {nnz}/{out_dim*in_dim} kept ({prune_pct:.1f}% pruned) */")
+            # Emit the CSR arrays as static const at function scope
+            if nnz > 0:
+                vals_str = ", ".join(f"{v:.6f}f" for v in values)
+                cols_str = ", ".join(str(c) for c in col_idx)
+                rows_str = ", ".join(str(rp) for rp in row_ptr)
+                lines.append(f"    static const float {arr_prefix}_vals[{nnz}] = {{{vals_str}}};")
+                lines.append(f"    static const int {arr_prefix}_cols[{nnz}] = {{{cols_str}}};")
+                lines.append(f"    static const int {arr_prefix}_rowptr[{out_dim+1}] = {{{rows_str}}};")
+                # Emit the sparse matmul loop
+                lines.append(f"    for (int j = 0; j < {out_dim}; j++) {{")
+                lines.append(f"        float s = {bias[j]:.6f}f;")
+                lines.append(f"        for (int k = {arr_prefix}_rowptr[j]; k < {arr_prefix}_rowptr[j+1]; k++) {{")
+                lines.append(f"            s += {a_vec}[{arr_prefix}_cols[k]] * {arr_prefix}_vals[k];")
+                lines.append(f"        }}")
+                lines.append(f"        {target_var}[j] = s;")
+                lines.append(f"    }}")
+            else:
+                # Fully pruned — just bias
+                for j in range(out_dim):
+                    lines.append(f"    {target_var}[{j}] = {bias[j]:.6f}f;  /* fully pruned */")
             return
         raise RuntimeError(f"relate op {r.op} is not vector")
     if isinstance(e, ERuleCall):
