@@ -590,9 +590,9 @@ static void lm_head_parallel(float *logits, const float *x, const float *wte,
     LmHeadJob jobs[8];
     if (n_threads > 8) n_threads = 8;
 
-    /* Set 256 KB stack per thread (ARM Android default is too small) */
+    /* Set 1 MB stack per thread (ARM Android default ~8 KB is too small) */
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256 * 1024);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
 
     int chunk = (vocab + n_threads - 1) / n_threads;
     for (int t = 0; t < n_threads; t++) {
