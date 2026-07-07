@@ -10,6 +10,7 @@
 #include <time.h>
 #include <string.h>
 #include "../runtime/lal_runtime.h"
+#include "../scripts/train_data.h"  /* Pre-tokenized corpus from LAL-Dev-B */
 
 /* === GPT-2 config — this is the ONLY model-specific code === */
 static ModelConfig gpt2_config(void) {
@@ -141,17 +142,18 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("[*] load: %.1fs\n", (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    printf("[*] training...\n");
+    printf("[*] training with %d pre-tokenized sentences...\n", (int)(sizeof(train_data)/sizeof(train_data[0])));
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    int n_train = sizeof(train_data) / sizeof(train_data[0]);
     for (int step = 0; step < n_steps; step++) {
-        int ti = step % 10;
-        int tokens[16]; int n = encode(TEXTS[ti], tokens);
-        int target = tokens[n-1];
-        int tt[16]; memcpy(tt, tokens, (n-1)*sizeof(int)); tt[n-1] = target;
+        int ti = step % n_train;
+        int n = train_data[ti].n;
+        int target = train_data[ti].ids[n-1];
+        int tt[32]; memcpy(tt, train_data[ti].ids, n * sizeof(int));
         float loss = model_forward(&model, tt, n-1);
         model_backward(&model, tt, n-1, lr);
-        if (step % 20 == 0)
-            printf("  step %4d  loss=%.4f  \"%s\"\n", step, loss, TEXTS[ti]);
+        if (step % 50 == 0)
+            printf("  step %4d  loss=%.4f  (sentence %d, %d tokens)\n", step, loss, ti, n);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
