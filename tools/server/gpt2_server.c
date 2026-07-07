@@ -225,6 +225,7 @@ typedef struct {
 } BinGPT2Layer;
 static BinGPT2Layer g_bin_layers[N_LAYER];
 static int g_binary_mode = 0;   /* set by --binary flag */
+static int g_use_bwn = 0;       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
 
 /* Mixed-precision mode (--mixed-precision, implies --binary): keep the first
  * and last transformer layers in float, binarize only the middle N_LAYER-2.
@@ -367,7 +368,60 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
 
     /* Binary (±1) path — original XNOR-Net. */
     uint64_t *xb;
-    uint64_t x_bits[16];  /* stack alloc for small in_dim (768 → 12 words) */
+    /* BWN mode (default): float x @ sign(w) — training-consistent, no activation binarization.
+     * This is the correct BWN (Binary Weight Network) computation:
+     *   y[j] = sum_i x[i] * sign(w[j,i]) * alpha[j] + bias[j]
+     * We pack sign(w) as bits and use popcount to count matching signs,
+     * but x stays float. The dot product is:
+     *   dot = sum_i x[i] * sign(w[i]) = sum_{x>0,w>0} x[i] - sum_{x>0,w<0} x[i] + ...
+     *
+     * Simplification: we can't use XNOR+popcount with float x (that requires
+     * binarized x). Instead, use the w_float weights if available, or unpack
+     * sign bits to {-1,+1} and do a float dot product.
+     *
+     * For maximum speed with correct BWN, we use the packed wbits to get
+     * sign(w) via bit extraction, then dot with float x. But that's slow.
+     * The fastest correct approach: store sign(w) as float {-1,+1} array
+     * and use SIMD float dot product. We do this when --bwn flag is set. */
+    if (g_use_bwn) {
+        /* BWN: float dot product with sign(w) unpacked from bits.
+         * Slower than XNOR but training-consistent (no activation binarization).
+         * 8x unrolled for auto-vectorization. */
+        for (int j = 0; j < bl->out_dim; j++) {
+            const uint64_t *wb = bl->wbits + (size_t)j * n_words;
+            float dot = 0.0f;
+            for (int wi = 0; wi < n_words; wi++) {
+                uint64_t w = wb[wi];
+                int base = wi * 64;
+                for (int bi = 0; bi < 8; bi++) {
+                    int idx = base + bi * 8;
+                    if (idx + 7 < bl->in_dim) {
+                        /* Unpack 8 sign bits and dot with 8 float x values */
+                        dot += x[idx+0] * ((w >> (bi*8+0)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+1] * ((w >> (bi*8+1)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+2] * ((w >> (bi*8+2)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+3] * ((w >> (bi*8+3)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+4] * ((w >> (bi*8+4)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+5] * ((w >> (bi*8+5)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+6] * ((w >> (bi*8+6)) & 1 ? 1.0f : -1.0f);
+                        dot += x[idx+7] * ((w >> (bi*8+7)) & 1 ? 1.0f : -1.0f);
+                    } else {
+                        for (int k = 0; k < 8; k++) {
+                            int i = idx + k;
+                            if (i < bl->in_dim)
+                                dot += x[i] * ((w >> (bi*8+k)) & 1 ? 1.0f : -1.0f);
+                        }
+                    }
+                }
+            }
+            y[j] = dot * bl->alpha[j] / bl->in_dim + bl->bias[j];
+        }
+        return;
+    }
+
+    /* BNN mode (legacy): binarize x to sign(x), use XNOR+popcount.
+     * Faster (64x via popcount) but training-inconsistent. */
+    uint64_t x_bits[16];
     if (n_words <= 16) {
         xb = x_bits;
     } else {
@@ -375,14 +429,13 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     }
     binarize_input(x, xb, bl->in_dim, n_words);
 
-    float x_scale = mean_abs;  /* mean over all in_dim elements */
+    float x_scale = mean_abs;
     for (int j = 0; j < bl->out_dim; j++) {
         const uint64_t *wb = bl->wbits + (size_t)j * n_words;
         int pc = 0;
         for (int wi = 0; wi < n_words; wi++) {
             pc += __builtin_popcountll(~(xb[wi] ^ wb[wi]));
         }
-        /* XNOR-Net: dot ≈ mean(|x|) * alpha * (2*pc - N) */
         y[j] = x_scale * bl->alpha[j] * (float)(2 * pc - bl->in_dim) + bl->bias[j];
     }
     if (n_words > 16) free(xb);
@@ -2078,6 +2131,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--dflash") == 0) {
             g_use_dflash = 1;
             g_use_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
+        } else if (strcmp(argv[i], "--bwn") == 0) {
+            g_use_bwn = 1;
         } else if (strcmp(argv[i], "--turboquant") == 0) {
             g_use_turboquant = 1;
         } else if (strcmp(argv[i], "--lm-head-int8") == 0) {
