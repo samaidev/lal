@@ -1,57 +1,59 @@
 # Build artifacts
-download/lal-mvp/build/
+build/
 *.o
 *.so
 *.exe
 
-# Generated C files (regenerated from .lal by lalc)
-download/lal-mvp/src/demo.c
-download/lal-mvp/src/syllogism.c
-download/lal-mvp/src/vsa_ops.c
-download/lal-mvp/src/embed_demo.c
-download/lal-mvp/src/embed_demo_q8.c
-download/lal-mvp/src/recursion_demo.c
-download/lal-mvp/src/graph_traversal.c
-download/lal-mvp/src/guard_demo.c
-download/lal-mvp/src/pattern_match_demo.c
-download/lal-mvp/src/sentiment_768d.c
-download/lal-mvp/src/gpt2_demo.c
-download/lal-mvp/src/gpt2_analogy.c
-download/lal-mvp/src/embed_300d.c
-download/lal-mvp/src/embed_300d_q8.c
-download/lal-mvp/src/embed_300d_q4.c
-download/lal-mvp/src/embed_768d.c
-download/lal-mvp/src/embed_768d_q8.c
-download/lal-mvp/src/embed_768d_q4.c
+# Generated C files
+*.c.gen
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Large binary files (regenerate with tools/)
+*.bin
+gpt2_weights.bin
+gpt2_binary_finetuned.bin
+gpt2_tokenizer.bin
+gpt2_model.bin
 
 # Environment
 .env
 
-# Skills system (not part of this project)
-skills/
-
-# Upload dir
-upload/
-
-# Node / Next.js
+# Old Next.js / web playground (removed)
 node_modules/
 .next/
 dev.log
 *.log
 .zscripts/
+Caddyfile
+package.json
+package-lock.json
+bun.lock
+tsconfig.json
+next.config.ts
+next-env.d.ts
+postcss.config.mjs
+tailwind.config.ts
+eslint.config.mjs
+components.json
+postcss.config.mjs
+
+# Skills / upload (not part of this project)
+skills/
+upload/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Large model weight files (regenerate with export_gpt2_weights.py)
-scripts/lal/gpt2_weights.bin
-download/lal-mvp/src/gpt2_weights.bin
-scripts/lal/gpt2_model.bin
-*.bin
-
-download/lal-mvp/src/gpt2_mlp.c
+# Old directories (superseded by new structure)
+scripts/
+download/
+src/
+mini-services/
+examples/
+prisma/
+public/
