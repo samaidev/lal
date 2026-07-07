@@ -221,10 +221,10 @@ def _load_weight_file(path: str) -> Dict[str, Tuple[List[int], 'np.ndarray']]:
     return _WEIGHT_FILE_CACHE[path]
 
 
-def _load_weight_matrix(path: str, key: str, threshold: float) -> Tuple[List[List[float]], List[float], int]:
+def _load_weight_matrix(path: str, key: str, threshold: float, binarize: bool = False) -> Tuple[List[List[float]], List[float], int]:
     """Load a 2D weight matrix [in, out] from a GPW2 file, prune by threshold,
     and return (pruned_weight[out][in], bias[out], n_kept).
-    Uses numpy for efficient loading and pruning.
+    If binarize=True, skip pruning (all weights kept, to be binarized later).
     """
     import numpy as np
     weights = _load_weight_file(path)
@@ -235,15 +235,20 @@ def _load_weight_matrix(path: str, key: str, threshold: float) -> Tuple[List[Lis
         raise ParseError(f"weight {key} has shape {shape}, expected 2D")
     in_dim, out_dim = shape
 
-    # Prune: zero out entries below threshold
-    arr_pruned = arr.copy()
-    arr_pruned[np.abs(arr_pruned) < threshold] = 0.0
+    if binarize:
+        # In binary mode, keep all weights (no threshold pruning). The binarization
+        # itself is the compression — 32x smaller (1 bit vs 32 bit float).
+        arr_pruned = arr
+    else:
+        # Prune: zero out entries below threshold
+        arr_pruned = arr.copy()
+        arr_pruned[np.abs(arr_pruned) < threshold] = 0.0
 
     # Transpose to [out, in] and convert to nested list for the compiler
     w_t = arr_pruned.T.tolist()  # [out_dim][in_dim]
     n_kept = int(np.count_nonzero(arr_pruned))
 
-    # Try to load bias: key.replace(".weight", ".bias")
+    # Try to load bias
     bias_key = key.replace(".weight", ".bias")
     bias = [0.0] * out_dim
     if bias_key in weights:
@@ -693,13 +698,16 @@ def parse(source: str, source_path: Optional[str] = None):
                 wkey_full = wkey + ".weight"
             else:
                 wkey_full = wkey
-            w_t, bias, n_kept = _load_weight_matrix(path, wkey_full, threshold)
+            w_t, bias, n_kept = _load_weight_matrix(path, wkey_full, threshold, binarize=_BINARY_MODE)
             out_dim = len(w_t)
             in_dim = len(w_t[0]) if out_dim > 0 else 0
             relates.append(Relate(name, params, "linear", None, None,
                                   weight_data=w_t, weight_bias=bias, weight_threshold=threshold))
-            print(f"[*] linear {name}: {wkey} [{in_dim}→{out_dim}], threshold={threshold}, "
-                  f"kept {n_kept}/{in_dim*out_dim} ({100*n_kept/(in_dim*out_dim):.1f}%)", flush=True)
+            if _BINARY_MODE:
+                print(f"[*] linear {name}: {wkey} [{in_dim}→{out_dim}], BINARY mode (1 bit/weight, 32x compression)", flush=True)
+            else:
+                print(f"[*] linear {name}: {wkey} [{in_dim}→{out_dim}], threshold={threshold}, "
+                      f"kept {n_kept}/{in_dim*out_dim} ({100*n_kept/(in_dim*out_dim):.1f}%)", flush=True)
             i += 1
             continue
 
@@ -911,23 +919,42 @@ def run_reference(concepts, bounds, memories, relates, rules, rule_name, input_v
                 a, b = arg_vals[0], arg_vals[1]
                 return [a[i] - b[i] for i in range(len(a))]
             if r.op == "linear":
-                # Compiled linear layer: y[j] = sum(x[i] * w[j][i]) + bias[j]
-                # w is already pruned (zeros for dropped connections)
                 x = arg_vals[0]
                 w = r.weight_data
                 bias = r.weight_bias
                 out_dim = len(w)
                 in_dim = len(w[0]) if out_dim > 0 else 0
-                y = []
-                for j in range(out_dim):
-                    s = bias[j] if bias else 0.0
-                    wj = w[j]
-                    for i in range(in_dim):
-                        wi = wj[i]
-                        if wi != 0.0:  # skip pruned
-                            s += x[i] * wi
-                    y.append(s)
-                return y
+                if _BINARY_MODE:
+                    # Binary mode: binarize weights to {-1,+1}, use sign-based dot
+                    y = []
+                    for j in range(out_dim):
+                        wj = w[j]
+                        # alpha = mean(|w|) for non-zero
+                        abs_vals = [abs(v) for v in wj if v != 0.0]
+                        alpha = sum(abs_vals)/len(abs_vals) if abs_vals else 0.0
+                        # Binary dot: sum(sign(w[j][i]) * sign(x[i]))
+                        pc = 0
+                        for i in range(in_dim):
+                            wi_sign = 1 if wj[i] > 0 else (-1 if wj[i] < 0 else 0)
+                            xi_sign = 1 if x[i] > 0 else (-1 if x[i] < 0 else 0)
+                            if wi_sign == xi_sign and wi_sign != 0:
+                                pc += 1
+                            elif wi_sign != 0 and xi_sign != 0:
+                                pc -= 1
+                        dot = pc * alpha
+                        y.append(dot + (bias[j] if bias else 0.0))
+                    return y
+                else:
+                    y = []
+                    for j in range(out_dim):
+                        s = bias[j] if bias else 0.0
+                        wj = w[j]
+                        for i in range(in_dim):
+                            wi = wj[i]
+                            if wi != 0.0:
+                                s += x[i] * wi
+                        y.append(s)
+                    return y
             raise RuntimeError(f"unknown relate op: {r.op}")
         if isinstance(e, ERuleCall):
             # Recursively run the called rule with the arg as input
@@ -1005,18 +1032,25 @@ _SIMD_HELPERS_NEEDED: Set[int] = set()
 _QUANTIZE_MODE = None
 # v0.8: parallel emission mode — emit wide SIMD for linear layers
 _PARALLEL_MODE = False
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False) -> str:
+# v0.9: binary mode — binarize weights to {-1,+1}, use XNOR+popcount dot product
+# This is the "bitplane parallel" approach: 64 multiplications per popcount instruction.
+_BINARY_MODE = False
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False) -> str:
     """Compile a rule (and any rules it calls) to specialized C.
 
     quantize: None for float32, or "int8"/"int4" for quantized concept data.
     parallel: if True, emit wide SIMD (AVX2/NEON) for linear layers — 8 outputs
               per instruction instead of serial loop. This realizes the "parallel
               logic" model: all output dimensions computed simultaneously.
+    binarize: if True, binarize weights to {-1,+1} and use XNOR+popcount dot
+              products. This is the "bitplane parallel" approach: 64 multiplications
+              per popcount instruction — true bit-level parallelism.
     """
-    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE
+    global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE, _BINARY_MODE
     _SIMD_HELPERS_NEEDED = set()  # reset for this compilation
     _QUANTIZE_MODE = quantize
     _PARALLEL_MODE = parallel
+    _BINARY_MODE = binarize
 
     concept_map = {c.name: c.vec for c in concepts}
     bound_map = {b.name: b.dims for b in bounds}
@@ -1951,6 +1985,93 @@ def _emit_scalar_expr(e, concept_map, bound_map, memory_map, relate_map, rule_ma
     raise RuntimeError(f"can't emit scalar: {e}")
 
 
+def _emit_linear_binary(lines, target_var, r, a_vec, out_dim, in_dim, bias):
+    """Binary linear layer: weights binarized to {-1,+1}, dot product via XNOR+popcount.
+
+    This is the "bitplane parallel" approach (v0.9). Each weight is stored as
+    a single bit (1=positive, 0=negative), packed 64 per uint64. The dot product
+    becomes: dot = (2 * popcount(XNOR(x_bits, w_bits)) - N) * alpha
+
+    where alpha is a per-output scale factor (mean of |weights|).
+
+    Key: ONE popcount instruction processes 64 multiplications. This is true
+    bit-level parallelism — the "parallel logic" the user's thesis describes.
+    """
+    import math
+    w = r.weight_data  # [out_dim][in_dim], already pruned
+
+    # Binarize: sign(w) → bit (1 if w>0, 0 if w<=0), plus scale = mean(|w|)
+    # Pack each row's bits into uint64 array (64 weights per uint64)
+    n_words = (in_dim + 63) // 64  # uint64s per output row
+    w_packed = []   # [out_dim][n_words] of int (uint64 values)
+    alpha = []      # [out_dim] scale factors
+    for j in range(out_dim):
+        wj = w[j]
+        # Scale: mean of absolute values (XNOR-Net style)
+        abs_sum = sum(abs(v) for v in wj if v != 0.0)
+        n_nz = sum(1 for v in wj if v != 0.0)
+        a = abs_sum / n_nz if n_nz > 0 else 0.0
+        alpha.append(a)
+        # Pack signs into uint64s
+        words = []
+        for wi in range(n_words):
+            word = 0
+            for bi in range(64):
+                idx = wi * 64 + bi
+                if idx < in_dim and wj[idx] > 0.0:
+                    word |= (1 << bi)
+            words.append(word)
+        w_packed.append(words)
+
+    arr_prefix = f"_lal_{r.name}_{id(r) & 0xFFFFFF:x}"
+
+    # Emit the packed weight data as static const uint64_t arrays
+    lines.append(f"    /* linear {r.name} (BINARY XNOR+popcount): {out_dim} out, {in_dim} in */")
+    lines.append(f"    /* {in_dim} weights per row packed into {n_words} uint64s — 64 muls per popcount */")
+
+    # Flatten all rows' packed data into one array: [out_dim * n_words]
+    all_words = []
+    for j in range(out_dim):
+        all_words.extend(w_packed[j])
+    words_str = ", ".join(f"{w}ULL" for w in all_words)
+    lines.append(f"    static const uint64_t {arr_prefix}_wbits[{out_dim * n_words}] = {{{words_str}}};")
+
+    # Emit alpha (scale factors)
+    alpha_str = ", ".join(f"{a:.6f}f" for a in alpha)
+    lines.append(f"    static const float {arr_prefix}_alpha[{out_dim}] = {{{alpha_str}}};")
+
+    # Emit bias
+    bias_str = ", ".join(f"{b:.6f}f" for b in bias)
+    lines.append(f"    static const float {arr_prefix}_bias[{out_dim}] = {{{bias_str}}};")
+
+    # Emit the binary dot product function.
+    # At runtime:
+    #   1. Binarize input x[0..in_dim-1] → x_bits (packed uint64s)
+    #   2. For each output j: dot = (2*popcount(XNOR(x_bits, w_bits[j])) - in_dim) * alpha[j] + bias[j]
+    lines.append(f"    /* Binarize input {a_vec}[0..{in_dim-1}] into packed bits */")
+    lines.append(f"    uint64_t {arr_prefix}_xbits[{n_words}];")
+    lines.append(f"    for (int wi = 0; wi < {n_words}; wi++) {{")
+    lines.append(f"        uint64_t bits = 0;")
+    lines.append(f"        for (int bi = 0; bi < 64; bi++) {{")
+    lines.append(f"            int idx = wi*64 + bi;")
+    lines.append(f"            if (idx < {in_dim} && {a_vec}[idx] > 0.0f) bits |= (1ULL << bi);")
+    lines.append(f"        }}")
+    lines.append(f"        {arr_prefix}_xbits[wi] = bits;")
+    lines.append(f"    }}")
+
+    # For each output: XNOR + popcount
+    lines.append(f"    for (int j = 0; j < {out_dim}; j++) {{")
+    lines.append(f"        int pc = 0;")
+    lines.append(f"        for (int wi = 0; wi < {n_words}; wi++) {{")
+    lines.append(f"            uint64_t xnor = ~({arr_prefix}_xbits[wi] ^ {arr_prefix}_wbits[j*{n_words}+wi]);")
+    lines.append(f"            pc += __builtin_popcountll(xnor);")
+    lines.append(f"        }}")
+    lines.append(f"        /* dot = (2*pc - N) * alpha, because XNOR gives count of matching signs */")
+    lines.append(f"        float dot = (float)(2 * pc - {in_dim}) * {arr_prefix}_alpha[j];")
+    lines.append(f"        {target_var}[j] = dot + {arr_prefix}_bias[j];")
+    lines.append(f"    }}")
+
+
 def _emit_linear_serial(lines, target_var, r, a_vec, out_dim, in_dim, bias):
     """Serial CSR sparse matmul — one output at a time (v0.7 default)."""
     w = r.weight_data
@@ -2145,7 +2266,9 @@ def _emit_vector_expr(lines, target_var, e, concept_map, bound_map, memory_map, 
             out_dim = len(w)
             in_dim = len(w[0]) if out_dim > 0 else 0
 
-            if _PARALLEL_MODE and out_dim >= 8:
+            if _BINARY_MODE:
+                _emit_linear_binary(lines, target_var, r, a_vec, out_dim, in_dim, bias)
+            elif _PARALLEL_MODE and out_dim >= 8:
                 _emit_linear_parallel(lines, target_var, r, a_vec, out_dim, in_dim, bias)
             else:
                 _emit_linear_serial(lines, target_var, r, a_vec, out_dim, in_dim, bias)
@@ -2323,14 +2446,22 @@ def main():
                     help="quantize concept vectors to int8 (4x smaller) or int4 (8x smaller)")
     ap.add_argument("--parallel", action="store_true",
                     help="emit parallel SIMD linear layers (AVX2/NEON, 8 outputs per instruction)")
+    ap.add_argument("--binarize", action="store_true",
+                    help="binarize weights to {-1,+1}, use XNOR+popcount (64 muls per instruction)")
     args = ap.parse_args()
 
     with open(args.input) as f:
         source = f.read()
 
+    # Set _BINARY_MODE before parsing so the linear parser knows to load
+    # weights without pruning (binarization happens at emission time).
+    global _BINARY_MODE
+    _BINARY_MODE = args.binarize
+
     concepts, bounds, memories, relates, rules = parse(source, args.input)
     c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule,
-                          quantize=args.quantize, parallel=args.parallel)
+                          quantize=args.quantize, parallel=args.parallel,
+                          binarize=args.binarize)
 
     if args.output:
         with open(args.output, "w") as f:
