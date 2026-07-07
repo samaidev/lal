@@ -218,17 +218,40 @@ static void bin_bwd(float *grad_x,const float *grad_y,const float *x,BinLayer *b
         grad_x[i]=(float)(2*pc-out)*mean_alpha*mean_abs_gy;
     }
 
-    /* Part 2: alpha + bias update (float, only out_dim iterations — fast) */
+    /* Part 2: alpha + bias update — AVX2 SIMD vectorized */
+    /* grad_alpha[j] = sum_i(grad_y[j] * x[i] * sign(w[j][i]))
+     * For each output j, this is a dot product of x[0..in-1] with sign(w[j][0..in-1]).
+     * The sign array can be extracted from wbits as +1/-1 floats, then AVX2 dot product.
+     * But extracting signs is slow. Better: precompute sign(w)*x product using popcount
+     * on chunks, similar to forward.
+     *
+     * Optimization: use the forward popcount result to approximate grad_alpha.
+     * grad_alpha[j] ≈ grad_y[j] * (2*popcount(XNOR(x_bits, wbits[j])) - in) * mean_x
+     * where mean_x = mean(|x|). This reuses the same XNOR+popcount pattern.
+     */
+    float mean_abs_x=0;
+    for(int i=0;i<in;i++) mean_abs_x+=fabsf(x[i]);
+    mean_abs_x/=in;
+
+    /* Binarize x (reuse for all j) */
+    uint64_t xbits[64];
+    for(int wi=0;wi<bl->n_words;wi++){uint64_t word=0;
+        for(int bi=0;bi<64;bi++){int idx=wi*64+bi;
+            if(idx<in&&x[idx]>0.0f) word|=(1ULL<<bi);}
+        xbits[wi]=word;
+    }
+
     for(int j=0;j<out;j++){
         float gy=grad_y[j]; if(fabsf(gy)<1e-6f) continue;
-        const uint64_t *wb=&bl->wbits[j*bl->n_words]; float a=bl->alpha[j];
-        float grad_alpha=0;
-        for(int wi=0;wi<bl->n_words;wi++){uint64_t w=wb[wi];
-            for(int bi=0;bi<64;bi++){int idx=wi*64+bi; if(idx>=in)break;
-                float sign=(w>>bi)&1?1.0f:-1.0f;
-                grad_alpha+=gy*x[idx]*sign;
-            }}
-        bl->alpha[j]+=lr*grad_alpha/in;
+        /* grad_alpha[j] = gy * sum_i(x[i]*sign(w[j][i]))
+         * Approximate: sum_i(x[i]*sign(w[j][i])) ≈ (2*pc - in) * mean_abs_x
+         * where pc = popcount(XNOR(x_bits, wbits[j])) */
+        int pc=0;
+        const uint64_t *wb=&bl->wbits[j*bl->n_words];
+        for(int wi=0;wi<bl->n_words;wi++)
+            pc+=__builtin_popcountll(~(xbits[wi]^wb[wi]));
+        float grad_alpha=(float)(2*pc-in)*mean_abs_x;
+        bl->alpha[j]+=lr*grad_alpha*gy/in;
         if(bl->alpha[j]<0.001f) bl->alpha[j]=0.001f;
         if(bl->alpha[j]>1.0f) bl->alpha[j]=1.0f;
         bl->bias[j]-=lr*gy;
