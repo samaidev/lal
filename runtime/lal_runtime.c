@@ -483,9 +483,13 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
     bl->bias = bias ? malloc(out_dim * sizeof(float)) : calloc(out_dim, sizeof(float));
     bl->w_float = malloc((size_t)in_dim * out_dim * sizeof(float));  /* STE */
 
-    /* Copy float weights for STE updates */
-    for (int i = 0; i < in_dim * out_dim; i++)
-        bl->w_float[i] = W[i];
+    /* Copy float weights for STE updates — TRANSPOSE to [out, in] layout!
+     * W is [in, out] row-major (GPT-2 Conv1D format). We store w_float as
+     * [out, in] so that w_float[j*in + i] is contiguous per output j.
+     * This makes repack/alpha/update loops all contiguous → SIMD-friendly. */
+    for (int j = 0; j < out_dim; j++)
+        for (int i = 0; i < in_dim; i++)
+            bl->w_float[j * in_dim + i] = W[i * out_dim + j];
 
     /* Row-major: pack sign(w[j][i]) per output j */
     for (int j = 0; j < out_dim; j++) {
@@ -524,55 +528,37 @@ void bin_layer_free(BinLayer *bl) {
 }
 
 /* Re-pack wbits and wbits_T from sign(w_float).
- * Called after STE updates w_float to keep the binary weights in sync.
+ * w_float is [out, in] (transposed from Conv1D's [in, out] for contiguous
+ * per-output access). All loops here are now contiguous → auto-vectorizable.
  *
- * SIMD-optimized: uses the v8f wrapper to compare 8 floats at once,
- * then packs 8 sign bits into a uint64 in one go. This is ~8x faster
- * than the original scalar loop (64 iterations → 8 iterations per word).
- *
- * w_float is [in, out] row-major. For wbits we need per-output columns
- * (stride=out), which is non-contiguous — but we can still SIMD-compare
- * 8 consecutive rows for the same output j. */
+ * Key optimization: wbits[j] packs sign(w_float[j*in + 0..in-1]) which is
+ * contiguous memory. The compiler auto-vectorizes the 8x unrolled comparison
+ * into SIMD compare + movemask-style bit extraction. */
 static void bin_layer_repack(BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
 
-    /* Row-major: wbits[j][wi] = pack sign(w_float[i*out+j]) for i in 64-blocks
-     * For each output j, iterate over 64-element blocks of input dimension.
-     * Within each block, process 8 floats at a time with SIMD. */
+    /* Pack wbits[j][wi] from sign(w_float[j*in + i]) — CONTIGUOUS in i! */
     for (int j = 0; j < out; j++) {
+        const float *wf = &bl->w_float[j * in];  /* contiguous [in] */
         for (int wi = 0; wi < bl->n_words; wi++) {
             uint64_t word = 0;
             int base = wi * 64;
-            /* Process 8 floats at a time, 8 iterations = 64 bits */
             for (int grp = 0; grp < 8; grp++) {
                 int idx = base + grp * 8;
                 if (idx + 7 < in) {
-                    /* SIMD: load 8 floats w_float[idx..idx+7][j], compare > 0 */
-                    /* w_float is [in, out] row-major, so w_float[idx*out+j] has stride=out */
-                    /* Can't use v8f_load (contiguous), but can do scalar-unrolled */
-                    float v0 = bl->w_float[(idx+0)*out + j];
-                    float v1 = bl->w_float[(idx+1)*out + j];
-                    float v2 = bl->w_float[(idx+2)*out + j];
-                    float v3 = bl->w_float[(idx+3)*out + j];
-                    float v4 = bl->w_float[(idx+4)*out + j];
-                    float v5 = bl->w_float[(idx+5)*out + j];
-                    float v6 = bl->w_float[(idx+6)*out + j];
-                    float v7 = bl->w_float[(idx+7)*out + j];
-                    uint64_t bits = 0;
-                    if (v0 > 0.0f) bits |= (1ULL << (grp*8 + 0));
-                    if (v1 > 0.0f) bits |= (1ULL << (grp*8 + 1));
-                    if (v2 > 0.0f) bits |= (1ULL << (grp*8 + 2));
-                    if (v3 > 0.0f) bits |= (1ULL << (grp*8 + 3));
-                    if (v4 > 0.0f) bits |= (1ULL << (grp*8 + 4));
-                    if (v5 > 0.0f) bits |= (1ULL << (grp*8 + 5));
-                    if (v6 > 0.0f) bits |= (1ULL << (grp*8 + 6));
-                    if (v7 > 0.0f) bits |= (1ULL << (grp*8 + 7));
-                    word |= bits;
+                    /* 8 contiguous floats — compiler auto-vectorizes to SIMD */
+                    if (wf[idx+0] > 0.0f) word |= (1ULL << (grp*8 + 0));
+                    if (wf[idx+1] > 0.0f) word |= (1ULL << (grp*8 + 1));
+                    if (wf[idx+2] > 0.0f) word |= (1ULL << (grp*8 + 2));
+                    if (wf[idx+3] > 0.0f) word |= (1ULL << (grp*8 + 3));
+                    if (wf[idx+4] > 0.0f) word |= (1ULL << (grp*8 + 4));
+                    if (wf[idx+5] > 0.0f) word |= (1ULL << (grp*8 + 5));
+                    if (wf[idx+6] > 0.0f) word |= (1ULL << (grp*8 + 6));
+                    if (wf[idx+7] > 0.0f) word |= (1ULL << (grp*8 + 7));
                 } else {
-                    /* Tail: scalar for remaining */
                     for (int bi = 0; bi < 8; bi++) {
                         int i = idx + bi;
-                        if (i < in && bl->w_float[i * out + j] > 0.0f)
+                        if (i < in && wf[i] > 0.0f)
                             word |= (1ULL << (grp * 8 + bi));
                     }
                 }
@@ -581,31 +567,28 @@ static void bin_layer_repack(BinLayer *bl) {
         }
     }
 
-    /* Col-major (transposed): wbits_T[i][wi] = pack sign(w_float[i*out+j])
-     * Here w_float[i*out + j] is contiguous in j (row-major), so we CAN
-     * use SIMD v8f_load for 8 consecutive outputs! */
+    /* Pack wbits_T[i][wi] from sign(w_float[j*in + i]) for j in 64-blocks.
+     * This is strided (stride=in), but only done once per step.
+     * The wbits path above is the hot one (contiguous). */
     for (int i = 0; i < in; i++) {
-        const float *row = &bl->w_float[i * out];  /* contiguous [out] */
         for (int wi = 0; wi < bl->n_words_T; wi++) {
             uint64_t word = 0;
             int base = wi * 64;
             for (int grp = 0; grp < 8; grp++) {
                 int idx = base + grp * 8;
                 if (idx + 7 < out) {
-                    /* 8 contiguous floats — can be SIMD'd but scalar unroll is
-                     * already fast enough here (compiler auto-vectorizes) */
-                    if (row[idx+0] > 0.0f) word |= (1ULL << (grp*8 + 0));
-                    if (row[idx+1] > 0.0f) word |= (1ULL << (grp*8 + 1));
-                    if (row[idx+2] > 0.0f) word |= (1ULL << (grp*8 + 2));
-                    if (row[idx+3] > 0.0f) word |= (1ULL << (grp*8 + 3));
-                    if (row[idx+4] > 0.0f) word |= (1ULL << (grp*8 + 4));
-                    if (row[idx+5] > 0.0f) word |= (1ULL << (grp*8 + 5));
-                    if (row[idx+6] > 0.0f) word |= (1ULL << (grp*8 + 6));
-                    if (row[idx+7] > 0.0f) word |= (1ULL << (grp*8 + 7));
+                    if (bl->w_float[(idx+0)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 0));
+                    if (bl->w_float[(idx+1)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 1));
+                    if (bl->w_float[(idx+2)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 2));
+                    if (bl->w_float[(idx+3)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 3));
+                    if (bl->w_float[(idx+4)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 4));
+                    if (bl->w_float[(idx+5)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 5));
+                    if (bl->w_float[(idx+6)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 6));
+                    if (bl->w_float[(idx+7)*in + i] > 0.0f) word |= (1ULL << (grp*8 + 7));
                 } else {
                     for (int bi = 0; bi < 8; bi++) {
                         int j = idx + bi;
-                        if (j < out && row[j] > 0.0f)
+                        if (j < out && bl->w_float[j * in + i] > 0.0f)
                             word |= (1ULL << (grp * 8 + bi));
                     }
                 }
@@ -614,22 +597,16 @@ static void bin_layer_repack(BinLayer *bl) {
         }
     }
 
-    /* Recompute alpha = mean(|w_float|) per output — SIMD-friendly (contiguous in j) */
+    /* Recompute alpha = mean(|w_float|) per output — now CONTIGUOUS! */
     for (int j = 0; j < out; j++) {
+        const float *wf = &bl->w_float[j * in];  /* contiguous [in] */
         float abs_sum = 0;
-        /* Unrolled 8x for auto-vectorization */
         for (int i = 0; i + 7 < in; i += 8) {
-            abs_sum += fabsf(bl->w_float[(i+0)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+1)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+2)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+3)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+4)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+5)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+6)*out + j]);
-            abs_sum += fabsf(bl->w_float[(i+7)*out + j]);
+            abs_sum += fabsf(wf[i+0]) + fabsf(wf[i+1]) + fabsf(wf[i+2]) + fabsf(wf[i+3]);
+            abs_sum += fabsf(wf[i+4]) + fabsf(wf[i+5]) + fabsf(wf[i+6]) + fabsf(wf[i+7]);
         }
         for (int i = (in / 8) * 8; i < in; i++)
-            abs_sum += fabsf(bl->w_float[i * out + j]);
+            abs_sum += fabsf(wf[i]);
         bl->alpha[j] = abs_sum / in;
     }
 }
@@ -781,29 +758,29 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
         grad_x[i] = (float)(2 * pc - out) * mean_alpha * mean_abs_gy;
     }
 
-    /* Part 2: STE update — w_float[i,j] -= lr * grad_y[j] * x[i]
-     * This is an outer product: w_float -= lr * x ⊗ grad_y
-     * w_float is [in, out] row-major, so w_float[i*out + j] is contiguous in j.
-     * For each input i, we can update 8 outputs at once (contiguous in memory).
-     * This is the hottest loop — 8x unrolled for auto-vectorization. */
+    /* Part 2: STE update — w_float[j*in + i] -= lr * grad_y[j] * x[i]
+     * w_float is [out, in] (transposed), so w_float[j*in + i] is CONTIGUOUS in i!
+     * This means the inner loop over i is a contiguous SAXPY: w_float[j] -= scale * x
+     * The compiler auto-vectorizes this to SIMD FMA (8 floats per iteration). */
     if (bl->w_float) {
         for (int j = 0; j < out; j++) {
             float gy = grad_y[j];
             if (fabsf(gy) < 1e-8f) continue;
             float scale = lr * gy;
-            /* Update w_float column j: w_float[i*out+j] -= scale * x[i] */
+            float *wf = &bl->w_float[j * in];  /* contiguous [in] */
+            /* SAXPY: wf[i] -= scale * x[i], 8x unrolled for SIMD */
             for (int i = 0; i + 7 < in; i += 8) {
-                bl->w_float[(i+0)*out + j] -= scale * x[i+0];
-                bl->w_float[(i+1)*out + j] -= scale * x[i+1];
-                bl->w_float[(i+2)*out + j] -= scale * x[i+2];
-                bl->w_float[(i+3)*out + j] -= scale * x[i+3];
-                bl->w_float[(i+4)*out + j] -= scale * x[i+4];
-                bl->w_float[(i+5)*out + j] -= scale * x[i+5];
-                bl->w_float[(i+6)*out + j] -= scale * x[i+6];
-                bl->w_float[(i+7)*out + j] -= scale * x[i+7];
+                wf[i+0] -= scale * x[i+0];
+                wf[i+1] -= scale * x[i+1];
+                wf[i+2] -= scale * x[i+2];
+                wf[i+3] -= scale * x[i+3];
+                wf[i+4] -= scale * x[i+4];
+                wf[i+5] -= scale * x[i+5];
+                wf[i+6] -= scale * x[i+6];
+                wf[i+7] -= scale * x[i+7];
             }
             for (int i = (in / 8) * 8; i < in; i++)
-                bl->w_float[i * out + j] -= scale * x[i];
+                wf[i] -= scale * x[i];
             /* Update bias */
             bl->bias[j] -= lr * gy;
         }
