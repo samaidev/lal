@@ -808,11 +808,13 @@ static int gpt2_forward_token(int token_id, int position) {
     }
 
     /* Final norm */
+    fprintf(stderr, "[d]   final norm\n"); fflush(stderr);
     layer_norm_simd(g_final_ln, g_x, g_ln_f_w, g_ln_f_b, N_EMBD);
 
     /* LM head: logits = wte @ final_ln  (tied embeddings)
      * wte stays float in both modes (binarizing embeddings hurts accuracy).
      * Use pruned version if --prune-vocab was set, else full parallel. */
+    fprintf(stderr, "[d]   lm_head\n"); fflush(stderr);
     if (g_active_vocab && g_n_active_vocab < VOCAB_SIZE) {
         lm_head_pruned(g_logits, g_final_ln, g_wte, g_active_vocab, g_n_active_vocab, N_EMBD);
     } else {
@@ -820,11 +822,13 @@ static int gpt2_forward_token(int token_id, int position) {
     }
 
     /* Argmax */
+    fprintf(stderr, "[d]   argmax\n"); fflush(stderr);
     int best = 0;
     float best_val = g_logits[0];
     for (int v = 1; v < VOCAB_SIZE; v++) {
         if (g_logits[v] > best_val) { best_val = g_logits[v]; best = v; }
     }
+    fprintf(stderr, "[d]   forward done, best=%d\n", best); fflush(stderr);
     return best;
 }
 
