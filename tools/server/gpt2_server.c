@@ -977,8 +977,10 @@ static void matmul_blas(float *y, const float *x, const float *W, const float *b
 /* LM head also uses BLAS */
 static void lm_head_blas(float *logits, const float *x, const float *wte,
                          int vocab, int n_embd) {
-    cblas_sgemv(CblasRowMajor, CblasTrans, n_embd, vocab,
-                1.0f, wte, vocab, x, 1, 0.0f, logits, 1);
+    /* logits = wte @ x. wte is [vocab, n_embd] row-major.
+     * NoTrans: y = A @ x, A=[M=vocab, N=n_embd], y len=M=vocab. */
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, vocab, n_embd,
+                1.0f, wte, n_embd, x, 1, 0.0f, logits, 1);
 }
 #define lm_head(logits, x, wte, v, ne) lm_head_blas(logits, x, wte, v, ne)
 #else
