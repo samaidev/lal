@@ -2652,8 +2652,21 @@ int main(int argc, char **argv) {
     if (g_n_threads > 8) g_n_threads = 8;
 #endif
 
+#ifdef USE_OPENBLAS
+    /* OpenBLAS thread control: if server uses pthreads for lm_head (x86_64),
+     * force BLAS to single-thread to avoid contention. On ARM (g_n_threads=1),
+     * let BLAS use all cores for parallel matmul. */
+    openblas_set_num_threads(g_n_threads > 1 ? 1 : (int)ncpu);
+    printf("[*] OpenBLAS: %d thread(s)\n", g_n_threads > 1 ? 1 : (int)ncpu);
+#endif
+
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
-           use_binary ? "BINARY XNOR+popcount" : "float SIMD",
+           use_binary ? "BINARY XNOR+popcount" :
+#ifdef USE_OPENBLAS
+           "float OpenBLAS",
+#else
+           "float SIMD",
+#endif
            g_n_threads, g_n_threads > 1 ? "s" : "", ncpu);
     if (g_prune_frac > 0.0f) {
         printf("[*] vocab pruning: dropping %.0f%% smallest-norm rows (%d → %d active)\n",
