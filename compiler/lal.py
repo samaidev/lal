@@ -1232,8 +1232,14 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     concept_names = set(concept_map.keys())
 
     # Find which rules we need to emit (all transitively-reachable rule names).
-    rules_to_emit = _collect_called_rules(rule_map[rule_name], rule_map, relate_map, max_recursion_depth)
-    rules_to_emit.add(rule_name)
+    # In filter_only mode the entry rule is irrelevant (we emit only filter
+    # rules), so skip the reachability walk — a filter-only .lal may declare
+    # no normal rule at all, in which case rule_name wouldn't be in rule_map.
+    if filter_only:
+        rules_to_emit = set()
+    else:
+        rules_to_emit = _collect_called_rules(rule_map[rule_name], rule_map, relate_map, max_recursion_depth)
+        rules_to_emit.add(rule_name)
     # filter rules are invoked by the server's sampling path via the strong
     # lal_filter_topk symbol, not by rule calls — force-emit all of them.
     for rn, r in rule_map.items():

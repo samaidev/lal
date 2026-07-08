@@ -1,0 +1,34 @@
+# sampling_filter.lal — LAL three-layer fusion level 2 demo
+#
+# This .lal file declares a sampling-constraint filter that the GPT-2 server
+# links into its top-k sampling path via the strong lal_filter_topk symbol.
+# When the server computes the top-k candidate pool (after top-k/top-p
+# narrowing, before softmax+sample), it calls lal_filter_topk() which this
+# file's `no_repeat` filter rule implements.
+#
+# The three ban actions below attack the most common binary-model quality
+# failure: repetitive token loops ("the the the...", "error error error...").
+#   - ban_last:     hard-bans the immediately-preceding token (complements
+#                   the server's soft rep_penalty, which only divides the logit)
+#   - ban_repeat(5): bans the last 5 generated tokens — blocks short n-gram
+#                   loops that survive ban_last (e.g. "A B A B A B")
+#   - ban_token(50256): bans the GPT-2 <|endoftext|> token from mid-generation
+#                   sampling (prevents premature truncation in long sequences)
+#
+# Compile (filter-only, no main — links cleanly into the server):
+#   lalc demos/basic/sampling_filter.lal _ --filter-only -o build/filter.o
+# Link into the server:
+#   gcc -O3 -mavx2 -mfma tools/server/gpt2_server.c runtime/lal_runtime.c \
+#       build/filter.o -lm -o build/gpt2_server_filtered
+# Run:
+#   ./build/gpt2_server_filtered  # now sampling is logic-constrained
+#
+# The entry-rule argument "_" is a placeholder: in --filter-only mode the
+# entry rule is ignored (filter rules are force-emitted). Any non-filter
+# rule name in the file would also work; we use "_" because this file
+# declares no normal rule.
+
+filter no_repeat:
+    ban_last
+    ban_repeat(5)
+    ban_token(50256)
