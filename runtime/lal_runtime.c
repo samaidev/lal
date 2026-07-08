@@ -279,6 +279,42 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
 int g_use_ste = 0;
+int g_use_logic_binarization = 0;  /* norm-based auto logic mask in model_load */
+
+/* Auto-generate per-output logic mask based on weight norms.
+ * W is [in, out] (GPT-2 Conv1D format). We compute per-output column norms.
+ * top 20% → CORE (0), bottom 10% → PRUNE (2), middle 70% → BINARY (1).
+ * mask: [out_dim] bytes, 0=CORE, 1=BINARY, 2=PRUNE. */
+static void compute_norm_mask(const float *W, int in_dim, int out_dim, uint8_t *mask) {
+    /* Compute per-output norms (W is [in, out] row-major) */
+    float *norms = malloc(out_dim * sizeof(float));
+    for (int j = 0; j < out_dim; j++) {
+        float s = 0;
+        for (int i = 0; i < in_dim; i++) {
+            float w = W[i * out_dim + j];
+            s += w * w;
+        }
+        norms[j] = sqrtf(s);
+    }
+    /* Find thresholds via partial sort (simple: sort a copy) */
+    float *sorted = malloc(out_dim * sizeof(float));
+    memcpy(sorted, norms, out_dim * sizeof(float));
+    /* Simple insertion sort (out_dim ≤ 3072, OK) */
+    for (int i = 1; i < out_dim; i++) {
+        float v = sorted[i]; int k = i - 1;
+        while (k >= 0 && sorted[k] > v) { sorted[k+1] = sorted[k]; k--; }
+        sorted[k+1] = v;
+    }
+    float core_threshold = sorted[(int)(out_dim * 0.8)];   /* top 20% */
+    float prune_threshold = sorted[(int)(out_dim * 0.1)];  /* bottom 10% */
+
+    for (int j = 0; j < out_dim; j++) {
+        if (norms[j] >= core_threshold) mask[j] = 0;       /* CORE */
+        else if (norms[j] <= prune_threshold) mask[j] = 2; /* PRUNE */
+        else mask[j] = 1;                                   /* BINARY */
+    }
+    free(norms); free(sorted);
+}
 
 /* Global flag: use legacy BNN fast path (binarizes x too). Off by default —
  * BNN causes train/inference mismatch. Enable only for max-speed-low-quality. */
@@ -470,7 +506,8 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
     m->ln_f_w = tensor_get(m->tensors, m->n_tensors, "ln_f.weight");
     m->ln_f_b = tensor_get(m->tensors, m->n_tensors, "ln_f.bias");
 
-    printf("[*] binarizing %d layers...\n", cfg.n_layer);
+    printf("[*] binarizing %d layers%s...\n", cfg.n_layer,
+           g_use_logic_binarization ? " (logic-guided)" : "");
     m->layers = malloc(cfg.n_layer * sizeof(TransLayer));
     m->acts = trans_act_alloc(&cfg);
 
@@ -480,54 +517,67 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
         TransLayer *tl = &m->layers[l];
         int n = cfg.n_embd, mm = cfg.mlp_dim;
 
+        /* Helper: bin_layer_init or bin_layer_init_logic depending on flag */
+        #define BIN_INIT(bl, W, b, in, out) do { \
+            if (g_use_logic_binarization) { \
+                uint8_t *mask = malloc(out); \
+                compute_norm_mask(W, in, out, mask); \
+                bin_layer_init_logic(bl, W, b, in, out, mask); \
+                free(mask); \
+            } else { \
+                bin_layer_init(bl, W, b, in, out); \
+            } \
+        } while(0)
+
         if (qkv_merged) {
             sprintf(key, "h.%d.attn.c_attn.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
         } else {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+            BIN_INIT(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, n);
+            BIN_INIT(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, n);
         }
 
         sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
         char bk[256]; strncpy(bk, key, sizeof(bk));
         char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        bin_layer_init(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
-                       tensor_get(m->tensors, m->n_tensors, bk), n, n);
+        BIN_INIT(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+                 tensor_get(m->tensors, m->n_tensors, bk), n, n);
 
         if (cfg.act_type == ACT_SWIGLU) {
             sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+            BIN_INIT(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, mm);
             sprintf(key, "model.layers.%d.mlp.up_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_up, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+            BIN_INIT(&tl->mlp_up, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, mm);
         } else {
             sprintf(key, "h.%d.mlp.c_fc.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
-                           tensor_get(m->tensors, m->n_tensors, bk), n, mm);
+            BIN_INIT(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+                     tensor_get(m->tensors, m->n_tensors, bk), n, mm);
         }
 
         sprintf(key, qkv_merged ? "h.%d.mlp.c_proj.weight" : "model.layers.%d.mlp.down_proj.weight", l);
         strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        bin_layer_init(&tl->mlp_down, tensor_get(m->tensors, m->n_tensors, key),
-                       tensor_get(m->tensors, m->n_tensors, bk), mm, n);
+        BIN_INIT(&tl->mlp_down, tensor_get(m->tensors, m->n_tensors, key),
+                 tensor_get(m->tensors, m->n_tensors, bk), mm, n);
+        #undef BIN_INIT
 
         /* Norm weights */
         if (qkv_merged) {
