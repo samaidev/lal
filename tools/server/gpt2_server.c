@@ -952,8 +952,20 @@ static void layer_norm_simd(float *out, const float *x, const float *w, const fl
  * prefetching, NEON/AVX tuning). ~2-3x faster than our matmul_avx2. */
 #ifdef USE_OPENBLAS
 #include <cblas.h>
+/* Forward declaration — matmul_avx2 is defined below; we use it for small
+ * matrices where BLAS function-call overhead exceeds the compute savings. */
+static void matmul_avx2(float *y, const float *x, const float *W, const float *b,
+                        int in_dim, int out_dim);
+
+/* Hybrid dispatch: BLAS for large matrices, SIMD for small ones.
+ * Threshold ~1M elements: c_proj (768x768=589K) uses SIMD,
+ * c_attn (768x2304=1.77M) and larger use BLAS. */
 static void matmul_blas(float *y, const float *x, const float *W, const float *b,
                         int in_dim, int out_dim) {
+    if ((size_t)in_dim * out_dim < 1000000) {
+        matmul_avx2(y, x, W, b, in_dim, out_dim);
+        return;
+    }
     /* y = W^T @ x + b. W is [in_dim, out_dim] row-major (GPT-2 Conv1D).
      * cblas_sgemv: y = alpha * op(A) * x + beta * y
      * Trans: op(A) = A^T, A is [M=in_dim, N=out_dim], x len=M, y len=N */
