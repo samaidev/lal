@@ -129,6 +129,10 @@ class EFloat:
     val: float
 
 @dataclass
+class EStr:
+    val: str  # string literal (for ban_relation args)
+
+@dataclass
 class ERelateCall:
     name: str
     args: List["Expr"]
@@ -177,7 +181,7 @@ class EUpdate:
     grad_var: str
     lr: float
 
-Expr = Union[ECall, EVar, EFloat, ERelateCall, ERuleCall, ERecall, EArgMax, ELoss, EGrad, EUpdate]
+Expr = Union[ECall, EVar, EFloat, EStr, ERelateCall, ERuleCall, ERecall, EArgMax, ELoss, EGrad, EUpdate]
 
 
 # =============================================================================
@@ -414,6 +418,28 @@ class _ExprParser:
             self.i += 1
         return float(self.s[start:self.i])
 
+    def _read_string(self) -> str:
+        """Read a double-quoted string literal. Supports \\" and \\\\ escapes."""
+        self._skip_ws()
+        if self.s[self.i] != '"':
+            raise ParseError(f"expected '\"' at pos {self.i} in: {self.s!r}")
+        self.i += 1  # skip opening quote
+        out = []
+        while self.i < self.n and self.s[self.i] != '"':
+            if self.s[self.i] == '\\' and self.i + 1 < self.n:
+                nxt = self.s[self.i + 1]
+                if nxt == '"': out.append('"')
+                elif nxt == '\\': out.append('\\')
+                else: out.append(self.s[self.i]); out.append(nxt)
+                self.i += 2
+            else:
+                out.append(self.s[self.i])
+                self.i += 1
+        if self.i >= self.n:
+            raise ParseError(f"unterminated string literal in: {self.s!r}")
+        self.i += 1  # skip closing quote
+        return "".join(out)
+
     def parse(self) -> Expr:
         e = self.parse_ternary()
         self._skip_ws()
@@ -498,6 +524,10 @@ class _ExprParser:
 
         if c.isdigit() or c == "." or (c == "-" and self.i+1 < self.n and (self.s[self.i+1].isdigit() or self.s[self.i+1] == ".")):
             return EFloat(self._read_number())
+
+        # String literal "..." — used by ban_relation(trigger, allow1, ...)
+        if c == '"':
+            return EStr(self._read_string())
 
         if c.isalpha() or c == "_":
             name = self._read_ident()
@@ -832,14 +862,15 @@ def parse(source: str, source_path: Optional[str] = None):
                 if not (bline.startswith("    ") or bline.startswith("\t")):
                     break
                 bline = bline.strip()
-                # filter body actions are stored as bare ECall nodes (var="__stmt__")
-                if re.match(r"ban_(last|repeat\(\d+\)|token\(\d+\))\s*$", bline):
+                # filter body actions are stored as bare ECall/EVar nodes (var="__filter__")
+                # ban_last | ban_repeat(n) | ban_token(id) | ban_relation("trig","w1","w2",...)
+                if re.match(r'ban_(last|repeat\(\d+\)|token\(\d+\)|relation\(.+\))\s*$', bline):
                     expr = _parse_expr(bline)
                     body.append(Stmt("__filter__", expr))
                     i += 1
                     continue
                 raise ParseError(f"can't parse filter body line: {bline!r} "
-                                 f"(expected ban_last / ban_repeat(n) / ban_token(id))")
+                                 f"(expected ban_last / ban_repeat(n) / ban_token(id) / ban_relation(...))")
             rules.append(Rule(name, [], body, outputs, None, kind="filter"))
             continue
 
@@ -2063,6 +2094,12 @@ def _emit_filter_rule(variants):
       ban_last         — drop the immediately-preceding token (anti-repeat)
       ban_repeat(n)    — drop the last n generated tokens (n-gram block)
       ban_token(id)    — drop a specific token id
+      ban_relation(trigger, allow, [w1, w2, ...])
+                       — concept-level constraint (logical parsing mapping):
+                         if the decoded recent-token stream ends with `trigger`,
+                         drop every surviving candidate whose decoded text is
+                         NOT one of the allow-words. Implements e.g.
+                         "France capital → must be Paris, ban Tokyo/Berlin/..."
     """
     if len(variants) > 1:
         raise ParseError(f"filter rule '{variants[0].name}' has {len(variants)} variants — "
@@ -2074,12 +2111,16 @@ def _emit_filter_rule(variants):
     L.append(" * Generated from a .lal `filter` rule. This STRONG symbol overrides the")
     L.append(" * weak fallback in gpt2_server.c at link time — the server's top-k sampling")
     L.append(" * pool is constrained by the ban actions declared below. */")
+    L.append("/* lal_token_decode_fn: callback into the server's tokenizer (token_id → text). */")
+    L.append("typedef int (*lal_token_decode_fn)(int token_id, char *out_buf, int max_len);")
     L.append("int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,")
-    L.append("                    const int *recent_tokens, int n_recent) {")
+    L.append("                    const int *recent_tokens, int n_recent,")
+    L.append("                    lal_token_decode_fn decode_fn) {")
     L.append("    int dropped = 0;")
-    L.append("    (void)last_token; (void)recent_tokens; (void)n_recent;  /* hush -Wunused if no ban_last/ban_repeat */")
+    L.append("    (void)last_token; (void)recent_tokens; (void)n_recent; (void)decode_fn;")
+    has_relation = False
     for stmt in rule.body:
-        # ban_last (no args) parses as EVar; ban_repeat(n)/ban_token(id) parse as ECall.
+        # ban_last (no args) parses as EVar; ban_repeat(n)/ban_token(id)/ban_relation(...) parse as ECall.
         if isinstance(stmt.expr, EVar) and stmt.expr.name == "ban_last":
             action, args = "ban_last", []
         elif isinstance(stmt.expr, ECall):
@@ -2109,9 +2150,51 @@ def _emit_filter_rule(variants):
             L.append(f"    if ({tid} >= 0 && {tid} < n_vocab && keep_mask[{tid}]) {{")
             L.append(f"        keep_mask[{tid}] = 0; dropped++;")
             L.append("    }")
+        elif action == "ban_relation":
+            # ban_relation("trigger_word", "allow_word1", "allow_word2", ...)
+            # At least 2 args: trigger + >=1 allow word. All must be string literals.
+            if len(args) < 2 or not all(isinstance(a, EStr) for a in args):
+                raise ParseError(f"filter rule '{rule.name}': ban_relation needs string args "
+                                 f"(trigger, allow1, allow2, ...) — e.g. "
+                                 f'ban_relation("France capital", "Paris", "French")')
+            has_relation = True
+            trigger = args[0].val
+            allow_words = [a.val for a in args[1:]]
+            # Emit the trigger + allow list as static string arrays, then the matcher.
+            trig_escaped = trigger.replace('\\', '\\\\').replace('"', '\\"')
+            L.append(f'    /* ban_relation: if recent text ends with "{trig_escaped}", '
+                     f'only keep tokens decoding to one of {allow_words} */')
+            L.append("    if (decode_fn) {")
+            L.append("        char _buf[128];")
+            # Build the recent-text string by decoding recent_tokens.
+            L.append("        char _recent[1024]; _recent[0] = 0; int _rl = 0;")
+            L.append("        for (int i = 0; i < n_recent && _rl < (int)sizeof(_recent) - 64; i++) {")
+            L.append("            int n = decode_fn(recent_tokens[i], _buf, sizeof(_buf) - 1);")
+            L.append("            if (n > 0) { _buf[n] = 0;")
+            L.append("                int _blen = (int)strlen(_buf);")
+            L.append("                if (_rl + _blen < (int)sizeof(_recent)) { memcpy(_recent + _rl, _buf, _blen); _rl += _blen; }")
+            L.append("            }")
+            L.append("        }")
+            L.append("        _recent[_rl] = 0;")
+            # Check if _recent contains the trigger substring.
+            L.append(f'        if (strstr(_recent, "{trig_escaped}")) {{')
+            L.append("            /* trigger matched — scan surviving candidates, drop non-allowed */")
+            L.append("            for (int v = 0; v < n_vocab; v++) {")
+            L.append("                if (!keep_mask[v]) continue;")
+            L.append("                int dn = decode_fn(v, _buf, sizeof(_buf) - 1);")
+            L.append("                if (dn <= 0) { keep_mask[v] = 0; dropped++; continue; }")
+            L.append("                _buf[dn] = 0;")
+            L.append("                int _ok = 0;")
+            for w in allow_words:
+                w_escaped = w.replace('\\', '\\\\').replace('"', '\\"')
+                L.append(f'                if (strstr(_buf, "{w_escaped}")) _ok = 1;')
+            L.append("                if (!_ok) { keep_mask[v] = 0; dropped++; }")
+            L.append("            }")
+            L.append("        }")
+            L.append("    }")
         else:
             raise ParseError(f"filter rule '{rule.name}': unknown ban action '{action}' "
-                             f"(expected ban_last / ban_repeat(n) / ban_token(id))")
+                             f"(expected ban_last / ban_repeat(n) / ban_token(id) / ban_relation(...))")
     L.append("    return dropped;")
     L.append("}")
     return L

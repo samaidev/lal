@@ -1225,16 +1225,29 @@ float *lal_server_get_hidden(void) {
  * last_token: most recently generated token id (-1 at sequence start).
  * recent_tokens: array of recently generated token ids.
  * n_recent: length of recent_tokens.
+ * decode_fn: optional callback (may be NULL) that maps a token id → its
+ *   decoded text (writes into out_buf, returns length). Lets the .lal filter
+ *   do word-level / concept-level matching (e.g. ban_relation("France",
+ *   "capital", {"Paris"})) without needing its own tokenizer. Filters that
+ *   only use token-id rules (ban_last/ban_repeat/ban_token) ignore this.
  *
  * Returns: number of tokens dropped (for logging). */
+typedef int (*lal_token_decode_fn)(int token_id, char *out_buf, int max_len);
 int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
-                    const int *recent_tokens, int n_recent)
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn)
     __attribute__((weak));
 int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
-                    const int *recent_tokens, int n_recent) {
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn) {
     (void)keep_mask; (void)n_vocab; (void)last_token;
-    (void)recent_tokens; (void)n_recent;
+    (void)recent_tokens; (void)n_recent; (void)decode_fn;
     return 0;  /* no .lal filter linked — sampling unchanged */
+}
+
+/* Thin wrapper so the weak symbol sees the server's tokenizer. */
+static int _server_decode_for_filter(int token_id, char *out_buf, int max_len) {
+    return decode_token(token_id, out_buf, max_len);
 }
 
 /* KV cache for real causal self-attention.
@@ -1807,7 +1820,7 @@ static int gpt2_forward_token(int token_id, int position) {
          * banned tokens get zero probability. */
         {
             int last = (g_n_recent > 0) ? g_recent_tokens[g_n_recent - 1] : -1;
-            lal_filter_topk(keep_mask, VOCAB_SIZE, last, g_recent_tokens, g_n_recent);
+            lal_filter_topk(keep_mask, VOCAB_SIZE, last, g_recent_tokens, g_n_recent, _server_decode_for_filter);
             /* Safety: if the filter dropped everything, restore the top-k
              * pool (avoid empty-sample crash). Scan for any survivor. */
             int any_kept = 0;
