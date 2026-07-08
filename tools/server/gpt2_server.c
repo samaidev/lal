@@ -1265,7 +1265,15 @@ static int8_t *g_k_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode)
 static int8_t *g_v_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode) */
 static float  *g_k_scale[N_LAYER];     /* [n_ctx] per-row scale for K (turboquant) */
 static float  *g_v_scale[N_LAYER];     /* [n_ctx] per-row scale for V (turboquant) */
-static int    g_srv_real_attention = 0;  /* set by --real-attention */
+/* Real causal self-attention is ON by default. The V-copy fallback
+ * (memcpy of V into attn_out) is a defective path that drops all
+ * token-to-token context — the 12-layer transformer degenerates into a
+ * memoryless Markov process and the model regresses to "generate itself"
+ * repetition loops. That repetition is the exact symptom level-2 filters
+ * (ban_last/ban_repeat) were patching. Defaulting real attention on fixes
+ * the root cause for inference. Use --vcopy to restore the legacy fast
+ * (but context-free) path for benchmark comparison only. */
+static int    g_srv_real_attention = 1;  /* default ON; --vcopy disables */
 static int    g_use_dflash = 0;         /* set by --dflash (Dynamic Flash Attention) */
 static int    g_use_turboquant = 0;     /* set by --turboquant (KV cache int8 quant) */
 static int    g_skip_lm_head = 0;       /* internal: skip LM head during prefill (optimization) */
@@ -2252,6 +2260,11 @@ int main(int argc, char **argv) {
             g_mixed_precision = 1;
         } else if (strcmp(argv[i], "--real-attention") == 0) {
             g_srv_real_attention = 1;
+        } else if (strcmp(argv[i], "--vcopy") == 0) {
+            /* Legacy V-copy attention path: attn_out = V (no Q·K context).
+             * Context-free → repetition loops. Kept ONLY for benchmark
+             * comparison against the now-default real attention path. */
+            g_srv_real_attention = 0;
         } else if (strcmp(argv[i], "--dflash") == 0) {
             g_use_dflash = 1;
             g_srv_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
