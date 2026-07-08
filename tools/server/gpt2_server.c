@@ -236,7 +236,8 @@ typedef struct {
 } BinGPT2Layer;
 static BinGPT2Layer g_bin_layers[N_LAYER];
 static int g_binary_mode = 0;   /* set by --binary flag */
-static int g_use_bwn = 0;       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
+static int g_use_bwn = 0;
+static int g_use_rsign = 0;      /* --rsign: BNN with RSign (shift threshold to mean) */       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
 static int g_use_int8 = 0;      /* --int8: BWN with int8 activation quantization (2-9x speedup) */
 static int g_mixed_int8_layers = 0;  /* --mixed-int8 N: first N layers int8, rest BWN. 0=all-int8 */
 static int g_current_layer = 0;      /* set by forward loop, read by bin_matmul */
@@ -275,6 +276,24 @@ static void binarize_input(const float *x, uint64_t *x_bits, int in_dim, int n_w
         for (int bi = 0; bi < 64; bi++) {
             int idx = wi * 64 + bi;
             if (idx < in_dim && x[idx] > 0.0f) word |= (1ULL << bi);
+        }
+        x_bits[wi] = word;
+    }
+}
+
+/* RSign binarization (ReActNet-inspired): shift threshold to per-tensor mean.
+ * LayerNorm output is not always zero-centered; sign(x-mean) preserves more
+ * information than sign(x) when the distribution is skewed.
+ * No extra cost at inference (just different comparison). */
+static void binarize_input_rsign(const float *x, uint64_t *x_bits, int in_dim, int n_words) {
+    float mean = 0;
+    for (int i = 0; i < in_dim; i++) mean += x[i];
+    mean /= in_dim;
+    for (int wi = 0; wi < n_words; wi++) {
+        uint64_t word = 0;
+        for (int bi = 0; bi < 64; bi++) {
+            int idx = wi * 64 + bi;
+            if (idx < in_dim && x[idx] > mean) word |= (1ULL << bi);
         }
         x_bits[wi] = word;
     }
@@ -586,7 +605,8 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     } else {
         xb = malloc(n_words * sizeof(uint64_t));
     }
-    binarize_input(x, xb, bl->in_dim, n_words);
+    if (g_use_rsign) binarize_input_rsign(x, xb, bl->in_dim, n_words);
+    else binarize_input(x, xb, bl->in_dim, n_words);
 
     float x_scale = mean_abs;
     for (int j = 0; j < bl->out_dim; j++) {
@@ -2625,6 +2645,9 @@ int main(int argc, char **argv) {
             g_srv_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
         } else if (strcmp(argv[i], "--bwn") == 0) {
             g_use_bwn = 1;
+        } else if (strcmp(argv[i], "--rsign") == 0) {
+            g_use_rsign = 1;  /* BNN with RSign (implies --binary) */
+            g_binary_mode = 1;  /* load binary weights, use bin_matmul */
         } else if (strcmp(argv[i], "--int8") == 0) {
             g_use_bwn = 1;  /* int8 implies bwn */
             g_use_int8 = 1;
