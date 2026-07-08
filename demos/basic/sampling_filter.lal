@@ -6,14 +6,18 @@
 # narrowing, before softmax+sample), it calls lal_filter_topk() which this
 # file's `no_repeat` filter rule implements.
 #
-# The three ban actions below attack the most common binary-model quality
-# failure: repetitive token loops ("the the the...", "error error error...").
+# The ban actions below attack both statistical noise and semantic errors:
 #   - ban_last:     hard-bans the immediately-preceding token (complements
 #                   the server's soft rep_penalty, which only divides the logit)
 #   - ban_repeat(5): bans the last 5 generated tokens — blocks short n-gram
 #                   loops that survive ban_last (e.g. "A B A B A B")
 #   - ban_token(50256): bans the GPT-2 <|endoftext|> token from mid-generation
 #                   sampling (prevents premature truncation in long sequences)
+#   - ban_relation: concept-level constraint (logical parsing mapping).
+#                   If the decoded recent-token stream contains the trigger
+#                   substring, only candidates decoding to one of the allow
+#                   words survive. Implements "France capital → Paris" style
+#                   world-knowledge constraints without weight training.
 #
 # Compile (filter-only, no main — links cleanly into the server):
 #   lalc demos/basic/sampling_filter.lal _ --filter-only -o build/filter.o
@@ -32,3 +36,5 @@ filter no_repeat:
     ban_last
     ban_repeat(5)
     ban_token(50256)
+    ban_relation("France capital", "Paris", "French")
+    ban_relation("Japan capital", "Tokyo", "Japanese")
