@@ -1886,13 +1886,17 @@ static int gpt2_forward_token(int token_id, int position) {
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             bin_matmul(g_ln1, &L->c_attn, g_qkv);
 
-            /* Attention: dflash (tiled) > real_attention (standard) > V-copy */
+            /* Attention: dflash (tiled) > real_attention_simd (SIMD) > V-copy.
+             * Use SIMD version for binary path too — attention computation is
+             * identical regardless of weight format (QKV are float after
+             * bin_matmul). Previously binary path used scalar real_attention,
+             * which was the actual bottleneck (BinAnalyzer's profiling). */
             if ((g_srv_real_attention || g_use_dflash) && g_k_cache[l]) {
                 if (g_use_dflash) {
                     dflash_attention(g_attn_out, g_qkv, position, l);
                 } else {
-                    real_attention(g_attn_out, g_qkv, l, position,
-                                   g_k_cache[l], g_v_cache[l]);
+                    real_attention_simd(g_attn_out, g_qkv, l, position,
+                                        g_k_cache[l], g_v_cache[l]);
                 }
             } else {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
