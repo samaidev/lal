@@ -34,6 +34,8 @@ embedding AND output projection / LM head). Keep it float.
 import struct, sys, os
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def pack_sign_bits(signs_2d):
     """Pack a 2D sign array [out_dim, in_dim] into uint64s.
     Returns bytes of shape [out_dim * n_words, 8]."""
@@ -65,7 +67,7 @@ def main():
     vocab = model.config.vocab_size     # 50257
     n_ctx = model.config.n_ctx          # 1024
 
-    out_path = "/home/z/my-project/prebuilt/gpt2_binary.bin"
+    out_path = os.path.join(REPO_ROOT, "prebuilt", "gpt2_binary.bin")
     
     with open(out_path, "wb") as f:
         # Magic + header

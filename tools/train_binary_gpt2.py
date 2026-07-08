@@ -18,6 +18,8 @@ import math
 import time
 import os
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 class BinaryLinear(nn.Module):
     """Linear layer with binary weights via STE.
     
@@ -280,7 +282,7 @@ def main():
     
     # Save fine-tuned binary weights
     print("\n[*] exporting binary weights...")
-    export_binary_weights(model, "/home/z/my-project/prebuilt/gpt2_binary_finetuned.bin")
+    export_binary_weights(model, os.path.join(REPO_ROOT, "prebuilt", "gpt2_binary_finetuned.bin"))
     
     # Test generation with fine-tuned model
     print("\n[*] testing generation...")

@@ -11,7 +11,9 @@ This tells us if sparse matmul is worth implementing.
 import struct, sys, os
 import numpy as np
 
-WEIGHTS = "/home/z/my-project/prebuilt/gpt2_weights.bin"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+WEIGHTS = os.path.join(REPO_ROOT, "prebuilt", "gpt2_weights.bin")
 THRESHOLDS = [0.005, 0.01, 0.02, 0.03, 0.05, 0.1]
 
 def load_tensors(path):

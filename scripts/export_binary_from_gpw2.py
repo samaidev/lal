@@ -27,8 +27,10 @@ Format (GB2L):
 import struct, os, sys
 import numpy as np
 
-FLOAT_PATH = "/home/z/my-project/prebuilt/gpt2_weights.bin"
-OUT_PATH = "/home/z/my-project/prebuilt/gpt2_binary.bin"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+FLOAT_PATH = os.path.join(REPO_ROOT, "prebuilt", "gpt2_weights.bin")
+OUT_PATH = os.path.join(REPO_ROOT, "prebuilt", "gpt2_binary.bin")
 
 N_LAYER = 12
 N_EMBD = 768

@@ -16,6 +16,8 @@ the `transformers` library and internet to download the model).
 import random
 import math
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 WORDS = {
     # Animals cluster
     "cat": "animal", "dog": "animal", "horse": "animal", "elephant": "animal",
@@ -54,5 +56,5 @@ def generate(dim, path):
 
 
 if __name__ == "__main__":
-    generate(300, "/home/z/my-project/prebuilt/embeddings_300d.txt")
-    generate(768, "/home/z/my-project/prebuilt/embeddings_768d.txt")
+    generate(300, os.path.join(REPO_ROOT, "prebuilt", "embeddings_300d.txt"))
+    generate(768, os.path.join(REPO_ROOT, "prebuilt", "embeddings_768d.txt"))

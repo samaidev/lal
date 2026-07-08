@@ -13,6 +13,8 @@ This lets LAL-compiled C code do real NLP using GPT-2's semantic knowledge.
 import sys
 import math
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def main():
     from transformers import GPT2Tokenizer, GPT2Model
     import torch
@@ -53,7 +55,7 @@ def main():
     # GPT-2 uses BPE tokenization. For single common words, the word is usually
     # a single token (with a leading space). We look up each word's token.
     DIM = 768
-    out_path = "/home/z/my-project/prebuilt/gpt2_embeddings.txt"
+    out_path = os.path.join(REPO_ROOT, "prebuilt", "gpt2_embeddings.txt")
 
     exported = []
     for word in WORDS:

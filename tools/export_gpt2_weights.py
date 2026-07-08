@@ -10,6 +10,8 @@ and compile them into sparse specialized C code.
 import struct
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def main():
     from transformers import GPT2Model
     print("[*] loading gpt2...", flush=True)
@@ -17,7 +19,7 @@ def main():
     model.eval()
     sd = model.state_dict()
 
-    out_path = "/home/z/my-project/prebuilt/gpt2_weights.bin"
+    out_path = os.path.join(REPO_ROOT, "prebuilt", "gpt2_weights.bin")
     with open(out_path, "wb") as f:
         # Header: magic + count
         f.write(b"GPW2")

@@ -3,6 +3,8 @@
 import struct
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def main():
     from transformers import AutoModelForCausalLM
     import torch
@@ -11,7 +13,7 @@ def main():
     model.eval()
     sd = model.state_dict()
 
-    out_path = "/home/z/my-project/prebuilt/qwen_weights.bin"
+    out_path = os.path.join(REPO_ROOT, "prebuilt", "qwen_weights.bin")
     # Write in chunks to avoid memory spike
     with open(out_path, "wb") as f:
         f.write(b"GPW2")

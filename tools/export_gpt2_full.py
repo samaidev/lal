@@ -17,6 +17,8 @@ import struct
 import json
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def bytes_to_unicode():
     """GPT-2's byte-to-unicode mapping. Returns dict: byte_val -> unicode_char."""
     bs = list(range(ord("!"), ord("~") + 1)) + \
@@ -48,7 +50,7 @@ def main():
     vocab = model.config.vocab_size      # 50257
 
     # === Export weights (GPW2 format, same as before) ===
-    weight_path = "/home/z/my-project/prebuilt/gpt2_weights.bin"
+    weight_path = os.path.join(REPO_ROOT, "prebuilt", "gpt2_weights.bin")
     with open(weight_path, "wb") as f:
         f.write(b"GPW2")
         f.write(struct.pack("I", len(sd)))
@@ -65,7 +67,7 @@ def main():
     print(f"[*] weights: {weight_path} ({os.path.getsize(weight_path)/1e6:.1f} MB)")
 
     # === Export tokenizer ===
-    tok_path = "/home/z/my-project/prebuilt/gpt2_tokenizer.bin"
+    tok_path = os.path.join(REPO_ROOT, "prebuilt", "gpt2_tokenizer.bin")
     b2u = bytes_to_unicode()
     u2b = {v: k for k, v in b2u.items()}
 

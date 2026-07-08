@@ -22,6 +22,8 @@ embeddings.
 """
 import sys
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def main():
     try:
         from transformers import BertTokenizer, BertModel
@@ -47,7 +49,7 @@ def main():
     model.eval()
 
     DIM = 768
-    out_path = "/home/z/my-project/scripts/lal/bert_embeddings.txt"
+    out_path = os.path.join(REPO_ROOT, "scripts", "lal", "bert_embeddings.txt")
 
     with open(out_path, "w") as f:
         f.write(f"{len(WORDS)} {DIM}\n")
