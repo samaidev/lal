@@ -24,3 +24,5 @@ skills/
 upload/
 .env
 prebuilt/gpt2_binary.bin
+prebuilt/gpt2_synthetic.bin
+prebuilt/qwen_tokenizer.json

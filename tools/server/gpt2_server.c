@@ -213,6 +213,13 @@ typedef struct {
     float    *alpha;   /* [out_dim] — per-output scale = mean|w| */
     float    *bias;    /* [out_dim] */
     int       in_dim, out_dim, n_words;
+    /* Logic-guided (GB2L2): per-output 0=CORE(float), 1=BINARY(sign+alpha), 2=PRUNE(zero).
+     * When logic_mask is non-NULL, wbits/alpha are stored in FULL [out_dim] layout
+     * (CORE/PRUNE rows zeroed) so bin_matmul can index by output j directly,
+     * matching the runtime's logic forward. w_core holds the CORE float rows. */
+    uint8_t  *logic_mask;  /* [out_dim], NULL for plain GB2L (all-BINARY) */
+    float    *w_core;      /* [n_core * in_dim] — CORE float rows */
+    int       n_core;      /* number of CORE outputs (rows in w_core) */
 } SrvBinLayer;
 
 typedef struct {
@@ -312,6 +319,71 @@ static void ternarize_input(const float *x, uint64_t *x_sign, uint64_t *x_mask,
  */
 static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     int n_words = bl->n_words;
+
+    /* Logic-guided path (GB2L2): per-output CORE / BINARY / PRUNE dispatch,
+     * matching the runtime's bin_forward logic branch. CORE = float dot with
+     * w_core; BINARY = sign(w)·alpha·K (K = mean|x|, BWN-consistent); PRUNE = 0. */
+    if (bl->logic_mask) {
+        int in = bl->in_dim, nw = bl->n_words;
+        float abs_sum = 0.0f;
+        for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
+        float K = abs_sum / in;
+
+        static float lg_sign_lut[256][8];
+        static int lut_init = 0;
+        if (!lut_init) {
+            for (int b = 0; b < 256; b++)
+                for (int i = 0; i < 8; i++)
+                    lg_sign_lut[b][i] = (b >> i) & 1 ? 1.0f : -1.0f;
+            lut_init = 1;
+        }
+
+        int core_idx = 0;
+        for (int j = 0; j < bl->out_dim; j++) {
+            switch (bl->logic_mask[j]) {
+            case 0: { /* CORE: float dot with w_core */
+                const float *wc = &bl->w_core[(size_t)core_idx * in];
+                float s = 0.0f;
+                for (int i = 0; i + 7 < in; i += 8) {
+                    s += x[i+0]*wc[i+0] + x[i+1]*wc[i+1] + x[i+2]*wc[i+2] + x[i+3]*wc[i+3];
+                    s += x[i+4]*wc[i+4] + x[i+5]*wc[i+5] + x[i+6]*wc[i+6] + x[i+7]*wc[i+7];
+                }
+                for (int i = (in/8)*8; i < in; i++) s += x[i] * wc[i];
+                y[j] = s + bl->bias[j];
+                core_idx++;
+                break;
+            }
+            case 1: { /* BINARY: sign(w) dot x, scaled by alpha * K */
+                const uint64_t *wb = bl->wbits + (size_t)j * nw;
+                float s = 0.0f;
+                for (int wi = 0; wi < nw; wi++) {
+                    uint64_t w = wb[wi];
+                    int base = wi * 64;
+                    for (int bi = 0; bi < 8; bi++) {
+                        int idx = base + bi * 8;
+                        uint8_t byte = (uint8_t)((w >> (bi * 8)) & 0xFF);
+                        const float *sw = lg_sign_lut[byte];
+                        if (idx + 7 < in) {
+                            s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
+                            s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                        } else {
+                            for (int k = 0; k < 8; k++) {
+                                int i = idx + k;
+                                if (i < in) s += x[i] * sw[k];
+                            }
+                        }
+                    }
+                }
+                y[j] = s * bl->alpha[j] * K + bl->bias[j];
+                break;
+            }
+            default: /* PRUNE: zero */
+                y[j] = 0.0f;
+                break;
+            }
+        }
+        return;
+    }
 
     /* Compute mean(|x|) over the active elements — the input scale factor.
      * In ternary mode, "active" means survivors (|x| >= threshold); the
@@ -455,15 +527,25 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     if (n_words > 16) free(xb);
 }
 
-/* Load GB2L binary weight file directly (no float weights in memory!) */
+/* Load GB2L / GB2L2 binary weight file directly (no float weights in memory!).
+ * GB2L  = all-binary (v1). GB2L2 = logic-guided (CORE/BINARY/PRUNE per output). */
 static int load_binary_weights(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[!] cannot open %s\n", path); return -1; }
 
+    /* Magic: "GB2L" (v1, 4B) or "GB2L2" (v2 logic-guided, 5B). Read 4, then
+     * peek the 5th byte: if '2' it's v2; otherwise seek back one (v1 header). */
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "GB2L", 4) != 0) {
         fprintf(stderr, "[!] bad magic in %s\n", path); fclose(f); return -1;
     }
+    int is_logic = 0;
+    char c5;
+    if (fread(&c5, 1, 1, f) == 1) {
+        if (c5 == '2') is_logic = 1;
+        else fseek(f, -1, SEEK_CUR);  /* v1: the byte belongs to the header */
+    }
+    fprintf(stderr, "[*] binary weights: %s format\n", is_logic ? "GB2L2 (logic-guided)" : "GB2L (all-binary)");
 
     unsigned int hdr[5];
     if (fread(hdr, 4, 5, f) != 5) { fclose(f); return -1; }
@@ -506,15 +588,60 @@ static int load_binary_weights(const char *path) {
             bl->out_dim = mhdr[0];
             bl->in_dim  = mhdr[1];
             bl->n_words = mhdr[2];
-            /* Read wbits: [out_dim * n_words] uint64s */
-            bl->wbits = malloc((size_t)bl->out_dim * bl->n_words * sizeof(uint64_t));
-            fread(bl->wbits, sizeof(uint64_t),
-                  (size_t)bl->out_dim * bl->n_words, f);
-            /* Read alpha + bias */
-            bl->alpha = malloc(bl->out_dim * sizeof(float));
-            bl->bias  = malloc(bl->out_dim * sizeof(float));
-            fread(bl->alpha, sizeof(float), bl->out_dim, f);
-            fread(bl->bias,  sizeof(float), bl->out_dim, f);
+            bl->logic_mask = NULL;
+            bl->w_core = NULL;
+            bl->n_core = 0;
+
+            if (is_logic) {
+                /* GB2L2: header 4th field = n_core. Read logic_mask, then
+                 * compacted BINARY rows (expand to full [out_dim] layout),
+                 * compacted alpha, full bias, then CORE float rows. */
+                int n_core = (int)mhdr[3];
+                bl->n_core = n_core;
+                bl->logic_mask = malloc(bl->out_dim);
+                if (fread(bl->logic_mask, 1, bl->out_dim, f) != (size_t)bl->out_dim)
+                { fclose(f); return -1; }
+                int n_binary = 0;
+                for (int j = 0; j < bl->out_dim; j++)
+                    if (bl->logic_mask[j] == 1) n_binary++;
+
+                /* wbits: expand compacted [n_binary × n_words] → full [out_dim × n_words] */
+                bl->wbits = calloc((size_t)bl->out_dim * bl->n_words, sizeof(uint64_t));
+                for (int j = 0, bi = 0; j < bl->out_dim; j++) {
+                    if (bl->logic_mask[j] == 1) {
+                        if (fread(bl->wbits + (size_t)j * bl->n_words, sizeof(uint64_t),
+                                  bl->n_words, f) != (size_t)bl->n_words)
+                        { fclose(f); return -1; }
+                        bi++;
+                    }
+                }
+                /* alpha: compacted [n_binary] → full [out_dim] (non-binary rows stay 0) */
+                bl->alpha = calloc(bl->out_dim, sizeof(float));
+                for (int j = 0; j < bl->out_dim; j++) {
+                    if (bl->logic_mask[j] == 1) {
+                        if (fread(&bl->alpha[j], sizeof(float), 1, f) != 1)
+                        { fclose(f); return -1; }
+                    }
+                }
+                /* bias: full [out_dim] (PRUNE bias already 0 in the file) */
+                bl->bias = malloc(bl->out_dim * sizeof(float));
+                if (fread(bl->bias, sizeof(float), bl->out_dim, f) != (size_t)bl->out_dim)
+                { fclose(f); return -1; }
+                /* w_core: [n_core × in_dim] float */
+                bl->w_core = malloc((size_t)n_core * bl->in_dim * sizeof(float));
+                if (fread(bl->w_core, sizeof(float), (size_t)n_core * bl->in_dim, f)
+                    != (size_t)n_core * bl->in_dim)
+                { fclose(f); return -1; }
+            } else {
+                /* GB2L v1: all-binary. wbits [out_dim × n_words], alpha [out_dim], bias [out_dim] */
+                bl->wbits = malloc((size_t)bl->out_dim * bl->n_words * sizeof(uint64_t));
+                fread(bl->wbits, sizeof(uint64_t),
+                      (size_t)bl->out_dim * bl->n_words, f);
+                bl->alpha = malloc(bl->out_dim * sizeof(float));
+                bl->bias  = malloc(bl->out_dim * sizeof(float));
+                fread(bl->alpha, sizeof(float), bl->out_dim, f);
+                fread(bl->bias,  sizeof(float), bl->out_dim, f);
+            }
         }
     }
 

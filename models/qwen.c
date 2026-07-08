@@ -1,14 +1,21 @@
-/* models/qwen.c — Qwen model definition (just config + main, ~30 lines)
+/* models/qwen.c — Qwen model definition (config + training main)
  *
  * Uses lal_runtime Level 3 API. Qwen uses LLaMA architecture:
  *   RMSNorm, RoPE, SwiGLU, separate Q/K/V/O.
  *
+ * Training data: scripts/qwen_train_data.h — pre-tokenized with the REAL
+ * Qwen2-0.5B BPE tokenizer (scripts/gen_qwen_train_data.py). This replaces
+ * the old hardcoded fake tokens (encode() returning 1..7) so Qwen training
+ * runs on real data, mirroring how models/gpt2.c consumes train_data.h.
+ *
  * Build: gcc -O3 -mavx2 -o qwen models/qwen.c runtime/lal_runtime.c -lm
- * Run:   ./qwen 10000 0.05
+ * Run:   ./qwen 10000 0.002 --logic --ste --real-attention
  */
 #define _POSIX_C_SOURCE 199309L
 #include <time.h>
+#include <string.h>
 #include "../runtime/lal_runtime.h"
+#include "../scripts/qwen_train_data.h"
 
 /* === Qwen-0.5B config — the ONLY difference from GPT-2 === */
 static ModelConfig qwen_config(void) {
@@ -23,50 +30,58 @@ static ModelConfig qwen_config(void) {
     };
 }
 
-/* === Training data (same as GPT-2, but would use Qwen tokenizer) === */
-static const char *TEXTS[] = {
-    "The capital of France is Paris.", "The capital of Japan is Tokyo.",
-    "The capital of Germany is Berlin.", "Hello, how are you doing today?",
-    "Once upon a time, there was a kingdom.", "The weather today is sunny and warm.",
-    "Machine learning is a subset of AI.", "The world is a place of great beauty.",
-    "I think, therefore I am.", "Knowledge is power.",
-};
-
-/* Placeholder encode — real version would use Qwen's tiktoken BPE */
-static int encode(const char *t, int *tk) {
-    tk[0]=1; tk[1]=2; tk[2]=3; tk[3]=4; tk[4]=5; tk[5]=6; tk[6]=7;
-    return 7;  /* TODO: use real Qwen tokenizer */
-}
-
 int main(int argc, char **argv) {
     int n_steps = argc > 1 ? atoi(argv[1]) : 200;
     float lr = argc > 2 ? atof(argv[2]) : 0.05;
+    int use_logic = 0, use_ste = 0, use_real_attn = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--logic") == 0) use_logic = 1;
+        else if (strcmp(argv[i], "--ste") == 0) use_ste = 1;
+        else if (strcmp(argv[i], "--real-attention") == 0) use_real_attn = 1;
+    }
 
     printf("[*] LAL Training — Qwen (model-agnostic runtime, no PyTorch)\n");
     printf("[*] steps:%d lr:%f\n", n_steps, lr);
+
+    if (use_logic) {
+        g_use_logic_binarization = 1;
+        printf("[*] Logic-guided binarization: top 20%% norm → CORE(float), bottom 10%% → PRUNE(zero)\n");
+    }
+    if (use_ste) {
+        g_use_ste = 1;
+        printf("[*] STE mode: binary weights updated via Straight-Through Estimator\n");
+        if (lr > 0.01f) {
+            printf("[!] WARNING: STE with lr=%f > 0.01 is likely to diverge (NaN). Clamping to 0.005.\n", lr);
+            lr = 0.005f;
+        }
+    }
+    if (use_real_attn) {
+        g_use_real_attention = 1;
+        printf("[*] Real attention: causal multi-head QK softmax + KV cache (replaces V-copy)\n");
+    }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     Model model;
-    /* The only difference from GPT-2: config + qkv_merged=0 */
-    model_load(&model, "/home/z/my-project/prebuilt/qwen_weights.bin",
-               qwen_config(), "model.layers.%d.", 0);
+    const char *weight_path = getenv("LAL_WEIGHTS");
+    if (!weight_path) weight_path = "prebuilt/qwen_weights.bin";
+    model_load(&model, weight_path, qwen_config(), "model.layers.%d.", 0);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("[*] load: %.1fs\n", (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    printf("[*] training...\n");
+    printf("[*] training with %d pre-tokenized sentences (real Qwen2 BPE)...\n", N_TRAIN);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int step = 0; step < n_steps; step++) {
-        int ti = step % 10;
-        int tokens[16]; int n = encode(TEXTS[ti], tokens);
-        int target = tokens[n-1];
-        int tt[16]; memcpy(tt, tokens, (n-1)*sizeof(int)); tt[n-1] = target;
+        int ti = step % N_TRAIN;
+        int n = train_data[ti].n;
+        int target = train_data[ti].ids[n-1];
+        int tt[32]; memcpy(tt, train_data[ti].ids, n * sizeof(int));
         float loss = model_forward(&model, tt, n-1);
         model_backward(&model, tt, n-1, lr);
-        if (step % 20 == 0)
-            printf("  step %4d  loss=%.4f  \"%s\"\n", step, loss, TEXTS[ti]);
+        if (step % 50 == 0)
+            printf("  step %4d  loss=%.4f  (sentence %d, %d tokens)\n", step, loss, ti, n);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;

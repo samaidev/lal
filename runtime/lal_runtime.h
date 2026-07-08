@@ -217,6 +217,7 @@ typedef struct {
     float norm2_cache[4];
     float *mlp_hidden;    /* MLP hidden state (after activation) */
     float *mlp_out;       /* MLP output */
+    int   seq_pos;        /* position of the cached forward pass (for attention bwd) */
 } TransAct;
 
 /* Initialize a transformer layer from tensors (model-agnostic) */
@@ -266,6 +267,19 @@ void attention_forward(float *attn_out, const float *qkv,
                        int n_embd, int n_head,
                        int seq_pos,
                        float *k_cache_layer, float *v_cache_layer);
+
+/* Attention backward: given grad w.r.t. attn_out at the current position,
+ * compute grad w.r.t. Q, K, V at the current position. Cached K/V at
+ * positions 0..seq_pos-1 are treated as constants (no gradient flows to
+ * them — only the current token's QKV projection learns, consistent with
+ * the single-position activation cache in model_forward/backward).
+ *
+ * qkv:        [3*n_embd] current Q|K|V (contiguous, both merged & separate)
+ * grad_qkv:   [3*n_embd] output grad Q|K|V (caller-allocated, zeroed here)
+ * k/v_cache:  [n_ctx*n_embd] — read for scores/weights and current-position K,V */
+void attention_backward(float *grad_qkv, const float *grad_attn_out,
+                        const float *qkv, int n_embd, int n_head, int seq_pos,
+                        const float *k_cache_layer, const float *v_cache_layer);
 
 /* Forward decl — model_kv_cache_alloc/free defined after Model struct below */
 struct Model;

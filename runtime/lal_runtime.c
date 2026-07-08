@@ -202,6 +202,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
                          ModelConfig *cfg, int seq_pos) {
     int n = cfg->n_embd, m = cfg->mlp_dim;
     float rs = cfg->residual_scale;
+    act->seq_pos = seq_pos;  /* cached for attention backward */
 
     /* Save x before norm1 */
     memcpy(act->x_pre_norm1, x, n * sizeof(float));
@@ -353,9 +354,28 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
     /* Attention backward */
     for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs;
     BIN_BW(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
-    memset(g_qkv, 0, 3 * n * sizeof(float));
-    memcpy(g_qkv + 2 * n, g_attn, n * sizeof(float));
-    BIN_BW(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
+    if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
+        /* Real attention: dQ/dK/dV at the current position. act->q is the
+         * contiguous [Q|K|V] buffer (k=q+n, v=q+2n), valid for both merged
+         * and separate QKV layouts. */
+        attention_backward(g_qkv, g_attn, act->q, n, cfg->n_head,
+                           act->seq_pos, tl->_kv_k, tl->_kv_v);
+    } else {
+        /* Legacy V-copy: only V receives gradient (Q, K grad = 0). */
+        memset(g_qkv, 0, 3 * n * sizeof(float));
+        memcpy(g_qkv + 2 * n, g_attn, n * sizeof(float));
+    }
+    if (cfg->qkv_merged) {
+        /* GPT-2: attn_q is the merged [in→3n] projection. */
+        BIN_BW(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
+    } else {
+        /* LLaMA/Qwen: separate Q/K/V projections — backprop each. */
+        static float g_n1k[4096], g_n1v[4096];
+        BIN_BW(g_norm1,  g_qkv,       act->norm1_out, &tl->attn_q, lr);
+        BIN_BW(g_n1k,    g_qkv + n,   act->norm1_out, &tl->attn_k, lr);
+        BIN_BW(g_n1v,    g_qkv + 2*n, act->norm1_out, &tl->attn_v, lr);
+        for (int i = 0; i < n; i++) g_norm1[i] += g_n1k[i] + g_n1v[i];
+    }
     norm_backward(g_pre, g_norm1, act->x_pre_norm1, tl->norm1_w,
                   act->norm1_cache, cfg->norm_type, n);
     for (int i = 0; i < n; i++) grad_x[i] += g_pre[i] * rs;
@@ -373,6 +393,11 @@ TransAct *trans_act_alloc(ModelConfig *cfg) {
         acts[l].x_pre_norm1 = malloc(n * sizeof(float));
         acts[l].norm1_out = malloc(n * sizeof(float));
         acts[l].q = malloc(3 * n * sizeof(float));
+        /* k/v alias into the contiguous Q|K|V buffer so both merged (GPT-2)
+         * and separate (LLaMA/Qwen) paths share one [3n] layout. Previously
+         * k/v were left NULL for the separate path → segfault. */
+        acts[l].k = acts[l].q + n;
+        acts[l].v = acts[l].q + 2 * n;
         acts[l].attn_out = malloc(n * sizeof(float));
         acts[l].proj_out = malloc(n * sizeof(float));
         acts[l].x_pre_norm2 = malloc(n * sizeof(float));
@@ -459,6 +484,99 @@ void attention_forward(float *attn_out, const float *qkv,
             float w = attn_weights[j];
             const float *V_jh = v_cache_layer + (size_t)j * n_embd + h * head_dim;
             for (int d = 0; d < head_dim; d++) out_h[d] += w * V_jh[d];
+        }
+    }
+}
+
+/* ----- Attention backward (dQ/dK/dV) -----
+ * Computes gradients for the current token's Q, K, V. Cached K/V at positions
+ * 0..seq_pos-1 are treated as constants (they are context, not learned here —
+ * only the current token's QKV projection receives gradient, matching the
+ * single-position activation cache used by model_forward/backward).
+ *
+ * Per head h (head_dim d, scale = 1/sqrt(head_dim)):
+ *   forward: scores[j]=Q·K_j*scale; w=softmax(scores); out=sum_j w[j]*V_j
+ *   backward:
+ *     g_w[j]      = <g_out, V_j>                       (grad w.r.t. weight j)
+ *     g_scores[j] = w[j] * (g_w[j] - <g_w, w>)         (softmax bwd)
+ *     g_Q[d]     += sum_j g_scores[j] * K_j[d] * scale
+ *     g_K_cur[d] += g_scores[seq_pos] * Q[d] * scale   (current K only)
+ *     g_V_cur[d] += w[seq_pos] * g_out[d]              (current V only)
+ */
+void attention_backward(float *grad_qkv, const float *grad_attn_out,
+                        const float *qkv, int n_embd, int n_head, int seq_pos,
+                        const float *k_cache_layer, const float *v_cache_layer) {
+    int head_dim = n_embd / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int n_attend = seq_pos + 1;  /* positions 0..seq_pos inclusive */
+    if (n_attend > 1024) n_attend = 1024;  /* clip to scratch size */
+
+    const float *Q = qkv;
+    float *gQ = grad_qkv;
+    float *gK = grad_qkv + n_embd;      /* grad K at current position */
+    float *gV = grad_qkv + 2 * n_embd;  /* grad V at current position */
+    memset(grad_qkv, 0, 3 * n_embd * sizeof(float));
+
+    /* If the current position fell outside the (clipped) attended window,
+     * there is no self-attention gradient to propagate. */
+    int have_self = (seq_pos >= 0 && seq_pos < n_attend);
+
+    float scores[1024], w[1024], g_w[1024];
+
+    for (int h = 0; h < n_head; h++) {
+        const float *Q_h = Q + h * head_dim;
+        const float *g_out_h = grad_attn_out + h * head_dim;
+
+        /* Recompute scores + softmax weights (K is in the cache). */
+        float max_score = -1e30f;
+        for (int j = 0; j < n_attend; j++) {
+            const float *K_jh = k_cache_layer + (size_t)j * n_embd + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[j] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+        float sum_exp = 0.0f;
+        for (int j = 0; j < n_attend; j++) {
+            float e = expf(scores[j] - max_score);
+            w[j] = e; sum_exp += e;
+        }
+        float inv = 1.0f / (sum_exp + 1e-12f);
+        for (int j = 0; j < n_attend; j++) w[j] *= inv;
+
+        /* g_w[j] = <g_out, V_j>; dot_gw_w = <g_w, w> */
+        float dot_gw_w = 0.0f;
+        for (int j = 0; j < n_attend; j++) {
+            const float *V_jh = v_cache_layer + (size_t)j * n_embd + h * head_dim;
+            float s = 0.0f;
+            for (int d = 0; d < head_dim; d++) s += g_out_h[d] * V_jh[d];
+            g_w[j] = s;
+            dot_gw_w += w[j] * s;
+        }
+        /* g_scores[j] = w[j] * (g_w[j] - dot_gw_w)  (now reuse g_w buffer) */
+        for (int j = 0; j < n_attend; j++) g_w[j] = w[j] * (g_w[j] - dot_gw_w);
+
+        /* g_Q[d] += sum_j g_scores[j] * K_j[d] * scale */
+        float *gQ_h = gQ + h * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            float s = 0.0f;
+            for (int j = 0; j < n_attend; j++) {
+                const float *K_jh = k_cache_layer + (size_t)j * n_embd + h * head_dim;
+                s += g_w[j] * K_jh[d];
+            }
+            gQ_h[d] += s * scale;
+        }
+
+        if (have_self) {
+            /* g_K_cur[d] += g_scores[seq_pos] * Q[d] * scale  (current K only) */
+            float gs_cur = g_w[seq_pos] * scale;
+            float *gK_h = gK + h * head_dim;
+            for (int d = 0; d < head_dim; d++) gK_h[d] += gs_cur * Q_h[d];
+            /* g_V_cur[d] += w[seq_pos] * g_out[d]  (current V only) */
+            float w_cur = w[seq_pos];
+            float *gV_h = gV + h * head_dim;
+            for (int d = 0; d < head_dim; d++) gV_h[d] += w_cur * g_out_h[d];
         }
     }
 }
@@ -605,14 +723,36 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
 
 float model_forward(Model *m, const int *tokens, int n_tokens) {
     int n = m->cfg.n_embd;
+    int nL = m->cfg.n_layer;
     static float x[4096];
-    int t = n_tokens - 1;
+    int t = n_tokens - 1;  /* predict tokens[t+1] from context tokens[0..t] */
+
+    if (g_use_real_attention && m->k_cache) {
+        /* Real attention needs the KV cache for positions 0..t to hold THIS
+         * sequence's keys/values. The cache persists across training steps
+         * (different sentences), so (re)fill 0..t-1 as context before running
+         * the target position t. Context positions are run through all layers
+         * with a scratch activation buffer (not stored); only their K/V land
+         * in the cache and are treated as constants during backward. */
+        static float xc[4096];
+        static TransAct *scratch = NULL;
+        if (!scratch) scratch = trans_act_alloc(&m->cfg);
+        for (int p = 0; p < t; p++) {
+            for (int i = 0; i < n; i++) {
+                xc[i] = m->wte[tokens[p] * n + i];
+                if (m->wpe) xc[i] += m->wpe[p * n + i];
+            }
+            for (int l = 0; l < nL; l++)
+                trans_layer_forward(xc, &m->layers[l], &scratch[l], &m->cfg, p);
+        }
+    }
+
     for (int i = 0; i < n; i++) {
         x[i] = m->wte[tokens[t] * n + i];
         if (m->wpe) x[i] += m->wpe[t * n + i];
     }
 
-    for (int l = 0; l < m->cfg.n_layer; l++)
+    for (int l = 0; l < nL; l++)
         trans_layer_forward(x, &m->layers[l], &m->acts[l], &m->cfg, t);
 
     memcpy(m->x_before_final, x, n * sizeof(float));
