@@ -1455,14 +1455,21 @@ static int _server_decode_for_filter(int token_id, char *out_buf, int max_len) {
 }
 
 /* KV cache for real causal self-attention.
- * Per layer: K and V for all positions [n_ctx, n_embd].
- * Total: 12 layers × 2 (K+V) × 1024 × 768 × 4 bytes = 72 MB.
- * Only allocated if --real-attention flag is set.
+ * Per layer: K and V for all positions, stored HEAD-MAJOR:
+ *   [N_HEAD][n_ctx][head_dim] instead of [n_ctx][N_EMBD].
+ * Total: 12 layers × 2 (K+V) × 12 × 1024 × 64 × 4 bytes = 72 MB (same size).
+ * Head-major layout makes K/V for a fixed head across positions contiguous,
+ * so the QK dot-product loop (iterating j=0..position for head h) reads
+ * sequential memory instead of striding by N_EMBD=768 floats (3KB) per step.
+ * This dramatically improves L1/L2 cache utilization for attention.
  *
  * TurboQuant: when --turboquant is set, KV cache is stored as int8 + per-row
  * scale (4x compression: 72MB → 18MB). K/V are quantized on write and
- * dequantized on read in the attention functions. Based on Google Research's
- * TurboQuant technique for KV cache compression. */
+ * dequantized on read in the attention functions. */
+#define KV_CACHE_CTX   1024   /* max sequence length (matches allocation) */
+#define KV_HD          (N_EMBD / N_HEAD)  /* head_dim = 64 */
+/* Offset for head h, position j in head-major KV cache */
+#define KV_OFF(h, j)   ((size_t)(h) * KV_CACHE_CTX * KV_HD + (size_t)(j) * KV_HD)
 static float *g_k_cache[N_LAYER];       /* [n_ctx, n_embd] per layer (float mode) */
 static float *g_v_cache[N_LAYER];       /* [n_ctx, n_embd] per layer (float mode) */
 static int8_t *g_k_cache_q[N_LAYER];   /* [n_ctx, n_embd] int8 (turboquant mode) */
@@ -1609,8 +1616,11 @@ static void dflash_attention(float *attn_out, const float *qkv,
         g_v_scale[layer_idx][position] = turboquant_quantize(
             g_v_cache_q[layer_idx] + (size_t)position * N_EMBD, V_new, N_EMBD);
     } else {
-        memcpy(g_k_cache[layer_idx] + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
-        memcpy(g_v_cache[layer_idx] + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+        /* Head-major scatter write for float cache */
+        for (int h = 0; h < n_head; h++) {
+            memcpy(g_k_cache[layer_idx] + KV_OFF(h, position), K_new + h * head_dim, head_dim * sizeof(float));
+            memcpy(g_v_cache[layer_idx] + KV_OFF(h, position), V_new + h * head_dim, head_dim * sizeof(float));
+        }
     }
 
     /* Temporary buffer for dequantized row (turboquant only) */
@@ -1651,7 +1661,7 @@ static void dflash_attention(float *attn_out, const float *qkv,
                                       g_k_scale[layer_idx][j], N_EMBD);
                 K_jh = k_row + h * head_dim;
             } else {
-                K_jh = g_k_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+                K_jh = g_k_cache[layer_idx] + KV_OFF(h, j);
             }
             v8f k0 = v8f_load(K_jh + 0);
             v8f k1 = v8f_load(K_jh + 8);
@@ -1695,7 +1705,7 @@ static void dflash_attention(float *attn_out, const float *qkv,
                                       g_v_scale[layer_idx][j], N_EMBD);
                 V_jh = v_row + h * head_dim;
             } else {
-                V_jh = g_v_cache[layer_idx] + (size_t)j * N_EMBD + h * head_dim;
+                V_jh = g_v_cache[layer_idx] + KV_OFF(h, j);
             }
             o0 = v8f_fmadd(wv, v8f_load(V_jh + 0),  o0);
             o1 = v8f_fmadd(wv, v8f_load(V_jh + 8),  o1);
@@ -1728,9 +1738,11 @@ static void real_attention(float *attn_out, const float *qkv, int layer_idx,
     const float *K_new = qkv + N_EMBD;     /* [n_embd] */
     const float *V_new = qkv + 2*N_EMBD;   /* [n_embd] */
 
-    /* Store current K, V into cache at this position */
-    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
-    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+    /* Store current K, V into cache at this position — head-major scatter */
+    for (int h = 0; h < n_head; h++) {
+        memcpy(k_cache_layer + KV_OFF(h, position), K_new + h * head_dim, head_dim * sizeof(float));
+        memcpy(v_cache_layer + KV_OFF(h, position), V_new + h * head_dim, head_dim * sizeof(float));
+    }
 
     float scores[1024];  /* max seq_len per head */
     float attn_weights[1024];
@@ -1741,7 +1753,7 @@ static void real_attention(float *attn_out, const float *qkv, int layer_idx,
         /* Compute scores[j] = Q_h · K[j, h] * scale, for j = 0..position */
         float max_score = -1e30f;
         for (int j = 0; j <= position; j++) {
-            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *K_jh = k_cache_layer + KV_OFF(h, j);
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
             dot *= scale;
@@ -1764,7 +1776,7 @@ static void real_attention(float *attn_out, const float *qkv, int layer_idx,
         for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
         for (int j = 0; j <= position; j++) {
             float w = attn_weights[j];
-            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *V_jh = v_cache_layer + KV_OFF(h, j);
             for (int d = 0; d < head_dim; d++) out_h[d] += w * V_jh[d];
         }
     }
@@ -1785,8 +1797,14 @@ static void real_attention_simd(float *attn_out, const float *qkv, int layer_idx
     const float *V_new = qkv + 2 * N_EMBD;
 
     /* Cache K, V for this position. */
-    memcpy(k_cache_layer + (size_t)position * N_EMBD, K_new, N_EMBD * sizeof(float));
-    memcpy(v_cache_layer + (size_t)position * N_EMBD, V_new, N_EMBD * sizeof(float));
+    /* Cache K, V for this position — head-major scatter write.
+     * Each head's K/V is stored contiguously across positions, so the QK
+     * dot-product loop reads sequential memory (stride=head_dim=64 floats=256B)
+     * instead of striding by N_EMBD=768 floats=3KB. */
+    for (int h = 0; h < N_HEAD; h++) {
+        memcpy(k_cache_layer + KV_OFF(h, position), K_new + h * head_dim, head_dim * sizeof(float));
+        memcpy(v_cache_layer + KV_OFF(h, position), V_new + h * head_dim, head_dim * sizeof(float));
+    }
 
     static float scores[1024];      /* max seq len */
     static float attn_weights[1024];
@@ -1794,10 +1812,11 @@ static void real_attention_simd(float *attn_out, const float *qkv, int layer_idx
     for (int h = 0; h < N_HEAD; h++) {
         const float *Q_h = Q + h * head_dim;
 
-        /* scores[j] = (Q_h · K[j,h]) * scale, vectorized. */
+        /* scores[j] = (Q_h · K[j,h]) * scale, vectorized.
+         * K[j,h] is now contiguous: KV_OFF(h,j) to KV_OFF(h,j)+head_dim. */
         float max_score = -1e30f;
         for (int j = 0; j <= position; j++) {
-            const float *K_jh = k_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *K_jh = k_cache_layer + KV_OFF(h, j);
             v8f acc = v8f_zero();
             int d = 0;
             for (; d + 8 <= head_dim; d += 8)
@@ -1824,7 +1843,7 @@ static void real_attention_simd(float *attn_out, const float *qkv, int layer_idx
         for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
         for (int j = 0; j <= position; j++) {
             float w = attn_weights[j];
-            const float *V_jh = v_cache_layer + (size_t)j * N_EMBD + h * head_dim;
+            const float *V_jh = v_cache_layer + KV_OFF(h, j);
             v8f wv = v8f_set1(w);
             int d = 0;
             for (; d + 8 <= head_dim; d += 8) {
