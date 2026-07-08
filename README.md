@@ -36,7 +36,7 @@ lal/
 
 # GPT-2 web server — multiple inference modes
 ./prebuilt/gpt2_server                       # float (default), opens http://localhost:8080
-./prebuilt/gpt2_server --bwn                 # BWN (binary weights, float activations)
+./prebuilt/gpt2_server --bwn                 # BWN (27.5 tok/s, 3.5MB weights)
 ./prebuilt/gpt2_server --binary              # BNN (full binary, XNOR+popcount)
 ./prebuilt/gpt2_server --int8                # Int8 activation quantization
 ./prebuilt/gpt2_server --mixed-int8 8        # Mixed precision (recommended)
@@ -63,7 +63,7 @@ make demos         # builds demo binaries
 |------|------|-------|---------|----------|
 | Float | (default) | 7-8 tok/s | Best (coherent + factual) | Quality-critical, reference baseline |
 | Float + OpenBLAS | `--blas`* | 15 tok/s | Best | Match PyTorch speed |
-| BWN | `--bwn` | 20 tok/s | Good (coherent, not factual) | 1-bit weights, 44x compression |
+| BWN | `--bwn` | 27.5 tok/s | Good (coherent, not factual) | 1-bit weights, 3.5MB, 30x less mem |
 | BNN | `--binary` | 47 tok/s | Poor (garbled) | Max speed, research only |
 | Int8 | `--int8` | 22 tok/s | Low (common words only) | Speed over quality |
 | Mixed-8 | `--mixed-int8 8` | 15 tok/s | Good (BWN-level) | **Recommended balance** |
@@ -72,11 +72,11 @@ make demos         # builds demo binaries
 
 ## Key optimizations
 
-### Binary Weight Network (BWN) — OpenBLAS-style matmul
-- **Pre-packed sign(W)** as contiguous float array (no LUT indirect)
-- **8 outputs parallel** sharing x loads (register blocking, OpenBLAS micro-kernel pattern)
-- **AVX2 FMA** (`_mm256_fmadd_ps`, 8 FMA/cycle)
-- Result: BWN 8.5 → 20 tok/s (**2.4x speedup**), quality preserved
+### Binary Weight Network (BWN) — wbits + LUT sign-flip
+- **Compact wbits** (1-bit packed, 3.5MB total, 30x less than float)
+- **LUT sign-flip**: 256-entry × 8 floats (0.0/-0.0), XOR x to apply ±1 (no multiply)
+- **ADD accumulate** (sign=±1 means multiply is just conditional negate)
+- Result: BWN 8.5 → 27.5 tok/s (**3.2x speedup**), memory 108MB → 3.5MB (-97%)
 
 ### OpenBLAS integration (float mode)
 - `cblas_sgemv` for large matmul (c_attn, LM head)
@@ -120,7 +120,7 @@ The runtime is model-agnostic. GPT-2 is just one example.
 | vs PyTorch | speedup | 250x |
 | Weight compression | binary (sign+alpha) | 44x (498MB → 11.3MB) |
 | **GPT-2 float (OpenBLAS)** | inference, x86_64 2-core | **15 tok/s** (matches PyTorch 14.2) |
-| **GPT-2 BWN (OpenBLAS-style)** | binary weights, x86_64 2-core | **20 tok/s** (2.4x vs LUT) |
+| **GPT-2 BWN (wbits+LUT)** | binary weights, x86_64 2-core | **27.5 tok/s** (3.8x float, 3.5MB) |
 | **GPT-2 mixed-8** | mixed int8+BWN, aarch64 | **15 tok/s** (3.6x float) |
 | GPT-2 BNN (full binary) | XNOR+popcount | 47 tok/s (garbled quality) |
 | GPT-2 on ARMv7 Android tablet | inference, Cortex-A7 @ 1.4GHz | 9.7 s/token (0.1 tok/s) |
@@ -132,7 +132,7 @@ The runtime is model-agnostic. GPT-2 is just one example.
 Quality
   Best │  float (7-8 tok/s) ─────────────────────
        │  float+BLAS (15 tok/s) ─────────────────
-  Good │  BWN (20 tok/s) ────────────────────────
+  Good │  BWN (27.5 tok/s) ──────────────────────
        │  mixed-8 (15 tok/s) ────────────────────
   Low  │  int8 (22 tok/s) ───────────────────────
   Poor │  BNN (47 tok/s) ────────────────────────
