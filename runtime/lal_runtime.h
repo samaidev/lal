@@ -135,6 +135,17 @@ extern int g_use_bnn_fast_path;
  * flag before model_load(). */
 extern int g_use_real_attention;
 
+/* Global flag: set to 1 to enable logic-guided binarization in model_load().
+ * When on, model_load computes a per-output norm-based logic_mask for each
+ * BinLayer and calls bin_layer_init_logic() instead of bin_layer_init():
+ *   - top 20% norm outputs → CORE (keep float in w_core, no binarization)
+ *   - bottom 10% norm outputs → PRUNE (zero out, save compute)
+ *   - middle 70% → BINARY (sign(w)+alpha, standard binarization)
+ * This preserves core-logic weights at full precision while binarizing the
+ * rest. Matches PHONE's "保留核心逻辑，排斥互斥关系" directive.
+ * Off by default for backward compat. */
+extern int g_use_logic_binarization;
+
 /* ========================================================================
  * Level 1: Standard NN Operations (operator level)
  * ======================================================================== */

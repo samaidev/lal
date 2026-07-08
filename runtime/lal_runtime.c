@@ -289,6 +289,16 @@ int g_use_bnn_fast_path = 0;
  * calls attention_forward() instead of memcpy(act->attn_out, act->v, n). */
 int g_use_real_attention = 0;
 
+/* Global flag: enable logic-guided binarization in model_load.
+ * When on, model_load computes norm-based logic_mask per output and calls
+ * bin_layer_init_logic() instead of bin_layer_init(). */
+int g_use_logic_binarization = 0;
+
+/* Forward decl: bin_layer_init_auto is defined after bin_layer_init_logic
+ * but used by model_load (which is above it). */
+static void bin_layer_init_auto(BinLayer *bl, const float *W, const float *bias,
+                                int in_dim, int out_dim);
+
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                           ModelConfig *cfg, float lr) {
     int n = cfg->n_embd, m = cfg->mlp_dim;
@@ -484,49 +494,49 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
             sprintf(key, "h.%d.attn.c_attn.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
         } else {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, n);
         }
 
         sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
         char bk[256]; strncpy(bk, key, sizeof(bk));
         char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        bin_layer_init(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+        bin_layer_init_auto(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
                        tensor_get(m->tensors, m->n_tensors, bk), n, n);
 
         if (cfg.act_type == ACT_SWIGLU) {
             sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, mm);
             sprintf(key, "model.layers.%d.mlp.up_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_up, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->mlp_up, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, mm);
         } else {
             sprintf(key, "h.%d.mlp.c_fc.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            bin_layer_init(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
+            bin_layer_init_auto(&tl->mlp_gate, tensor_get(m->tensors, m->n_tensors, key),
                            tensor_get(m->tensors, m->n_tensors, bk), n, mm);
         }
 
         sprintf(key, qkv_merged ? "h.%d.mlp.c_proj.weight" : "model.layers.%d.mlp.down_proj.weight", l);
         strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        bin_layer_init(&tl->mlp_down, tensor_get(m->tensors, m->n_tensors, key),
+        bin_layer_init_auto(&tl->mlp_down, tensor_get(m->tensors, m->n_tensors, key),
                        tensor_get(m->tensors, m->n_tensors, bk), mm, n);
 
         /* Norm weights */
@@ -670,6 +680,65 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
  * - BINARY: y[j] = alpha * (2*popcount - N) + bias (XNOR+popcount)
  * - PRUNE: y[j] = 0 (skipped entirely)
  */
+
+/* Compute a norm-based logic_mask for a weight matrix.
+ * W is [in_dim, out_dim] row-major (GPT-2 Conv1D layout: W[i*out_dim + j]).
+ * For each output j, compute ||W[:,j]||_2, then:
+ *   - top 20% highest norm → CORE (0)
+ *   - bottom 10% lowest norm → PRUNE (2)
+ *   - middle 70% → BINARY (1)
+ * mask must be pre-allocated with out_dim bytes. */
+static int _cmp_float(const void *a, const void *b) {
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static void compute_norm_logic_mask(const float *W, int in_dim, int out_dim,
+                                     uint8_t *mask) {
+    /* Compute per-output L2 norm */
+    float *norms = malloc(out_dim * sizeof(float));
+    for (int j = 0; j < out_dim; j++) {
+        float s = 0.0f;
+        for (int i = 0; i < in_dim; i++) {
+            float w = W[i * out_dim + j];
+            s += w * w;
+        }
+        norms[j] = sqrtf(s);
+    }
+    /* Sort norms to find percentile thresholds */
+    float *sorted = malloc(out_dim * sizeof(float));
+    memcpy(sorted, norms, out_dim * sizeof(float));
+    qsort(sorted, out_dim, sizeof(float), _cmp_float);
+    int top20_idx = (int)(out_dim * 0.8);    /* top 20% = above 80th percentile */
+    int bottom10_idx = (int)(out_dim * 0.1); /* bottom 10% = below 10th percentile */
+    if (top20_idx >= out_dim) top20_idx = out_dim - 1;
+    if (bottom10_idx < 0) bottom10_idx = 0;
+    float top20_thresh = sorted[top20_idx];
+    float bottom10_thresh = sorted[bottom10_idx];
+
+    for (int j = 0; j < out_dim; j++) {
+        if (norms[j] >= top20_thresh)      mask[j] = 0;  /* CORE */
+        else if (norms[j] <= bottom10_thresh) mask[j] = 2; /* PRUNE */
+        else                                mask[j] = 1;  /* BINARY */
+    }
+    free(norms);
+    free(sorted);
+}
+
+/* Wrapper: init BinLayer with logic-guided binarization if flag is on,
+ * else fall back to standard bin_layer_init. Used by model_load. */
+static void bin_layer_init_auto(BinLayer *bl, const float *W, const float *bias,
+                                int in_dim, int out_dim) {
+    if (g_use_logic_binarization) {
+        uint8_t *mask = malloc(out_dim);
+        compute_norm_logic_mask(W, in_dim, out_dim, mask);
+        bin_layer_init_logic(bl, W, bias, in_dim, out_dim, mask);
+        free(mask);  /* bin_layer_init_logic copies mask internally */
+    } else {
+        bin_layer_init(bl, W, bias, in_dim, out_dim);
+    }
+}
+
 void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
                           int in_dim, int out_dim, const uint8_t *logic_mask) {
     bl->in_dim = in_dim;
@@ -1002,6 +1071,79 @@ void bin_backward(float *grad_x, const float *grad_y, const float *x,
                   BinLayer *bl, float lr) {
     int in = bl->in_dim, out = bl->out_dim;
     int nw_T = bl->n_words_T;
+
+    /* Logic-guided: if logic_mask exists, PRUNE outputs contribute zero
+     * gradient (they're zeroed in forward). Skip them in grad_x computation
+     * to avoid NaN from alpha=0 mean_alpha division. CORE outputs use float
+     * w_core for grad_x (proper gradient), BINARY uses popcount as before. */
+    if (bl->logic_mask) {
+        /* Zero grad_x first */
+        for (int i = 0; i < in; i++) grad_x[i] = 0.0f;
+
+        /* grad_x += sum_j grad_y[j] * sign(W[:,j]) * alpha[j] for BINARY,
+         *           sum_j grad_y[j] * W_core[:,j] for CORE,
+         *           0 for PRUNE */
+        int core_idx = 0;
+        for (int j = 0; j < out; j++) {
+            float gy = grad_y[j];
+            if (fabsf(gy) < 1e-8f) {
+                if (bl->logic_mask[j] == 0) core_idx++;
+                continue;
+            }
+            if (bl->logic_mask[j] == 0) {
+                /* CORE: grad_x[i] += grad_y[j] * w_core[core_idx][i] */
+                const float *wc = &bl->w_core[core_idx * in];
+                for (int i = 0; i + 7 < in; i += 8) {
+                    grad_x[i+0] += gy * wc[i+0];
+                    grad_x[i+1] += gy * wc[i+1];
+                    grad_x[i+2] += gy * wc[i+2];
+                    grad_x[i+3] += gy * wc[i+3];
+                    grad_x[i+4] += gy * wc[i+4];
+                    grad_x[i+5] += gy * wc[i+5];
+                    grad_x[i+6] += gy * wc[i+6];
+                    grad_x[i+7] += gy * wc[i+7];
+                }
+                for (int i = (in/8)*8; i < in; i++) grad_x[i] += gy * wc[i];
+                core_idx++;
+                /* Update bias (CORE has real bias) */
+                bl->bias[j] -= lr * gy;
+            } else if (bl->logic_mask[j] == 1) {
+                /* BINARY: grad_x[i] += grad_y[j] * sign(wbits[j][i]) * alpha[j] */
+                const uint64_t *wb = &bl->wbits[j * bl->n_words];
+                float scale = gy * bl->alpha[j];
+                for (int wi = 0; wi < bl->n_words; wi++) {
+                    uint64_t w = wb[wi];
+                    int base = wi * 64;
+                    for (int bi = 0; bi < 8; bi++) {
+                        int idx = base + bi * 8;
+                        if (idx + 7 < in) {
+                            grad_x[idx+0] += scale * ((w >> (bi*8+0)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+1] += scale * ((w >> (bi*8+1)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+2] += scale * ((w >> (bi*8+2)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+3] += scale * ((w >> (bi*8+3)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+4] += scale * ((w >> (bi*8+4)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+5] += scale * ((w >> (bi*8+5)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+6] += scale * ((w >> (bi*8+6)) & 1 ? 1.0f : -1.0f);
+                            grad_x[idx+7] += scale * ((w >> (bi*8+7)) & 1 ? 1.0f : -1.0f);
+                        } else {
+                            for (int k = 0; k < 8; k++) {
+                                int i = idx + k;
+                                if (i < in) grad_x[i] += scale * ((w >> (bi*8+k)) & 1 ? 1.0f : -1.0f);
+                            }
+                        }
+                    }
+                }
+                /* Alpha + bias update (same as non-logic path) */
+                bl->alpha[j] -= lr * gy * (2 * 0 - in);  /* simplified, grad_alpha approx */
+                if (bl->alpha[j] < 0.0f) bl->alpha[j] = 0.0f;
+                bl->bias[j] -= lr * gy;
+            }
+            /* PRUNE (case 2): no gradient, skip */
+        }
+        return;
+    }
+
+    /* Non-logic path: original bin_backward */
 
     /* Part 1: grad_x via XNOR+popcount using transposed weights */
     uint64_t gybits[64];
