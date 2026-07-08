@@ -468,23 +468,23 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
      * The fastest correct approach: store sign(w) as float {-1,+1} array
      * and use SIMD float dot product. We do this when --bwn flag is set. */
     if (g_use_bwn) {
-        /* BWN accelerated: XOR sign-bit flip replaces multiply.
-         * Since W=±1, sign(W)·x = x XOR mask (mask=0x80000000 where W=-1).
-         * This replaces 8 FMA (multiply+add) per 8 elements with 1 XOR + 1 ADD.
+        /* BWN accelerated: multi-output SIMD FMA with ±1 sign LUT.
+         * Key insight: W=±1, so sign(W)·x = x * sign_lut (no general multiply).
          * Multi-output: process 8 outputs at a time, sharing x loads across
-         * all 8 (8x less memory traffic for x vs 1-output-at-a-time). */
-        static float xor_lut[256][8];  /* 0.0f or -0.0f (sign bit) */
+         * all 8 (8x less memory traffic for x vs 1-output-at-a-time).
+         * Uses v8f_fmadd (1 instruction on both AVX2 and NEON).
+         * XOR sign-flip was tested but is 3 instructions on NEON (slower). */
+        static float sign_lut[256][8];  /* ±1.0 */
         static int lut_init = 0;
         if (!lut_init) {
             for (int b = 0; b < 256; b++)
                 for (int i = 0; i < 8; i++)
-                    xor_lut[b][i] = ((b >> i) & 1) ? 0.0f : -0.0f;  /* -0.0f = 0x80000000 */
+                    sign_lut[b][i] = ((b >> i) & 1) ? 1.0f : -1.0f;
             lut_init = 1;
         }
 
         int j = 0;
         for (; j + 8 <= bl->out_dim; j += 8) {
-            /* 8 accumulators for 8 outputs — x is loaded once per input group */
             v8f acc0 = v8f_zero(), acc1 = v8f_zero(), acc2 = v8f_zero(), acc3 = v8f_zero();
             v8f acc4 = v8f_zero(), acc5 = v8f_zero(), acc6 = v8f_zero(), acc7 = v8f_zero();
             const uint64_t *w0 = bl->wbits + (size_t)(j+0) * n_words;
@@ -499,20 +499,20 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                 int base = wi * 64;
                 for (int bi = 0; bi < 8; bi++) {
                     int idx = base + bi * 8;
-                    if (idx + 7 >= bl->in_dim) break;  /* tail handled below */
+                    if (idx + 7 >= bl->in_dim) break;
                     v8f xv = v8f_load(x + idx);
                     uint64_t w;
-                    w = w0[wi]; acc0 = v8f_add(acc0, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w1[wi]; acc1 = v8f_add(acc1, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w2[wi]; acc2 = v8f_add(acc2, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w3[wi]; acc3 = v8f_add(acc3, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w4[wi]; acc4 = v8f_add(acc4, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w5[wi]; acc5 = v8f_add(acc5, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w6[wi]; acc6 = v8f_add(acc6, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
-                    w = w7[wi]; acc7 = v8f_add(acc7, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
+                    w = w0[wi]; acc0 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc0);
+                    w = w1[wi]; acc1 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc1);
+                    w = w2[wi]; acc2 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc2);
+                    w = w3[wi]; acc3 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc3);
+                    w = w4[wi]; acc4 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc4);
+                    w = w5[wi]; acc5 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc5);
+                    w = w6[wi]; acc6 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc6);
+                    w = w7[wi]; acc7 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc7);
                 }
             }
-            /* Tail: remaining input elements (in_dim % 64) via scalar */
+            /* Tail */
             int tail_start = n_words * 64;
             float t0=0,t1=0,t2=0,t3=0,t4=0,t5=0,t6=0,t7=0;
             for (int i = tail_start; i < bl->in_dim; i++) {
@@ -526,19 +526,16 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                 t6 += ((w6[i/64] >> (i%64)) & 1) ? xi : -xi;
                 t7 += ((w7[i/64] >> (i%64)) & 1) ? xi : -xi;
             }
-            float s0=v8f_hsum(acc0)+t0, s1=v8f_hsum(acc1)+t1, s2=v8f_hsum(acc2)+t2, s3=v8f_hsum(acc3)+t3;
-            float s4=v8f_hsum(acc4)+t4, s5=v8f_hsum(acc5)+t5, s6=v8f_hsum(acc6)+t6, s7=v8f_hsum(acc7)+t7;
-            /* Add tail contributions (already in y) and apply alpha+bias */
-            y[j+0] = s0 * bl->alpha[j+0] + bl->bias[j+0];
-            y[j+1] = s1 * bl->alpha[j+1] + bl->bias[j+1];
-            y[j+2] = s2 * bl->alpha[j+2] + bl->bias[j+2];
-            y[j+3] = s3 * bl->alpha[j+3] + bl->bias[j+3];
-            y[j+4] = s4 * bl->alpha[j+4] + bl->bias[j+4];
-            y[j+5] = s5 * bl->alpha[j+5] + bl->bias[j+5];
-            y[j+6] = s6 * bl->alpha[j+6] + bl->bias[j+6];
-            y[j+7] = s7 * bl->alpha[j+7] + bl->bias[j+7];
+            y[j+0] = (v8f_hsum(acc0)+t0) * bl->alpha[j+0] + bl->bias[j+0];
+            y[j+1] = (v8f_hsum(acc1)+t1) * bl->alpha[j+1] + bl->bias[j+1];
+            y[j+2] = (v8f_hsum(acc2)+t2) * bl->alpha[j+2] + bl->bias[j+2];
+            y[j+3] = (v8f_hsum(acc3)+t3) * bl->alpha[j+3] + bl->bias[j+3];
+            y[j+4] = (v8f_hsum(acc4)+t4) * bl->alpha[j+4] + bl->bias[j+4];
+            y[j+5] = (v8f_hsum(acc5)+t5) * bl->alpha[j+5] + bl->bias[j+5];
+            y[j+6] = (v8f_hsum(acc6)+t6) * bl->alpha[j+6] + bl->bias[j+6];
+            y[j+7] = (v8f_hsum(acc7)+t7) * bl->alpha[j+7] + bl->bias[j+7];
         }
-        /* Remaining outputs (out_dim % 8) — single-output XOR path */
+        /* Remaining outputs */
         for (; j < bl->out_dim; j++) {
             const uint64_t *wb = bl->wbits + (size_t)j * n_words;
             v8f acc = v8f_zero();
@@ -548,12 +545,10 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                 for (int bi = 0; bi < 8; bi++) {
                     int idx = base + bi * 8;
                     if (idx + 7 >= bl->in_dim) break;
-                    v8f xv = v8f_load(x + idx);
-                    acc = v8f_add(acc, v8f_xor(xv, v8f_load(xor_lut[(w >> (bi*8)) & 0xFF])));
+                    acc = v8f_fmadd(v8f_load(x + idx), v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc);
                 }
             }
             float dot = v8f_hsum(acc);
-            /* Tail */
             for (int i = n_words * 64; i < bl->in_dim; i++) {
                 int bit = (wb[i/64] >> (i%64)) & 1;
                 dot += bit ? x[i] : -x[i];
