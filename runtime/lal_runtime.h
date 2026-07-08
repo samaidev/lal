@@ -121,6 +121,7 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
 /* Global flag: set to 1 to use STE backward in trans_layer_backward.
  * Models can set this before calling model_backward(). */
 extern int g_use_ste;
+extern int g_use_logic_binarization;  /* norm-based auto logic mask in model_load */
 
 /* Global flag: set to 1 to use the legacy BNN fast path (bin_forward_bnn) in
  * trans_layer_forward instead of the BWN default. Off by default — BNN causes
