@@ -1140,11 +1140,19 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
     }
 }
 
-/* Legacy BNN fast path: XNOR + popcount, binarizes BOTH x and W.
- * ~64x faster than BWN but causes train/inference distribution mismatch.
- * Kept for opt-in via g_use_bnn_fast_path flag. Do NOT use by default. */
+/* BNN fast path: XNOR + popcount, binarizes BOTH x and W.
+ * ~64x faster than BWN. With K-norm input scaling (XNOR-Net, Rastegari 2016),
+ * the output magnitude is restored: y = (2*pc-in) * alpha * K + bias, where
+ * K = mean(|x|). Without K, outputs have wrong magnitude → garbled generation. */
 void bin_forward_bnn(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
+
+    /* Compute input scale K = mean(|x|) — restores magnitude lost by sign(x).
+     * O(in) cost is negligible vs the O(in*out) XNOR+popcount matmul. */
+    float abs_sum = 0.0f;
+    for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
+    float K = abs_sum / in;
+
     /* Binarize input */
     uint64_t xbits[64];
     for (int wi = 0; wi < nw; wi++) {
@@ -1155,13 +1163,13 @@ void bin_forward_bnn(float *y, const float *x, const BinLayer *bl) {
         }
         xbits[wi] = word;
     }
-    /* XNOR + popcount per output */
+    /* XNOR + popcount per output, scaled by alpha * K */
     for (int j = 0; j < out; j++) {
         int pc = 0;
         const uint64_t *wb = &bl->wbits[j * nw];
         for (int wi = 0; wi < nw; wi++)
             pc += __builtin_popcountll(~(xbits[wi] ^ wb[wi]));
-        y[j] = (float)(2 * pc - in) * bl->alpha[j] + bl->bias[j];
+        y[j] = (float)(2 * pc - in) * bl->alpha[j] * K + bl->bias[j];
     }
 }
 
