@@ -1053,6 +1053,74 @@ void bin_backward(float *grad_x, const float *grad_y, const float *x,
     int in = bl->in_dim, out = bl->out_dim;
     int nw_T = bl->n_words_T;
 
+    /* Logic-guided: if logic_mask exists, dispatch per-output.
+     * Without this, the non-logic path uses mean_alpha = sum(alpha)/out,
+     * but PRUNE (alpha=0) and CORE (alpha=0) dilute mean_alpha → wrong
+     * grad_x → NaN divergence. This was the root cause of ai_4116f587's
+     * step-100 NaN in --logic + --real-attention testing.
+     *   CORE: grad_x += grad_y * w_core (proper float gradient)
+     *   BINARY: grad_x += grad_y * sign(wbits) * alpha (original logic)
+     *   PRUNE: skip (zero gradient, output is zeroed in forward) */
+    if (bl->logic_mask) {
+        for (int i = 0; i < in; i++) grad_x[i] = 0.0f;
+        int core_idx = 0;
+        for (int j = 0; j < out; j++) {
+            float gy = grad_y[j];
+            if (bl->logic_mask[j] == 0) {
+                /* CORE: float gradient through w_core */
+                if (fabsf(gy) >= 1e-8f) {
+                    const float *wc = &bl->w_core[core_idx * in];
+                    for (int i = 0; i + 7 < in; i += 8) {
+                        grad_x[i+0] += gy * wc[i+0];
+                        grad_x[i+1] += gy * wc[i+1];
+                        grad_x[i+2] += gy * wc[i+2];
+                        grad_x[i+3] += gy * wc[i+3];
+                        grad_x[i+4] += gy * wc[i+4];
+                        grad_x[i+5] += gy * wc[i+5];
+                        grad_x[i+6] += gy * wc[i+6];
+                        grad_x[i+7] += gy * wc[i+7];
+                    }
+                    for (int i = (in/8)*8; i < in; i++) grad_x[i] += gy * wc[i];
+                }
+                core_idx++;
+                bl->bias[j] -= lr * gy;
+            } else if (bl->logic_mask[j] == 1) {
+                /* BINARY: gradient through sign(wbits) * alpha */
+                if (fabsf(gy) >= 1e-8f) {
+                    const uint64_t *wb = &bl->wbits[j * bl->n_words];
+                    float scale = gy * bl->alpha[j];
+                    for (int wi = 0; wi < bl->n_words; wi++) {
+                        uint64_t w = wb[wi];
+                        int base = wi * 64;
+                        for (int bi = 0; bi < 8; bi++) {
+                            int idx = base + bi * 8;
+                            if (idx + 7 < in) {
+                                grad_x[idx+0] += scale * ((w >> (bi*8+0)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+1] += scale * ((w >> (bi*8+1)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+2] += scale * ((w >> (bi*8+2)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+3] += scale * ((w >> (bi*8+3)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+4] += scale * ((w >> (bi*8+4)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+5] += scale * ((w >> (bi*8+5)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+6] += scale * ((w >> (bi*8+6)) & 1 ? 1.0f : -1.0f);
+                                grad_x[idx+7] += scale * ((w >> (bi*8+7)) & 1 ? 1.0f : -1.0f);
+                            } else {
+                                for (int k = 0; k < 8; k++) {
+                                    int i = idx + k;
+                                    if (i < in) grad_x[i] += scale * ((w >> (bi*8+k)) & 1 ? 1.0f : -1.0f);
+                                }
+                            }
+                        }
+                    }
+                }
+                bl->bias[j] -= lr * gy;
+            }
+            /* PRUNE (case 2): no gradient, skip entirely */
+        }
+        return;
+    }
+
+    /* Non-logic path: original bin_backward */
+
     /* Part 1: grad_x via XNOR+popcount using transposed weights */
     uint64_t gybits[64];
     for (int wi = 0; wi < nw_T; wi++) {
