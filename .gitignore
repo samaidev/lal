@@ -13,6 +13,7 @@ build/
 prebuilt/gpt2_weights.bin
 prebuilt/gpt2_binary_finetuned.bin
 prebuilt/gpt2_float_subset.bin
+prebuilt/gpt2_binary_logic.bin
 
 # Built standalone tools (regenerate via make)
 scripts/extract_float_subset

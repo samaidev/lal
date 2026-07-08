@@ -247,7 +247,8 @@ void trans_act_free(TransAct *acts, int n_layer);
  * Level 2: Causal Multi-Head Self-Attention (KV cache)
  * ========================================================================
  * Replaces the degenerate `memcpy(attn_out, v, n)` in trans_layer_forward.
- * Mirrors tools/server/gpt2_server.c:real_attention semantics:\n *   - Stores K, V at current position into per-layer cache
+ * Mirrors tools/server/gpt2_server.c:real_attention semantics:
+ *   - Stores K, V at current position into per-layer cache
  *   - Multi-head QK^T dot product with 1/sqrt(head_dim) scaling
  *   - Causal mask (only attend to positions 0..seq_pos)
  *   - Softmax with max subtraction (numerical stability)
@@ -270,29 +271,6 @@ void attention_forward(float *attn_out, const float *qkv,
 struct Model;
 void model_kv_cache_alloc(struct Model *m);
 void model_kv_cache_free(struct Model *m);
-
-/* ========================================================================
- * Level 2: Causal Multi-Head Self-Attention (KV cache)
- * ========================================================================
- * Replaces the degenerate `memcpy(attn_out, v, n)` in trans_layer_forward.
- * Mirrors tools/server/gpt2_server.c:real_attention semantics:
- *   - Stores K, V at current position into per-layer cache
- *   - Multi-head QK^T dot product with 1/sqrt(head_dim) scaling
- *   - Causal mask (only attend to positions 0..seq_pos)
- *   - Softmax with max subtraction (numerical stability)
- *   - Weighted sum of V
- *
- * KV cache is owned by Model (k_cache/v_cache arrays, [n_layer][n_ctx*n_embd]).
- * Allocated in model_load, freed in model_free.
- *
- * Backward: NOT YET IMPLEMENTED. trans_layer_backward still does pass-through
- *   (memcpy g_qkv+2n, g_attn). This means gradient flow through attention
- *   is incorrect — Q, K gradients are zero. Sufficient for inference but
- *   training with attention enabled will not learn Q/K properly. TODO. */
-void attention_forward(float *attn_out, const float *qkv,
-                       int n_embd, int n_head,
-                       int seq_pos,
-                       float *k_cache_layer, float *v_cache_layer);
 
 /* ========================================================================
  * Level 3: Full Model (highest level — just config + weight keys)

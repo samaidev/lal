@@ -17,7 +17,7 @@ Format (GB2L2):
     Per matrix (4 per layer):
       Header: out_dim, in_dim, n_words, n_core (4 × 4B)
       logic_mask: out_dim bytes
-      wbits: (out_dim - n_core) × n_words uint64s (BINARY only, PRUNE excluded)
+      wbits: (out_dim - n_core - n_prune) × n_words uint64s (BINARY only, PRUNE excluded)
       alpha: (out_dim - n_core - n_prune) floats (BINARY only)
       bias: out_dim floats (all, PRUNE bias=0)
       w_core: n_core × in_dim floats (CORE only)
@@ -25,8 +25,17 @@ Format (GB2L2):
 import struct, sys, os
 import numpy as np
 
-FLOAT_PATH = "/home/z/my-project/prebuilt/gpt2_weights.bin"
-OUT_PATH = "/home/z/my-project/prebuilt/gpt2_binary_logic.bin"
+# Resolve paths relative to the repo root so the script works on any machine.
+# (LAL-Reviewer issue #6 — was hardcoded /home/z/my-project/...)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FLOAT_PATH = os.environ.get(
+    "LAL_FLOAT_WEIGHTS",
+    os.path.join(_REPO_ROOT, "prebuilt", "gpt2_weights.bin"),
+)
+OUT_PATH = os.environ.get(
+    "LAL_LOGIC_BINARY_OUT",
+    os.path.join(_REPO_ROOT, "prebuilt", "gpt2_binary_logic.bin"),
+)
 
 N_LAYER = 12
 N_EMBD = 768
@@ -86,6 +95,12 @@ def pack_sign_bits(signs_2d):
     return packed
 
 def main():
+    if len(sys.argv) >= 2:
+        global FLOAT_PATH
+        FLOAT_PATH = sys.argv[1]
+    if len(sys.argv) >= 3:
+        global OUT_PATH
+        OUT_PATH = sys.argv[2]
     print(f"[*] loading {FLOAT_PATH}...")
     tensors = load_gpw2(FLOAT_PATH)
     
