@@ -466,20 +466,8 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
      * Only for non-logic-guided layers (w_sign_int8 is NULL for logic_mask).
      * Mixed precision: when g_mixed_int8_layers > 0, only first N layers use
      * int8; later layers fall through to BWN (float) for precision. */
-    if (g_use_int8 && bl->wbits && !bl->logic_mask &&
+    if (g_use_int8 && bl->w_sign_int8 &&
         (g_mixed_int8_layers == 0 || g_current_layer < g_mixed_int8_layers)) {
-        /* int8 sign LUT: byte → 8 int8 ±1 values. 2KB, fits L1.
-         * Replaces the 84MB w_sign_int8 pre-computed array — sign is extracted
-         * on-the-fly from wbits (1-bit packed), same as BWN path. */
-        static int8_t sign_lut_i8[256][8];
-        static int lut_init = 0;
-        if (!lut_init) {
-            for (int b = 0; b < 256; b++)
-                for (int i = 0; i < 8; i++)
-                    sign_lut_i8[b][i] = ((b >> i) & 1) ? 1 : -1;
-            lut_init = 1;
-        }
-
         /* Quantize x: symmetric per-tensor scale */
         float max_abs = 0;
         for (int i = 0; i < bl->in_dim; i++) {
@@ -502,28 +490,15 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
         float K_mean = abs_sum / bl->in_dim;
 
         /* Int8 matmul: y[j] = sum(w_sign[i] * x_q[i]) * x_scale * alpha * K + bias
-         * w_sign extracted on-the-fly from wbits via LUT (no w_sign_int8 array).
-         * w_sign * x_q = conditional add/sub, no multiply needed. */
+         * w_sign is +/-1, so w_sign * x_q = conditional add/sub */
         for (int j = 0; j < bl->out_dim; j++) {
-            const uint64_t *wb = bl->wbits + (size_t)j * bl->n_words;
+            const int8_t *ws = bl->w_sign_int8 + (size_t)j * bl->in_dim;
             int32_t acc = 0;
-            for (int wi = 0; wi < bl->n_words; wi++) {
-                uint64_t w = wb[wi];
-                int base = wi * 64;
-                for (int bi = 0; bi < 8; bi++) {
-                    int idx = base + bi * 8;
-                    if (idx + 7 >= bl->in_dim) break;
-                    uint8_t byte = (w >> (bi * 8)) & 0xFF;
-                    const int8_t *sw = sign_lut_i8[byte];
-                    acc += sw[0]*x_q[idx+0] + sw[1]*x_q[idx+1] + sw[2]*x_q[idx+2] + sw[3]*x_q[idx+3];
-                    acc += sw[4]*x_q[idx+4] + sw[5]*x_q[idx+5] + sw[6]*x_q[idx+6] + sw[7]*x_q[idx+7];
-                }
+            for (int i = 0; i + 7 < bl->in_dim; i += 8) {
+                acc += ws[i+0]*x_q[i+0] + ws[i+1]*x_q[i+1] + ws[i+2]*x_q[i+2] + ws[i+3]*x_q[i+3];
+                acc += ws[i+4]*x_q[i+4] + ws[i+5]*x_q[i+5] + ws[i+6]*x_q[i+6] + ws[i+7]*x_q[i+7];
             }
-            /* Tail: remaining elements */
-            for (int i = bl->n_words * 64; i < bl->in_dim; i++) {
-                int bit = (wb[i/64] >> (i%64)) & 1;
-                acc += (bit ? 1 : -1) * x_q[i];
-            }
+            for (int i = (bl->in_dim/8)*8; i < bl->in_dim; i++) acc += ws[i] * x_q[i];
             /* K-norm: preserve input magnitude (XNOR-Net input scaling).
              * K = mean(|x|), computed once before j loop. */
             y[j] = (float)acc * x_scale * bl->alpha[j] * K_mean + bl->bias[j];
@@ -724,10 +699,31 @@ static int load_binary_weights(const char *path) {
     fclose(f);
     g_binary_mode = 1;
 
-    /* Int8 optimization: sign(w) extracted on-the-fly from wbits via LUT.
-     * Previously pre-packed as int8 (84MB redundant memory). Now uses a 2KB
-     * LUT (sign_lut_i8) — same approach as BWN's float sign_lut.
-     * w_sign_int8 left NULL; Int8 matmul reads directly from wbits. */
+    /* Int8 speedup: pre-pack sign(w) as int8 for all BINARY layers.
+     * Only for non-logic-guided (GB2L all-binary) — logic_mask handled separately. */
+    for (int l = 0; l < N_LAYER; l++) {
+        BinGPT2Layer *L = &g_bin_layers[l];
+        SrvBinLayer *mats[] = {&L->c_attn, &L->c_proj, &L->mlp_fc, &L->mlp_proj};
+        for (int mi = 0; mi < 4; mi++) {
+            SrvBinLayer *bl = mats[mi];
+            if (bl->logic_mask) continue;
+            size_t n = (size_t)bl->out_dim * bl->in_dim;
+            bl->w_sign_int8 = malloc(n);
+            for (int j = 0; j < bl->out_dim; j++) {
+                const uint64_t *wb = bl->wbits + (size_t)j * bl->n_words;
+                int8_t *ws = bl->w_sign_int8 + (size_t)j * bl->in_dim;
+                for (int wi = 0; wi < bl->n_words; wi++) {
+                    uint64_t w = wb[wi];
+                    int base = wi * 64;
+                    for (int bi = 0; bi < 64; bi++) {
+                        int i = base + bi;
+                        if (i >= bl->in_dim) break;
+                        ws[i] = (w >> bi) & 1 ? 1 : -1;
+                    }
+                }
+            }
+        }
+    }
     return 0;
 }
 
