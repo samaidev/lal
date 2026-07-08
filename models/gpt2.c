@@ -128,6 +128,16 @@ int main(int argc, char **argv) {
     if (use_ste) {
         g_use_ste = 1;
         printf("[*] STE mode: binary weights will be updated via Straight-Through Estimator\n");
+        /* STE updates w_float (full-precision weights) then repacks wbits.
+         * The gradient magnitude is much larger than non-STE (which only
+         * updates alpha/bias), so lr > 0.01 causes NaN divergence.
+         * Tested: lr=0.05 → NaN at step 100; lr=0.002 → stable.
+         * Recommended: lr=0.001-0.005 for STE. */
+        if (lr > 0.01f) {
+            printf("[!] WARNING: STE with lr=%f > 0.01 is likely to diverge (NaN).\n", lr);
+            printf("[!]           Clamping to 0.005. Use lr=0.002 for best results.\n");
+            lr = 0.005f;
+        }
     }
     if (use_real_attn) {
         g_use_real_attention = 1;
