@@ -107,6 +107,7 @@ class Rule:
     outputs: List[str]
     guard: Optional["Expr"] = None  # v0.5: if present, body only runs when guard is truthy;
                                     #       otherwise rule returns the input vector unchanged.
+    kind: str = "rule"  # "rule" (VSA inference) | "filter" (level-2 sampling filter → lal_filter_topk)
 
 @dataclass
 class Stmt:
@@ -811,6 +812,37 @@ def parse(source: str, source_path: Optional[str] = None):
             i += 1
             continue
 
+        # filter name:                          (level-2 fusion: .lal sampling filter)
+        #   ban_last                            (ban the immediately-preceding token)
+        #   ban_repeat(n)                        (ban the last n tokens — n-gram repeat block)
+        #   ban_token(123)                       (ban a specific token id)
+        # Compiles to a strong lal_filter_topk() C symbol that overrides the server's
+        # weak fallback, constraining the top-k sampling pool with .lal logic rules.
+        m = re.match(r"filter\s+(\w+)\s*:\s*$", line)
+        if m:
+            name = m.group(1)
+            body: List[Stmt] = []
+            outputs: List[str] = []
+            i += 1
+            while i < len(lines):
+                bline = lines[i].split("#")[0]
+                if not bline.strip():
+                    i += 1
+                    continue
+                if not (bline.startswith("    ") or bline.startswith("\t")):
+                    break
+                bline = bline.strip()
+                # filter body actions are stored as bare ECall nodes (var="__stmt__")
+                if re.match(r"ban_(last|repeat\(\d+\)|token\(\d+\))\s*$", bline):
+                    expr = _parse_expr(bline)
+                    body.append(Stmt("__filter__", expr))
+                    i += 1
+                    continue
+                raise ParseError(f"can't parse filter body line: {bline!r} "
+                                 f"(expected ban_last / ban_repeat(n) / ban_token(id))")
+            rules.append(Rule(name, [], body, outputs, None, kind="filter"))
+            continue
+
         # rule name(params):                    (no guard)
         # rule name(params) | guard_expr:       (with guard — v0.5)
         m = re.match(r"rule\s+(\w+)\s*\(([^)]*)\)\s*(?:\|\s*(.+?)\s*)?:\s*$", line)
@@ -1199,6 +1231,11 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # Find which rules we need to emit (all transitively-reachable rule names).
     rules_to_emit = _collect_called_rules(rule_map[rule_name], rule_map, relate_map, max_recursion_depth)
     rules_to_emit.add(rule_name)
+    # filter rules are invoked by the server's sampling path via the strong
+    # lal_filter_topk symbol, not by rule calls — force-emit all of them.
+    for rn, r in rule_map.items():
+        if getattr(r, "kind", "rule") == "filter":
+            rules_to_emit.add(rn)
 
     # Determine the vector dimension (assume all concepts have the same dim).
     vec_dim = len(concepts[0].vec) if concepts else 0
@@ -1350,6 +1387,9 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     lines.append("/* === Forward declarations === */")
     for rn in sorted(rules_to_emit):
         variants = rule_groups.get(rn, [rule_map[rn]])
+        # filter rules emit lal_filter_topk (strong symbol), not rule_<name> — skip here.
+        if getattr(variants[0], "kind", "rule") == "filter":
+            continue
         for idx, r in enumerate(variants):
             params_sig = ", ".join(f"const float* {p}" for p in r.params)
             out_params = []
@@ -1384,6 +1424,11 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # Emit each rule variant as a C function, plus a dispatcher per rule name.
     for rn in sorted(rules_to_emit):
         variants = rule_groups.get(rn, [rule_map[rn]])
+        # filter rules: emit as strong lal_filter_topk (level-2 fusion), skip rule_/dispatcher.
+        if getattr(variants[0], "kind", "rule") == "filter":
+            lines.extend(_emit_filter_rule(variants))
+            lines.append("")
+            continue
         for idx, r in enumerate(variants):
             # v0.11: In train mode, if a rule contains loss/grad/update,
             # emit it as a training function (forward + backward + update).
@@ -1487,6 +1532,10 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     lines.append("    }")
     lines.append(f"    for (int i = 0; i < {vec_dim}; i++) q[i] = (float)atof(argv[i+1]);")
     entry_rule = rule_map[rule_name]
+    if getattr(entry_rule, "kind", "rule") == "filter":
+        raise ParseError(f"filter rule '{rule_name}' cannot be the entry rule — "
+                         f"filter rules emit lal_filter_topk and are invoked by the "
+                         f"server's sampling path, not from main(). Choose a 'rule' as entry.")
     # Declare output vars: int for argmax, float[vec_dim] for vectors.
     for n in entry_rule.outputs:
         matching = [s for s in entry_rule.body if s.var == n]
@@ -1980,6 +2029,73 @@ def _pack_nibbles(int4_values: List[int]) -> List[int]:
         byte = (unsigned[i+1] << 4) | unsigned[i]
         packed.append(byte)
     return packed
+
+
+def _emit_filter_rule(variants):
+    """Emit a .lal filter rule as a strong lal_filter_topk() C definition.
+
+    This is the compiler half of three-layer fusion level 2: the .lal program
+    declares one or more `ban_*` actions in a `filter` rule, and we emit them
+    as the body of lal_filter_topk(). At link time this strong symbol overrides
+    the weak fallback in gpt2_server.c, so the server's top-k sampling pool is
+    constrained by .lal logic rules.
+
+    Supported ban actions:
+      ban_last         — drop the immediately-preceding token (anti-repeat)
+      ban_repeat(n)    — drop the last n generated tokens (n-gram block)
+      ban_token(id)    — drop a specific token id
+    """
+    if len(variants) > 1:
+        raise ParseError(f"filter rule '{variants[0].name}' has {len(variants)} variants — "
+                         f"filter rules do not support multi-variant pattern matching "
+                         f"(one strong lal_filter_topk symbol per link unit).")
+    rule = variants[0]
+    L: List[str] = []
+    L.append(f"/* === LAL three-layer fusion (level 2): filter rule '{rule.name}' ===")
+    L.append(" * Generated from a .lal `filter` rule. This STRONG symbol overrides the")
+    L.append(" * weak fallback in gpt2_server.c at link time — the server's top-k sampling")
+    L.append(" * pool is constrained by the ban actions declared below. */")
+    L.append("int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,")
+    L.append("                    const int *recent_tokens, int n_recent) {")
+    L.append("    int dropped = 0;")
+    L.append("    (void)last_token; (void)recent_tokens; (void)n_recent;  /* hush -Wunused if no ban_last/ban_repeat */")
+    for stmt in rule.body:
+        # ban_last (no args) parses as EVar; ban_repeat(n)/ban_token(id) parse as ECall.
+        if isinstance(stmt.expr, EVar) and stmt.expr.name == "ban_last":
+            action, args = "ban_last", []
+        elif isinstance(stmt.expr, ECall):
+            action, args = stmt.expr.func, stmt.expr.args
+        else:
+            raise ParseError(f"filter rule '{rule.name}': unsupported body statement (expected ban_* action)")
+        if action == "ban_last":
+            L.append("    /* ban_last: drop the immediately-preceding token */")
+            L.append("    if (last_token >= 0 && last_token < n_vocab && keep_mask[last_token]) {")
+            L.append("        keep_mask[last_token] = 0; dropped++;")
+            L.append("    }")
+        elif action == "ban_repeat":
+            if len(args) != 1 or not isinstance(args[0], EFloat):
+                raise ParseError(f"filter rule '{rule.name}': ban_repeat(n) needs one integer arg")
+            n = int(args[0].val)
+            L.append(f"    /* ban_repeat({n}): drop the last {n} generated tokens */")
+            L.append(f"    {{ const int _start = n_recent > {n} ? n_recent - {n} : 0;")
+            L.append("      for (int i = _start; i < n_recent; i++) {")
+            L.append("          int t = recent_tokens[i];")
+            L.append("          if (t >= 0 && t < n_vocab && keep_mask[t]) { keep_mask[t] = 0; dropped++; }")
+            L.append("      } }")
+        elif action == "ban_token":
+            if len(args) != 1 or not isinstance(args[0], EFloat):
+                raise ParseError(f"filter rule '{rule.name}': ban_token(id) needs one integer arg")
+            tid = int(args[0].val)
+            L.append(f"    /* ban_token({tid}): drop a specific token id */")
+            L.append(f"    if ({tid} >= 0 && {tid} < n_vocab && keep_mask[{tid}]) {{")
+            L.append(f"        keep_mask[{tid}] = 0; dropped++;")
+            L.append("    }")
+        else:
+            raise ParseError(f"filter rule '{rule.name}': unknown ban action '{action}' "
+                             f"(expected ban_last / ban_repeat(n) / ban_token(id))")
+    L.append("    return dropped;")
+    L.append("}")
+    return L
 
 
 def _emit_rule(rule, concept_map, bound_map, memory_map, relate_map, rule_map, concept_names, rules_to_emit, max_recursion_depth, name_suffix=""):
