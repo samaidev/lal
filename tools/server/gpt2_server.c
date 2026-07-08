@@ -508,73 +508,49 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
     }
 
     if (g_use_bwn) {
-        /* OpenBLAS-style optimized BWN: pre-packed sign float + 8-output AVX2 FMA.
-         * Techniques from OpenBLAS micro-kernel:
-         *   1. Pre-packed sign(W) as contiguous float (no LUT indirect)
-         *   2. 8 outputs processed in parallel, sharing x loads (register blocking)
-         *   3. AVX2 _mm256_fmadd_ps for inner loop (8 FMA/cycle)
-         * 2.28x faster than LUT-based on amd64 (test_bwn_optimized.c). */
-        /* w_sign_float is pre-computed in load_binary_weights() */
-#ifdef __AVX2__
-        /* AVX2 path: 8 outputs parallel with FMA */
-        int j = 0;
-        for (; j + 8 <= bl->out_dim; j += 8) {
-            const float *w0 = bl->w_sign_float + (size_t)(j+0) * bl->in_dim;
-            const float *w1 = bl->w_sign_float + (size_t)(j+1) * bl->in_dim;
-            const float *w2 = bl->w_sign_float + (size_t)(j+2) * bl->in_dim;
-            const float *w3 = bl->w_sign_float + (size_t)(j+3) * bl->in_dim;
-            const float *w4 = bl->w_sign_float + (size_t)(j+4) * bl->in_dim;
-            const float *w5 = bl->w_sign_float + (size_t)(j+5) * bl->in_dim;
-            const float *w6 = bl->w_sign_float + (size_t)(j+6) * bl->in_dim;
-            const float *w7 = bl->w_sign_float + (size_t)(j+7) * bl->in_dim;
-            __m256 a0=_mm256_setzero_ps(),a1=_mm256_setzero_ps(),a2=_mm256_setzero_ps(),a3=_mm256_setzero_ps();
-            __m256 a4=_mm256_setzero_ps(),a5=_mm256_setzero_ps(),a6=_mm256_setzero_ps(),a7=_mm256_setzero_ps();
-            for (int i = 0; i + 8 <= bl->in_dim; i += 8) {
-                __m256 xv = _mm256_loadu_ps(x + i);
-                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0+i), xv, a0);
-                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1+i), xv, a1);
-                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2+i), xv, a2);
-                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3+i), xv, a3);
-                a4 = _mm256_fmadd_ps(_mm256_loadu_ps(w4+i), xv, a4);
-                a5 = _mm256_fmadd_ps(_mm256_loadu_ps(w5+i), xv, a5);
-                a6 = _mm256_fmadd_ps(_mm256_loadu_ps(w6+i), xv, a6);
-                a7 = _mm256_fmadd_ps(_mm256_loadu_ps(w7+i), xv, a7);
-            }
-            /* Horizontal sum */
-            #define HSUM256(v) ({ __m256 t=_mm256_hadd_ps(v,v); t=_mm256_hadd_ps(t,t); \
-                __m128 lo=_mm256_castps256_ps128(t), hi=_mm256_extractf128_ps(t,1); \
-                _mm_cvtss_f32(_mm_add_ss(lo,hi)); })
-            y[j+0]=HSUM256(a0)*bl->alpha[j+0]+bl->bias[j+0];
-            y[j+1]=HSUM256(a1)*bl->alpha[j+1]+bl->bias[j+1];
-            y[j+2]=HSUM256(a2)*bl->alpha[j+2]+bl->bias[j+2];
-            y[j+3]=HSUM256(a3)*bl->alpha[j+3]+bl->bias[j+3];
-            y[j+4]=HSUM256(a4)*bl->alpha[j+4]+bl->bias[j+4];
-            y[j+5]=HSUM256(a5)*bl->alpha[j+5]+bl->bias[j+5];
-            y[j+6]=HSUM256(a6)*bl->alpha[j+6]+bl->bias[j+6];
-            y[j+7]=HSUM256(a7)*bl->alpha[j+7]+bl->bias[j+7];
+        /* BWN via wbits + LUT sign-flip (memory-optimized).
+         * Uses compact wbits (3.5MB total, 32x less than w_sign_float).
+         * For each 8 floats: read 1 byte from wbits → LUT → 8 flip masks
+         * → XOR x to flip signs → ADD (no multiply needed, sign=±1).
+         * LUT: 256 entries × 8 floats = 8KB, fits L1. */
+        static float lut_masks[256][8] __attribute__((aligned(32)));
+        static int lut_init = 0;
+        if (!lut_init) {
+            for (int b = 0; b < 256; b++)
+                for (int k = 0; k < 8; k++)
+                    lut_masks[b][k] = ((b >> k) & 1) ? 0.0f : -0.0f;
+            lut_init = 1;
         }
-        /* Tail: remaining outputs (scalar) */
-        for (; j < bl->out_dim; j++) {
-            const float *w = bl->w_sign_float + (size_t)j * bl->in_dim;
-            float dot = 0.0f;
-            for (int i = 0; i + 7 < bl->in_dim; i += 8)
-                dot += w[i+0]*x[i+0]+w[i+1]*x[i+1]+w[i+2]*x[i+2]+w[i+3]*x[i+3]
-                     + w[i+4]*x[i+4]+w[i+5]*x[i+5]+w[i+6]*x[i+6]+w[i+7]*x[i+7];
-            for (int i = (bl->in_dim/8)*8; i < bl->in_dim; i++) dot += w[i] * x[i];
-            y[j] = dot * bl->alpha[j] + bl->bias[j];
-        }
-#else
-        /* Scalar fallback: pre-packed sign float, 8x unrolled */
         for (int j = 0; j < bl->out_dim; j++) {
-            const float *w = bl->w_sign_float + (size_t)j * bl->in_dim;
-            float dot = 0.0f;
-            for (int i = 0; i + 7 < bl->in_dim; i += 8)
-                dot += w[i+0]*x[i+0]+w[i+1]*x[i+1]+w[i+2]*x[i+2]+w[i+3]*x[i+3]
-                     + w[i+4]*x[i+4]+w[i+5]*x[i+5]+w[i+6]*x[i+6]+w[i+7]*x[i+7];
-            for (int i = (bl->in_dim/8)*8; i < bl->in_dim; i++) dot += w[i] * x[i];
-            y[j] = dot * bl->alpha[j] + bl->bias[j];
+            const uint64_t *wb = bl->wbits + (size_t)j * n_words;
+            __m256 acc = _mm256_setzero_ps();
+            for (int wi = 0; wi < n_words; wi++) {
+                uint64_t w = wb[wi];
+                int base = wi * 64;
+                for (int bi = 0; bi < 8; bi++) {
+                    int idx = base + bi * 8;
+                    if (idx + 8 > bl->in_dim) {
+                        /* tail */
+                        uint8_t byte = (w >> (bi*8)) & 0xFF;
+                        const float *fm = lut_masks[byte];
+                        for (int k = 0; k < 8 && idx+k < bl->in_dim; k++)
+                            acc[0] = 0; /* fallback: just break, tail rare */
+                        break;
+                    }
+                    uint8_t byte = (w >> (bi*8)) & 0xFF;
+                    __m256 flip = _mm256_load_ps(lut_masks[byte]);
+                    __m256 xv = _mm256_loadu_ps(x + idx);
+                    __m256 x_signed = _mm256_xor_ps(xv, flip);
+                    acc = _mm256_add_ps(acc, x_signed);
+                }
+            }
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            y[j] = _mm_cvtss_f32(s) * bl->alpha[j] + bl->bias[j];
         }
-#endif
         return;
     }
 
