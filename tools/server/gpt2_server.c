@@ -237,6 +237,8 @@ static BinGPT2Layer g_bin_layers[N_LAYER];
 static int g_binary_mode = 0;   /* set by --binary flag */
 static int g_use_bwn = 0;       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
 static int g_use_int8 = 0;      /* --int8: BWN with int8 activation quantization (2-9x speedup) */
+static int g_mixed_int8_layers = 0;  /* --mixed-int8 N: first N layers int8, rest BWN. 0=all-int8 */
+static int g_current_layer = 0;      /* set by forward loop, read by bin_matmul */
 
 /* Mixed-precision mode (--mixed-precision, implies --binary): keep the first
  * and last transformer layers in float, binarize only the middle N_LAYER-2.
@@ -461,8 +463,11 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
      * and use SIMD float dot product. We do this when --bwn flag is set. */
     /* Int8 quantized BWN: ~9x faster than float BWN.
      * Quantize x to int8, matmul with sign(w) int8, then rescale.
-     * Only for non-logic-guided layers (w_sign_int8 is NULL for logic_mask). */
-    if (g_use_int8 && bl->w_sign_int8) {
+     * Only for non-logic-guided layers (w_sign_int8 is NULL for logic_mask).
+     * Mixed precision: when g_mixed_int8_layers > 0, only first N layers use
+     * int8; later layers fall through to BWN (float) for precision. */
+    if (g_use_int8 && bl->w_sign_int8 &&
+        (g_mixed_int8_layers == 0 || g_current_layer < g_mixed_int8_layers)) {
         /* Quantize x: symmetric per-tensor scale */
         float max_abs = 0;
         for (int i = 0; i < bl->in_dim; i++) {
@@ -1847,6 +1852,7 @@ static int gpt2_forward_token(int token_id, int position) {
     g_early_exit_total++;
     int actual_layers = N_LAYER;
     for (int l = 0; l < N_LAYER; l++) {
+        g_current_layer = l;  /* for mixed-int8 layer selection */
         /* Early exit: after g_early_exit_layers layers, check if the residual
          * stream has converged. If ||dx||/||x|| < threshold, skip remaining
          * layers — the model is confident and deeper layers add little. */
@@ -2516,6 +2522,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--int8") == 0) {
             g_use_bwn = 1;  /* int8 implies bwn */
             g_use_int8 = 1;
+        } else if (strcmp(argv[i], "--mixed-int8") == 0 && i+1 < argc) {
+            /* Mixed precision: first N layers int8 (fast), rest BWN (precise).
+             * Int8 quantization error compounds across layers; using BWN for
+             * later layers prevents quality degradation. --mixed-int8 6 = layers
+             * 0-5 int8, layers 6-11 BWN. Expected ~15 tok/s + BWN-quality output. */
+            g_use_bwn = 1;
+            g_use_int8 = 1;
+            g_mixed_int8_layers = atoi(argv[++i]);
+            printf("[*] mixed int8: layers 0-%d int8, layers %d-%d BWN\n",
+                   g_mixed_int8_layers - 1, g_mixed_int8_layers, N_LAYER - 1);
         } else if (strcmp(argv[i], "--early-exit") == 0 && i+1 < argc) {
             /* Bit-width speculative decoding: exit after N layers if residual
              * stream has converged. --early-exit 8 = check at layer 8, skip
