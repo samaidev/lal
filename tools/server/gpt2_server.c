@@ -45,10 +45,6 @@
   #define v8f_sub(a, b)      _mm256_sub_ps((a), (b))
   #define v8f_mul(a, b)      _mm256_mul_ps((a), (b))
   #define v8f_fmadd(a, b, c) _mm256_fmadd_ps((a), (b), (c))
-  /* XOR for sign-bit flip: replaces multiply when one operand is ±1.
-   * sign(W)·x = x XOR mask (mask has sign bit set where W=-1). ~2x faster
-   * than FMA for BWN dot product — no multiply needed, just conditional negate. */
-  static inline v8f v8f_xor(v8f a, v8f b) { return _mm256_xor_ps(a, b); }
   /* horizontal sum of 8 lanes */
   static inline float v8f_hsum(v8f v) {
     float t[8]; _mm256_storeu_ps(t, v);
@@ -73,13 +69,6 @@
   static inline v8f v8f_add(v8f a, v8f b) { v8f r; r.lo = vaddq_f32(a.lo, b.lo); r.hi = vaddq_f32(a.hi, b.hi); return r; }
   static inline v8f v8f_sub(v8f a, v8f b) { v8f r; r.lo = vsubq_f32(a.lo, b.lo); r.hi = vsubq_f32(a.hi, b.hi); return r; }
   static inline v8f v8f_mul(v8f a, v8f b) { v8f r; r.lo = vmulq_f32(a.lo, b.lo); r.hi = vmulq_f32(a.hi, b.hi); return r; }
-  /* XOR for sign-bit flip (BWN acceleration): conditional negate via bitwise XOR. */
-  static inline v8f v8f_xor(v8f a, v8f b) {
-    v8f r;
-    r.lo = vreinterpretq_f32_s32(veorq_s32(vreinterpretq_s32_f32(a.lo), vreinterpretq_s32_f32(b.lo)));
-    r.hi = vreinterpretq_f32_s32(veorq_s32(vreinterpretq_s32_f32(a.hi), vreinterpretq_s32_f32(b.hi)));
-    return r;
-  }
   #if defined(__aarch64__)
     /* AArch64 has FMA intrinsic */
     static inline v8f v8f_fmadd(v8f a, v8f b, v8f c) {
@@ -109,7 +98,6 @@
   static inline v8f v8f_sub(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]-b.v[i]; return r; }
   static inline v8f v8f_mul(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]; return r; }
   static inline v8f v8f_fmadd(v8f a, v8f b, v8f c) { v8f r; for (int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]+c.v[i]; return r; }
-  static inline v8f v8f_xor(v8f a, v8f b) { v8f r; for (int i=0;i<8;i++) { uint32_t u,v; memcpy(&u,&a.v[i],4); memcpy(&v,&b.v[i],4); u^=v; memcpy(&r.v[i],&u,4); } return r; }
   static inline float v8f_hsum(v8f v) { float s=0; for (int i=0;i<8;i++) s+=v.v[i]; return s; }
 #endif
 
@@ -468,90 +456,49 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
      * The fastest correct approach: store sign(w) as float {-1,+1} array
      * and use SIMD float dot product. We do this when --bwn flag is set. */
     if (g_use_bwn) {
-        /* BWN accelerated: multi-output SIMD FMA with ±1 sign LUT.
-         * Key insight: W=±1, so sign(W)·x = x * sign_lut (no general multiply).
-         * Multi-output: process 8 outputs at a time, sharing x loads across
-         * all 8 (8x less memory traffic for x vs 1-output-at-a-time).
-         * Uses v8f_fmadd (1 instruction on both AVX2 and NEON).
-         * XOR sign-flip was tested but is 3 instructions on NEON (slower). */
-        static float sign_lut[256][8];  /* ±1.0 */
+        /* BWN: float dot product with sign(w) unpacked from bits.
+         * Uses a pre-computed lookup table: byte → 8 floats of ±1.
+         * Table is 256×8×4B = 8KB (fits L1). Each iteration:
+         *   1. Extract byte from wbits
+         *   2. Load 8 sign floats from table
+         *   3. Dot with 8 x floats (SIMD auto-vectorizable)
+         * This is ~8x faster than scalar bit-by-bit extraction. */
+        static float sign_lut[256][8];
         static int lut_init = 0;
         if (!lut_init) {
             for (int b = 0; b < 256; b++)
                 for (int i = 0; i < 8; i++)
-                    sign_lut[b][i] = ((b >> i) & 1) ? 1.0f : -1.0f;
+                    sign_lut[b][i] = (b >> i) & 1 ? 1.0f : -1.0f;
             lut_init = 1;
         }
 
-        int j = 0;
-        for (; j + 8 <= bl->out_dim; j += 8) {
-            v8f acc0 = v8f_zero(), acc1 = v8f_zero(), acc2 = v8f_zero(), acc3 = v8f_zero();
-            v8f acc4 = v8f_zero(), acc5 = v8f_zero(), acc6 = v8f_zero(), acc7 = v8f_zero();
-            const uint64_t *w0 = bl->wbits + (size_t)(j+0) * n_words;
-            const uint64_t *w1 = bl->wbits + (size_t)(j+1) * n_words;
-            const uint64_t *w2 = bl->wbits + (size_t)(j+2) * n_words;
-            const uint64_t *w3 = bl->wbits + (size_t)(j+3) * n_words;
-            const uint64_t *w4 = bl->wbits + (size_t)(j+4) * n_words;
-            const uint64_t *w5 = bl->wbits + (size_t)(j+5) * n_words;
-            const uint64_t *w6 = bl->wbits + (size_t)(j+6) * n_words;
-            const uint64_t *w7 = bl->wbits + (size_t)(j+7) * n_words;
-            for (int wi = 0; wi < n_words; wi++) {
-                int base = wi * 64;
-                for (int bi = 0; bi < 8; bi++) {
-                    int idx = base + bi * 8;
-                    if (idx + 7 >= bl->in_dim) break;
-                    v8f xv = v8f_load(x + idx);
-                    uint64_t w;
-                    w = w0[wi]; acc0 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc0);
-                    w = w1[wi]; acc1 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc1);
-                    w = w2[wi]; acc2 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc2);
-                    w = w3[wi]; acc3 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc3);
-                    w = w4[wi]; acc4 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc4);
-                    w = w5[wi]; acc5 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc5);
-                    w = w6[wi]; acc6 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc6);
-                    w = w7[wi]; acc7 = v8f_fmadd(xv, v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc7);
-                }
-            }
-            /* Tail */
-            int tail_start = n_words * 64;
-            float t0=0,t1=0,t2=0,t3=0,t4=0,t5=0,t6=0,t7=0;
-            for (int i = tail_start; i < bl->in_dim; i++) {
-                float xi = x[i];
-                t0 += ((w0[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t1 += ((w1[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t2 += ((w2[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t3 += ((w3[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t4 += ((w4[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t5 += ((w5[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t6 += ((w6[i/64] >> (i%64)) & 1) ? xi : -xi;
-                t7 += ((w7[i/64] >> (i%64)) & 1) ? xi : -xi;
-            }
-            y[j+0] = (v8f_hsum(acc0)+t0) * bl->alpha[j+0] + bl->bias[j+0];
-            y[j+1] = (v8f_hsum(acc1)+t1) * bl->alpha[j+1] + bl->bias[j+1];
-            y[j+2] = (v8f_hsum(acc2)+t2) * bl->alpha[j+2] + bl->bias[j+2];
-            y[j+3] = (v8f_hsum(acc3)+t3) * bl->alpha[j+3] + bl->bias[j+3];
-            y[j+4] = (v8f_hsum(acc4)+t4) * bl->alpha[j+4] + bl->bias[j+4];
-            y[j+5] = (v8f_hsum(acc5)+t5) * bl->alpha[j+5] + bl->bias[j+5];
-            y[j+6] = (v8f_hsum(acc6)+t6) * bl->alpha[j+6] + bl->bias[j+6];
-            y[j+7] = (v8f_hsum(acc7)+t7) * bl->alpha[j+7] + bl->bias[j+7];
-        }
-        /* Remaining outputs */
-        for (; j < bl->out_dim; j++) {
+        for (int j = 0; j < bl->out_dim; j++) {
             const uint64_t *wb = bl->wbits + (size_t)j * n_words;
-            v8f acc = v8f_zero();
+            float dot = 0.0f;
             for (int wi = 0; wi < n_words; wi++) {
                 uint64_t w = wb[wi];
                 int base = wi * 64;
                 for (int bi = 0; bi < 8; bi++) {
                     int idx = base + bi * 8;
-                    if (idx + 7 >= bl->in_dim) break;
-                    acc = v8f_fmadd(v8f_load(x + idx), v8f_load(sign_lut[(w >> (bi*8)) & 0xFF]), acc);
+                    uint8_t byte = (w >> (bi * 8)) & 0xFF;
+                    const float *sw = sign_lut[byte];
+                    if (idx + 7 < bl->in_dim) {
+                        /* 8x unrolled dot product — auto-vectorizes to SIMD */
+                        dot += x[idx+0] * sw[0];
+                        dot += x[idx+1] * sw[1];
+                        dot += x[idx+2] * sw[2];
+                        dot += x[idx+3] * sw[3];
+                        dot += x[idx+4] * sw[4];
+                        dot += x[idx+5] * sw[5];
+                        dot += x[idx+6] * sw[6];
+                        dot += x[idx+7] * sw[7];
+                    } else {
+                        for (int k = 0; k < 8; k++) {
+                            int i = idx + k;
+                            if (i < bl->in_dim) dot += x[i] * sw[k];
+                        }
+                    }
                 }
-            }
-            float dot = v8f_hsum(acc);
-            for (int i = n_words * 64; i < bl->in_dim; i++) {
-                int bit = (wb[i/64] >> (i%64)) & 1;
-                dot += bit ? x[i] : -x[i];
             }
             y[j] = dot * bl->alpha[j] + bl->bias[j];
         }
