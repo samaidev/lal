@@ -68,11 +68,22 @@ typedef struct {
     float    *alpha;
     float    *bias;
     float    *w_float;   /* STE: full-precision weights for gradient update */
+    float    *w_core;    /* Logic-guided: CORE weights kept as float (not binarized) */
+    uint8_t  *logic_mask; /* Per-output: 0=CORE(float), 1=BINARY(sign+alpha), 2=PRUNE(zero) */
+    int       n_core;     /* Count of CORE outputs */
+    int       n_prune;    /* Count of PRUNE outputs */
     int       in_dim, out_dim, n_words, n_words_T;
 } BinLayer;
 
 void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
                     int in_dim, int out_dim);
+
+/* Logic-guided binarization: initialize with a per-output logic_mask.
+ * mask[j]: 0=CORE (keep float in w_core), 1=BINARY (sign+alpha), 2=PRUNE (zero).
+ * This implements PHONE's "logic extraction at binarization time":
+ * core logic weights stay float, noise is pruned, rest is binarized. */
+void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
+                          int in_dim, int out_dim, const uint8_t *logic_mask);
 void bin_layer_free(BinLayer *bl);
 
 /* bin_forward (BWN, default): x stays float, only W is binarized.

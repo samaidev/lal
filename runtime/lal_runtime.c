@@ -657,11 +657,115 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
     }
 }
 
+/* Logic-guided binarization: initialize with per-output logic_mask.
+ * mask[j]: 0=CORE (keep float), 1=BINARY (sign+alpha), 2=PRUNE (zero).
+ *
+ * This implements PHONE's "logic extraction at binarization time":
+ * - CORE outputs: weights stored as float in w_core, NOT binarized
+ * - BINARY outputs: sign(w) packed into wbits, alpha = mean(|w|)
+ * - PRUNE outputs: wbits all zero, alpha=0, bias=0 (effectively removed)
+ *
+ * The forward pass (bin_forward) checks logic_mask per output:
+ * - CORE: y[j] = x @ w_core[j] (float matmul, no binarization)
+ * - BINARY: y[j] = alpha * (2*popcount - N) + bias (XNOR+popcount)
+ * - PRUNE: y[j] = 0 (skipped entirely)
+ */
+void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
+                          int in_dim, int out_dim, const uint8_t *logic_mask) {
+    bl->in_dim = in_dim;
+    bl->out_dim = out_dim;
+    bl->n_words = (in_dim + 63) / 64;
+    bl->n_words_T = (out_dim + 63) / 64;
+    bl->wbits = calloc(out_dim * bl->n_words, sizeof(uint64_t));
+    bl->wbits_T = calloc(in_dim * bl->n_words_T, sizeof(uint64_t));
+    bl->alpha = calloc(out_dim, sizeof(float));
+    bl->bias = bias ? malloc(out_dim * sizeof(float)) : calloc(out_dim, sizeof(float));
+    bl->w_float = malloc((size_t)out_dim * in_dim * sizeof(float));
+    bl->w_core = NULL;
+    bl->logic_mask = NULL;
+    bl->n_core = 0;
+    bl->n_prune = 0;
+
+    if (!logic_mask) {
+        /* No logic mask → use standard binarization (all BINARY) */
+        bin_layer_init(bl, W, bias, in_dim, out_dim);
+        return;
+    }
+
+    /* Copy logic mask + count categories */
+    bl->logic_mask = malloc(out_dim);
+    memcpy(bl->logic_mask, logic_mask, out_dim);
+    for (int j = 0; j < out_dim; j++) {
+        if (logic_mask[j] == 0) bl->n_core++;
+        else if (logic_mask[j] == 2) bl->n_prune++;
+    }
+
+    /* Allocate w_core for CORE outputs (float weights, [n_core, in_dim]) */
+    if (bl->n_core > 0) {
+        bl->w_core = malloc((size_t)bl->n_core * in_dim * sizeof(float));
+    }
+
+    /* Process each output based on its logic category */
+    int core_idx = 0;
+    for (int j = 0; j < out_dim; j++) {
+        const float *wj = &W[j * in_dim];  /* W is [out, in] (transposed) */
+
+        switch (logic_mask[j]) {
+        case 0: /* CORE: keep float */
+            memcpy(&bl->w_core[core_idx * in_dim], wj, in_dim * sizeof(float));
+            bl->alpha[j] = 0.0f;  /* not used for CORE */
+            if (bias) bl->bias[j] = bias[j];
+            /* wbits for CORE: all zero (not used, but keep for indexing) */
+            core_idx++;
+            break;
+
+        case 1: /* BINARY: sign(w) + alpha */
+            {
+                float abs_sum = 0;
+                for (int i = 0; i < in_dim; i++) abs_sum += fabsf(wj[i]);
+                bl->alpha[j] = abs_sum / in_dim;
+                if (bias) bl->bias[j] = bias[j];
+                for (int wi = 0; wi < bl->n_words; wi++) {
+                    uint64_t word = 0;
+                    for (int bi = 0; bi < 64; bi++) {
+                        int idx = wi * 64 + bi;
+                        if (idx < in_dim && wj[idx] > 0.0f) word |= (1ULL << bi);
+                    }
+                    bl->wbits[j * bl->n_words + wi] = word;
+                }
+            }
+            break;
+
+        case 2: /* PRUNE: zero out */
+            bl->alpha[j] = 0.0f;
+            bl->bias[j] = 0.0f;
+            /* wbits already zero from calloc */
+            break;
+        }
+
+        /* Copy to w_float (transposed [out, in] for STE compatibility) */
+        memcpy(&bl->w_float[j * in_dim], wj, in_dim * sizeof(float));
+    }
+
+    /* Build wbits_T (transposed) only for BINARY outputs */
+    for (int i = 0; i < in_dim; i++) {
+        for (int wi = 0; wi < bl->n_words_T; wi++) {
+            uint64_t word = 0;
+            for (int bi = 0; bi < 64; bi++) {
+                int j = wi * 64 + bi;
+                if (j < out_dim && logic_mask[j] == 1 && W[j * in_dim + i] > 0.0f)
+                    word |= (1ULL << bi);
+            }
+            bl->wbits_T[i * bl->n_words_T + wi] = word;
+        }
+    }
+}
+
 void bin_layer_free(BinLayer *bl) {
     free(bl->wbits); free(bl->wbits_T); free(bl->alpha); free(bl->bias);
-    free(bl->w_float);
+    free(bl->w_float); free(bl->w_core); free(bl->logic_mask);
     bl->wbits = NULL; bl->wbits_T = NULL; bl->alpha = NULL; bl->bias = NULL;
-    bl->w_float = NULL;
+    bl->w_float = NULL; bl->w_core = NULL; bl->logic_mask = NULL;
 }
 
 /* Re-pack wbits and wbits_T from sign(w_float).
@@ -735,16 +839,74 @@ static void bin_layer_repack(BinLayer *bl) {
 void bin_forward(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
 
-    /* K-norm: ||x||_1 / in_dim (XNOR-Net input scaling factor) */
+    /* Logic-guided: if logic_mask exists, dispatch per-output */
+    if (bl->logic_mask) {
+        /* K-norm for BINARY outputs */
+        float abs_sum = 0.0f;
+        for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
+        float K = abs_sum / in;
+
+        static float sign_lut[256][8];
+        static int lut_init = 0;
+        if (!lut_init) {
+            for (int b = 0; b < 256; b++)
+                for (int i = 0; i < 8; i++)
+                    sign_lut[b][i] = (b >> i) & 1 ? 1.0f : -1.0f;
+            lut_init = 1;
+        }
+
+        int core_idx = 0;
+        for (int j = 0; j < out; j++) {
+            switch (bl->logic_mask[j]) {
+            case 0: { /* CORE: float matmul */
+                const float *wc = &bl->w_core[core_idx * in];
+                float s = 0.0f;
+                for (int i = 0; i + 7 < in; i += 8) {
+                    s += x[i+0]*wc[i+0] + x[i+1]*wc[i+1] + x[i+2]*wc[i+2] + x[i+3]*wc[i+3];
+                    s += x[i+4]*wc[i+4] + x[i+5]*wc[i+5] + x[i+6]*wc[i+6] + x[i+7]*wc[i+7];
+                }
+                for (int i = (in/8)*8; i < in; i++) s += x[i] * wc[i];
+                y[j] = s + bl->bias[j];
+                core_idx++;
+                break;
+            }
+            case 1: { /* BINARY: sign(w) * alpha * K + bias */
+                const uint64_t *wb = &bl->wbits[j * nw];
+                float s = 0.0f;
+                for (int wi = 0; wi < nw; wi++) {
+                    uint64_t w = wb[wi];
+                    int base = wi * 64;
+                    for (int bi = 0; bi < 8; bi++) {
+                        int idx = base + bi * 8;
+                        uint8_t byte = (uint8_t)((w >> (bi * 8)) & 0xFF);
+                        const float *sw = sign_lut[byte];
+                        if (idx + 7 < in) {
+                            s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
+                            s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                        } else {
+                            for (int k = 0; k < 8; k++) {
+                                int i = idx + k;
+                                if (i < in) s += x[i] * sw[k];
+                            }
+                        }
+                    }
+                }
+                y[j] = s * bl->alpha[j] * K + bl->bias[j];
+                break;
+            }
+            default: /* PRUNE: zero */
+                y[j] = 0.0f;
+                break;
+            }
+        }
+        return;
+    }
+
+    /* Standard BWN path (no logic_mask) */
     float abs_sum = 0.0f;
     for (int i = 0; i < in; i++) abs_sum += fabsf(x[i]);
     float K = abs_sum / in;
 
-    /* LUT-based sign unpack (matches tools/server/gpt2_server.c 51c115b):
-     * 256-entry table, byte → 8 floats of ±1. 8KB, fits L1.
-     * Each iteration extracts 1 byte from wbits, loads 8 sign floats,
-     * dots with 8 x floats. 8x unrolled loop auto-vectorizes to SIMD.
-     * ~8x faster than scalar bit-by-bit extraction. */
     static float sign_lut[256][8];
     static int lut_init = 0;
     if (!lut_init) {
