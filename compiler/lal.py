@@ -1198,7 +1198,7 @@ _PARALLEL_MODE = False
 _BINARY_MODE = False
 # v0.11: train mode — compile forward + backward + update (no PyTorch needed)
 _TRAIN_MODE = False
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False, train=False) -> str:
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False, train=False, filter_only=False) -> str:
     """Compile a rule (and any rules it calls) to specialized C.
 
     quantize: None for float32, or "int8"/"int4" for quantized concept data.
@@ -1207,6 +1207,9 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     train: if True, compile forward + backward + update (v0.11). Generates
            a complete training loop in C — no PyTorch needed. The rule body
            must contain loss(), grad(), and update() calls.
+    filter_only: if True, emit ONLY the lal_filter_topk strong symbol (no main,
+           no entry-rule call). Used when linking the .lal filter into the server
+           to avoid a main() symbol conflict with gpt2_server.c.
     """
     global _SIMD_HELPERS_NEEDED, _QUANTIZE_MODE, _PARALLEL_MODE, _BINARY_MODE, _TRAIN_MODE
     _SIMD_HELPERS_NEEDED = set()
@@ -1452,6 +1455,16 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             lines.append("")
 
     # main() — in train mode, runs a training loop; otherwise calls entry rule.
+    # filter_only mode skips main() entirely: the output .o is linked into the
+    # server (which has its own main), so we emit only lal_filter_topk + any
+    # supporting concept/relate data it references.
+    if filter_only:
+        # Validate that at least one filter rule was emitted.
+        if not any(getattr(rule_map[rn], "kind", "rule") == "filter" for rn in rules_to_emit):
+            raise ParseError("--filter-only: no filter rule found in the .lal source. "
+                             "Declare a `filter name:` block with ban_* actions.")
+        return "\n".join(lines) + "\n"
+
     if _TRAIN_MODE:
         # In train mode, we need a different output order:
         # 1. Global param arrays (BEFORE the train function so it can access them)
@@ -3008,6 +3021,10 @@ def main():
                     help="binarize weights to {-1,+1}, use XNOR+popcount (64 muls per instruction)")
     ap.add_argument("--train", action="store_true",
                     help="compile forward + backward + update (training mode, no PyTorch)")
+    ap.add_argument("--filter-only", action="store_true",
+                    help="emit ONLY the lal_filter_topk strong symbol (no main). "
+                         "Used when linking a .lal filter into the server to avoid "
+                         "a main() symbol conflict with gpt2_server.c.")
     args = ap.parse_args()
 
     with open(args.input) as f:
@@ -3020,7 +3037,8 @@ def main():
     concepts, bounds, memories, relates, rules = parse(source, args.input)
     c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule,
                           quantize=args.quantize, parallel=args.parallel,
-                          binarize=args.binarize, train=args.train)
+                          binarize=args.binarize, train=args.train,
+                          filter_only=args.filter_only)
 
     if args.output:
         with open(args.output, "w") as f:
