@@ -46,9 +46,18 @@ static int encode(const char *t, int *tk) {
     tk[0]=464;tk[1]=995;tk[2]=318;tk[3]=257;tk[4]=1639;tk[5]=286;tk[6]=869;return 7;
 }
 
-/* Export fine-tuned binary weights to GB2L file (same format as gpt2_binary.bin).
- * After STE training, wbits/alpha/bias have been updated. Export them so the
- * inference server can load the improved weights. */
+/* Export binary weights to GB2L / GB2L2 file.
+ * After STE training, wbits/alpha/bias have been updated (w_float via STE).
+ *
+ * Format:
+ *  - GB2L  (v1, all-binary): magic "GB2L" + header + per-matrix full
+ *    wbits/alpha/bias, mhdr[3]=0.
+ *  - GB2L2 (v2, logic-guided): magic "GB2L2" + header + per-matrix
+ *    {mhdr[3]=n_core, logic_mask[out_dim], compacted BINARY wbits,
+ *     compacted BINARY alpha, full bias[out_dim], w_core[n_core*in_dim]}.
+ * The inference server auto-detects format via the magic bytes, so
+ * logic-guided binarization (CORE float / BINARY sign+alpha / PRUNE zero)
+ * survives the export -> inference round-trip. */
 static void export_binary_weights(Model *m, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "[!] cannot open %s for writing\n", path); return; }
@@ -59,8 +68,30 @@ static void export_binary_weights(Model *m, const char *path) {
     int vocab = m->cfg.vocab_size;
     int n_ctx = m->cfg.n_ctx;
 
-    /* Header */
-    fwrite("GB2L", 1, 4, f);
+    /* Detect whether any BinLayer carries a logic_mask (logic-guided
+     * binarization). If so, write GB2L2; else fall back to GB2L (v1).
+     * If any layer has zbits (ternary mode), write GT3L instead. */
+    int has_logic = 0, has_ternary = 0;
+    for (int l = 0; l < n_layer && !has_logic; l++) {
+        TransLayer *tl = &m->layers[l];
+        BinLayer *probes[4] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+        for (int mi = 0; mi < 4; mi++)
+            if (probes[mi]->logic_mask) { has_logic = 1; break; }
+    }
+    if (has_logic) {
+        for (int l = 0; l < n_layer && !has_ternary; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *probes[4] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            for (int mi = 0; mi < 4; mi++)
+                if (probes[mi]->zbits) { has_ternary = 1; break; }
+        }
+    }
+
+    /* Magic: "GT3L" for ternary logic-guided, "GB2L2" for binary logic-guided,
+     * "GB2L" for plain binary. GT3L is a superset of GB2L2 (adds zbits block). */
+    if (has_ternary) fwrite("GT3L", 1, 4, f);
+    else { fwrite("GB2L", 1, 4, f); if (has_logic) fwrite("2", 1, 1, f); }
+
     int hdr[5] = {n_layer, n_embd, mlp_dim, vocab, n_ctx};
     fwrite(hdr, 4, 5, f);
 
@@ -71,6 +102,7 @@ static void export_binary_weights(Model *m, const char *path) {
     fwrite(m->ln_f_b, sizeof(float), n_embd, f);
 
     /* Per-layer binary weights (updated by STE) */
+    int total_core = 0, total_binary = 0;
     for (int l = 0; l < n_layer; l++) {
         TransLayer *tl = &m->layers[l];
         /* LayerNorm (float, not updated) */
@@ -95,19 +127,63 @@ static void export_binary_weights(Model *m, const char *path) {
 
         for (int mi = 0; mi < 4; mi++) {
             BinLayer *bl = mats[mi];
-            int mhdr[4] = {bl->out_dim, bl->in_dim, bl->n_words, 0};
-            fwrite(mhdr, 4, 4, f);
-            /* wbits: [out_dim * n_words] uint64s */
-            fwrite(bl->wbits, sizeof(uint64_t),
-                   (size_t)bl->out_dim * bl->n_words, f);
-            /* alpha + bias */
-            fwrite(bl->alpha, sizeof(float), bl->out_dim, f);
-            fwrite(bl->bias, sizeof(float), bl->out_dim, f);
+            if (has_logic && bl->logic_mask) {
+                /* GB2L2/GT3L per-matrix: mhdr[3]=n_core, then logic_mask,
+                 * compacted BINARY wbits, compacted BINARY zbits (GT3L only),
+                 * compacted BINARY alpha, full bias, then CORE float rows. */
+                int mhdr[4] = {bl->out_dim, bl->in_dim, bl->n_words, bl->n_core};
+                fwrite(mhdr, 4, 4, f);
+                fwrite(bl->logic_mask, 1, bl->out_dim, f);
+                /* compacted wbits: only BINARY rows (logic_mask==1), j order */
+                for (int j = 0; j < bl->out_dim; j++)
+                    if (bl->logic_mask[j] == 1)
+                        fwrite(bl->wbits + (size_t)j * bl->n_words,
+                               sizeof(uint64_t), bl->n_words, f);
+                /* GT3L: compacted zbits (zero mask) — only BINARY rows, j order.
+                 * Reader allocates zbits when this block is present (magic=GT3L). */
+                if (has_ternary) {
+                    for (int j = 0; j < bl->out_dim; j++)
+                        if (bl->logic_mask[j] == 1)
+                            fwrite(bl->zbits + (size_t)j * bl->n_words,
+                                   sizeof(uint64_t), bl->n_words, f);
+                }
+                /* compacted alpha: only BINARY rows, j order */
+                for (int j = 0; j < bl->out_dim; j++)
+                    if (bl->logic_mask[j] == 1)
+                        fwrite(&bl->alpha[j], sizeof(float), 1, f);
+                /* full bias (PRUNE rows already zeroed at init) */
+                fwrite(bl->bias, sizeof(float), bl->out_dim, f);
+                /* CORE float rows: [n_core × in_dim], contiguous in w_core
+                 * (laid out by bin_layer_init_with_logic). */
+                if (bl->n_core > 0)
+                    fwrite(bl->w_core, sizeof(float),
+                           (size_t)bl->n_core * bl->in_dim, f);
+                total_core   += bl->n_core;
+                for (int j = 0; j < bl->out_dim; j++)
+                    if (bl->logic_mask[j] == 1) total_binary++;
+            } else {
+                /* GB2L v1 per-matrix: full wbits/alpha/bias, mhdr[3]=0 */
+                int mhdr[4] = {bl->out_dim, bl->in_dim, bl->n_words, 0};
+                fwrite(mhdr, 4, 4, f);
+                fwrite(bl->wbits, sizeof(uint64_t),
+                       (size_t)bl->out_dim * bl->n_words, f);
+                fwrite(bl->alpha, sizeof(float), bl->out_dim, f);
+                fwrite(bl->bias,  sizeof(float), bl->out_dim, f);
+            }
         }
     }
 
     fclose(f);
-    printf("[*] exported STE-tuned binary weights to %s\n", path);
+    if (has_ternary)
+        printf("[*] exported GT3L (ternary logic-guided, {-1,0,+1}) weights to %s "
+               "(%d CORE float rows, %d BINARY ternary rows retained)\n",
+               path, total_core, total_binary);
+    else if (has_logic)
+        printf("[*] exported GB2L2 (logic-guided) weights to %s "
+               "(%d CORE float rows, %d BINARY rows retained)\n",
+               path, total_core, total_binary);
+    else
+        printf("[*] exported STE-tuned binary weights to %s\n", path);
 }
 
 int main(int argc, char **argv) {
@@ -116,17 +192,42 @@ int main(int argc, char **argv) {
     int use_ste = 0;
     int use_real_attn = 0;
     int use_logic = 0;
+    int use_adam = 0;
+    int use_ternary = 0;
+    float ternary_delta = 0.7f;
+    int warmup_steps = 0;       /* default: no warmup */
+    int total_steps = 0;       /* default: no cosine decay (use n_steps if >0) */
     const char *export_path = NULL;
+    const char *distill_path = NULL;       /* teacher weights path */
+    float distill_alpha = 0.5f;            /* CE/KL mix (0=CE only, 1=KL only) */
+    float distill_T = 4.0f;                /* distillation temperature */
     /* Parse flags */
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--ste") == 0) use_ste = 1;
         else if (strcmp(argv[i], "--real-attention") == 0) use_real_attn = 1;
         else if (strcmp(argv[i], "--logic") == 0) use_logic = 1;
+        else if (strcmp(argv[i], "--adam") == 0) use_adam = 1;
+        else if (strcmp(argv[i], "--ternary") == 0) use_ternary = 1;
+        else if (strcmp(argv[i], "--ternary-delta") == 0 && i + 1 < argc) ternary_delta = atof(argv[++i]);
+        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup_steps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--total") == 0 && i + 1 < argc) total_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) export_path = argv[++i];
+        else if (strcmp(argv[i], "--distill") == 0 && i + 1 < argc) distill_path = argv[++i];
+        else if (strcmp(argv[i], "--distill-alpha") == 0 && i + 1 < argc) distill_alpha = atof(argv[++i]);
+        else if (strcmp(argv[i], "--distill-T") == 0 && i + 1 < argc) distill_T = atof(argv[++i]);
     }
+    if (total_steps == 0) total_steps = n_steps;  /* auto-decay over training */
 
     printf("[*] LAL Training — GPT-2 (model-agnostic runtime, no PyTorch)\n");
-    printf("[*] steps:%d lr:%f ste:%d logic:%d real_attn:%d\n", n_steps, lr, use_ste, use_logic, use_real_attn);
+    printf("[*] steps:%d lr:%f ste:%d logic:%d real_attn:%d adam:%d\n",
+           n_steps, lr, use_ste, use_logic, use_real_attn, use_adam);
+    printf("[*] schedule: warmup=%d cosine_total=%d  (lr=%.1e at step 0)\n",
+           warmup_steps, total_steps,
+           warmup_steps > 0 ? lr / warmup_steps : lr);
+    if (distill_path) {
+        printf("[*] distillation: teacher=%s alpha=%.2f T=%.1f\n",
+               distill_path, distill_alpha, distill_T);
+    }
     if (use_logic) {
         g_use_logic_binarization = 1;
         printf("[*] Logic-guided binarization: top 20%% norm → CORE(float), bottom 10%% → PRUNE(zero)\n");
@@ -136,18 +237,34 @@ int main(int argc, char **argv) {
         printf("[*] STE mode: binary weights will be updated via Straight-Through Estimator\n");
         /* STE updates w_float (full-precision weights) then repacks wbits.
          * The gradient magnitude is much larger than non-STE (which only
-         * updates alpha/bias), so lr > 0.01 causes NaN divergence.
-         * Tested: lr=0.05 → NaN at step 100; lr=0.002 → stable.
-         * Recommended: lr=0.001-0.005 for STE. */
-        if (lr > 0.01f) {
-            printf("[!] WARNING: STE with lr=%f > 0.01 is likely to diverge (NaN).\n", lr);
-            printf("[!]           Clamping to 0.005. Use lr=0.002 for best results.\n");
+         * updates alpha/bias), so lr > 0.01 caused NaN divergence with SGD.
+         * With Adam, the per-param adaptive lr stabilizes updates — lr=0.001
+         * is the recommended default. SGD should still use lr<=0.005. */
+        if (!use_adam && lr > 0.01f) {
+            printf("[!] WARNING: STE+SGD with lr=%f > 0.01 is likely to diverge (NaN).\n", lr);
+            printf("[!]           Clamping to 0.005. Use --adam for higher lr.\n");
             lr = 0.005f;
         }
+    }
+    if (use_adam) {
+        g_use_adam = 1;
+        printf("[*] Adam optimizer: beta1=%.2f beta2=%.4f eps=%.0e (per-param adaptive lr)\n",
+               g_adam_beta1, g_adam_beta2, g_adam_eps);
     }
     if (use_real_attn) {
         g_use_real_attention = 1;
         printf("[*] Real attention: causal multi-head QK softmax + KV cache (replaces V-copy)\n");
+    }
+    if (use_ternary) {
+        if (!use_logic) {
+            printf("[!] --ternary requires --logic (ternary applies to BINARY logic rows). Auto-enabling logic.\n");
+            use_logic = 1;
+            g_use_logic_binarization = 1;
+        }
+        g_use_ternary = 1;
+        g_ternary_delta_factor = ternary_delta;
+        printf("[*] Ternary Weight Network: W ∈ {-1, 0, +1}, Δ=%.2f * mean(|W|) "
+               "(~1.58 bits/weight, 3x BWN capacity)\n", ternary_delta);
     }
     if (export_path) {
         printf("[*] will export tuned weights to %s after training\n", export_path);
@@ -161,6 +278,23 @@ int main(int argc, char **argv) {
     if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
     model_load(&model, weight_path, gpt2_config(), "h.%d.", 1);
 
+    /* Load teacher model (for distillation). Teacher is loaded with
+     * logic_binarization OFF so all layers are BINARY — but we never call
+     * backward on it, so w_float stays at the original GPT-2 weights. We use
+     * trans_layer_forward_pure_float which dispatches via w_float directly. */
+    Model teacher;
+    int use_distill = 0;
+    float *teacher_logits = NULL;
+    if (distill_path) {
+        int saved_logic = g_use_logic_binarization;
+        g_use_logic_binarization = 0;  /* teacher: no logic mask */
+        model_load(&teacher, distill_path, gpt2_config(), "h.%d.", 1);
+        g_use_logic_binarization = saved_logic;
+        teacher_logits = malloc(gpt2_config().vocab_size * sizeof(float));
+        use_distill = 1;
+        printf("[*] teacher model loaded (pure-float, never updated)\n");
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("[*] load: %.1fs\n", (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
@@ -172,10 +306,21 @@ int main(int argc, char **argv) {
         int n = train_data[ti].n;
         int target = train_data[ti].ids[n-1];
         int tt[32]; memcpy(tt, train_data[ti].ids, n * sizeof(int));
+        /* LR schedule: warmup + cosine decay. */
+        float lr_step = lr_schedule(step, warmup_steps, total_steps, lr);
         float loss = model_forward(&model, tt, n-1);
-        model_backward(&model, tt, n-1, lr);
+        if (use_distill) {
+            /* Teacher produces full-vocab logits at the target position.
+             * Then student backward combines hard CE + soft KL. */
+            model_forward_float_logits(&teacher, tt, n-1, teacher_logits);
+            model_backward_distill(&model, tt, n-1, lr_step,
+                                   teacher_logits, distill_alpha, distill_T);
+        } else {
+            model_backward(&model, tt, n-1, lr_step);
+        }
         if (step % 50 == 0)
-            printf("  step %4d  loss=%.4f  (sentence %d, %d tokens)\n", step, loss, ti, n);
+            printf("  step %4d  loss=%.4f  lr=%.2e  (sentence %d, %d tokens)\n",
+                   step, loss, lr_step, ti, n);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
@@ -187,6 +332,10 @@ int main(int argc, char **argv) {
         export_binary_weights(&model, export_path);
     }
 
+    if (use_distill) {
+        free(teacher_logits);
+        model_free(&teacher);
+    }
     model_free(&model);
     return 0;
 }

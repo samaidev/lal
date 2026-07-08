@@ -210,10 +210,13 @@ static GPT2Layer g_layers[N_LAYER];
  */
 typedef struct {
     uint64_t *wbits;   /* [out_dim, n_words] — sign(w) packed, row-major per output */
+    uint64_t *zbits;   /* [out_dim, n_words] — ternary zero mask (GT3L only). NULL for GB2L/GB2L2.
+                         * Bit=1 means weight is 0 (ternary), bit=0 means active (±1).
+                         * Combined: ternary value = sign * (1 - zbit) ∈ {-1, 0, +1}. */
     float    *alpha;   /* [out_dim] — per-output scale = mean|w| */
     float    *bias;    /* [out_dim] */
     int       in_dim, out_dim, n_words;
-    /* Logic-guided (GB2L2): per-output 0=CORE(float), 1=BINARY(sign+alpha), 2=PRUNE(zero).
+    /* Logic-guided (GB2L2/GT3L): per-output 0=CORE(float), 1=BINARY(sign+alpha), 2=PRUNE(zero).
      * When logic_mask is non-NULL, wbits/alpha are stored in FULL [out_dim] layout
      * (CORE/PRUNE rows zeroed) so bin_matmul can index by output j directly,
      * matching the runtime's logic forward. w_core holds the CORE float rows. */
@@ -360,23 +363,39 @@ static void bin_matmul(const float *x, const SrvBinLayer *bl, float *y) {
                 core_idx++;
                 break;
             }
-            case 1: { /* BINARY: sign(w) dot x, scaled by alpha * K */
+            case 1: { /* BINARY: sign(w) dot x, scaled by alpha * K (ternary if zbits set) */
                 const uint64_t *wb = bl->wbits + (size_t)j * nw;
+                const uint64_t *zb = bl->zbits ? bl->zbits + (size_t)j * nw : NULL;
                 float s = 0.0f;
                 for (int wi = 0; wi < nw; wi++) {
                     uint64_t w = wb[wi];
+                    uint64_t z = zb ? zb[wi] : 0;  /* zero mask: 1=skip (ternary 0) */
                     int base = wi * 64;
                     for (int bi = 0; bi < 8; bi++) {
                         int idx = base + bi * 8;
                         uint8_t byte = (uint8_t)((w >> (bi * 8)) & 0xFF);
+                        uint8_t zbyte = (uint8_t)((z >> (bi * 8)) & 0xFF);
                         const float *sw = lg_sign_lut[byte];
                         if (idx + 7 < in) {
-                            s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
-                            s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                            if (zbyte == 0) {
+                                /* No zeros — full 8x dot product. */
+                                s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
+                                s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                            } else {
+                                /* Ternary: zeroed positions (zbyte bit set) contribute 0. */
+                                s += (zbyte & 0x01) ? 0 : x[idx+0]*sw[0];
+                                s += (zbyte & 0x02) ? 0 : x[idx+1]*sw[1];
+                                s += (zbyte & 0x04) ? 0 : x[idx+2]*sw[2];
+                                s += (zbyte & 0x08) ? 0 : x[idx+3]*sw[3];
+                                s += (zbyte & 0x10) ? 0 : x[idx+4]*sw[4];
+                                s += (zbyte & 0x20) ? 0 : x[idx+5]*sw[5];
+                                s += (zbyte & 0x40) ? 0 : x[idx+6]*sw[6];
+                                s += (zbyte & 0x80) ? 0 : x[idx+7]*sw[7];
+                            }
                         } else {
                             for (int k = 0; k < 8; k++) {
                                 int i = idx + k;
-                                if (i < in) s += x[i] * sw[k];
+                                if (i < in && !((zbyte >> k) & 1)) s += x[i] * sw[k];
                             }
                         }
                     }
@@ -606,19 +625,27 @@ static int load_binary_weights(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[!] cannot open %s\n", path); return -1; }
 
-    /* Magic: "GB2L" (v1, 4B) or "GB2L2" (v2 logic-guided, 5B). Read 4, then
-     * peek the 5th byte: if '2' it's v2; otherwise seek back one (v1 header). */
+    /* Magic: "GB2L" (v1, 4B), "GB2L2" (v2 logic-guided, 5B), or "GT3L" (ternary, 4B).
+     * Read 4 bytes; if '2' follows GB2L → v2 logic-guided; if GT3L → ternary;
+     * otherwise v1 all-binary (the 5th byte belongs to the header, seek back). */
     char magic[4];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "GB2L", 4) != 0) {
+    if (fread(magic, 1, 4, f) != 4 || (memcmp(magic, "GB2L", 4) != 0 && memcmp(magic, "GT3L", 4) != 0)) {
         fprintf(stderr, "[!] bad magic in %s\n", path); fclose(f); return -1;
     }
-    int is_logic = 0;
-    char c5;
-    if (fread(&c5, 1, 1, f) == 1) {
-        if (c5 == '2') is_logic = 1;
-        else fseek(f, -1, SEEK_CUR);  /* v1: the byte belongs to the header */
+    int is_logic = 0, is_ternary = 0;
+    if (memcmp(magic, "GT3L", 4) == 0) {
+        is_ternary = 1;  /* GT3L implies logic-guided (ternary only applies to BINARY rows) */
+        is_logic = 1;
+    } else {
+        char c5;
+        if (fread(&c5, 1, 1, f) == 1) {
+            if (c5 == '2') is_logic = 1;
+            else fseek(f, -1, SEEK_CUR);  /* v1: the byte belongs to the header */
+        }
     }
-    fprintf(stderr, "[*] binary weights: %s format\n", is_logic ? "GB2L2 (logic-guided)" : "GB2L (all-binary)");
+    fprintf(stderr, "[*] binary weights: %s format\n",
+            is_ternary ? "GT3L (ternary logic-guided)" :
+            is_logic ? "GB2L2 (logic-guided)" : "GB2L (all-binary)");
 
     unsigned int hdr[5];
     if (fread(hdr, 4, 5, f) != 5) { fclose(f); return -1; }
@@ -663,11 +690,12 @@ static int load_binary_weights(const char *path) {
             bl->n_words = mhdr[2];
             bl->logic_mask = NULL;
             bl->w_core = NULL;
+            bl->zbits = NULL;  /* GT3L only */
             bl->n_core = 0;
 
             if (is_logic) {
-                /* GB2L2: header 4th field = n_core. Read logic_mask, then
-                 * compacted BINARY rows (expand to full [out_dim] layout),
+                /* GB2L2/GT3L: header 4th field = n_core. Read logic_mask, then
+                 * compacted BINARY wbits, compacted BINARY zbits (GT3L only),
                  * compacted alpha, full bias, then CORE float rows. */
                 int n_core = (int)mhdr[3];
                 bl->n_core = n_core;
@@ -686,6 +714,17 @@ static int load_binary_weights(const char *path) {
                                   bl->n_words, f) != (size_t)bl->n_words)
                         { fclose(f); return -1; }
                         bi++;
+                    }
+                }
+                /* GT3L: zbits (zero mask) — same compacted layout as wbits. */
+                if (is_ternary) {
+                    bl->zbits = calloc((size_t)bl->out_dim * bl->n_words, sizeof(uint64_t));
+                    for (int j = 0; j < bl->out_dim; j++) {
+                        if (bl->logic_mask[j] == 1) {
+                            if (fread(bl->zbits + (size_t)j * bl->n_words, sizeof(uint64_t),
+                                      bl->n_words, f) != (size_t)bl->n_words)
+                            { fclose(f); return -1; }
+                        }
                     }
                 }
                 /* alpha: compacted [n_binary] → full [out_dim] (non-binary rows stay 0) */
@@ -986,11 +1025,28 @@ static void layer_norm_simd(float *out, const float *x, const float *w, const fl
 
 /* Float matmul: y[out_dim] = bias[out_dim] + x[in_dim] @ W[in_dim, out_dim]
  */
-/* === Optional OpenBLAS acceleration for float matmul ===
- * When compiled with -DUSE_OPENBLAS, float matmul uses cblas_sgemv instead
- * of hand-written SIMD. OpenBLAS is highly optimized per-CPU (cache blocking,
- * prefetching, NEON/AVX tuning). ~2-3x faster than our matmul_avx2. */
-#ifdef USE_OPENBLAS
+/* === OpenBLAS acceleration for float matmul (auto-detected) ===
+ * OpenBLAS uses cblas_sgemv instead of hand-written SIMD. It is highly
+ * optimized per-CPU (cache blocking, prefetching, NEON/AVX tuning) and is
+ * ~2-3x faster than our matmul_avx2 on typical GPT-2 matmul sizes.
+ *
+ * By default OpenBLAS is auto-enabled when <cblas.h> is found at compile time
+ * (so `make server` uses it out of the box on systems with libopenblas-dev).
+ * Override explicitly:
+ *   -DUSE_OPENBLAS=1   force enable  (requires linking -lopenblas)
+ *   -DUSE_OPENBLAS=0   force disable (always use hand-written SIMD) */
+#ifndef USE_OPENBLAS
+#  if defined(__has_include)
+#    if __has_include(<cblas.h>)
+#      define USE_OPENBLAS 1
+#    else
+#      define USE_OPENBLAS 0
+#    endif
+#  else
+#    define USE_OPENBLAS 0
+#  endif
+#endif
+#if USE_OPENBLAS
 #include <cblas.h>
 /* Forward declaration — matmul_avx2 is defined below; we use it for small
  * matrices where BLAS function-call overhead exceeds the compute savings. */
@@ -2694,7 +2750,7 @@ int main(int argc, char **argv) {
     if (g_n_threads > 8) g_n_threads = 8;
 #endif
 
-#ifdef USE_OPENBLAS
+#if USE_OPENBLAS
     /* OpenBLAS thread control: if server uses pthreads for lm_head (x86_64),
      * force BLAS to single-thread to avoid contention. On ARM (g_n_threads=1),
      * let BLAS use all cores for parallel matmul. */
@@ -2704,7 +2760,7 @@ int main(int argc, char **argv) {
 
     printf("[*] LAL GPT-2 Server (%s mode, %d thread%s, %ld cores detected)\n",
            use_binary ? "BINARY XNOR+popcount" :
-#ifdef USE_OPENBLAS
+#if USE_OPENBLAS
            "float OpenBLAS",
 #else
            "float SIMD",

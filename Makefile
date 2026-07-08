@@ -33,27 +33,37 @@ train: prebuilt/gpt2_train
 prebuilt/gpt2_train: models/gpt2.c runtime/lal_runtime.c runtime/lal_runtime.h
 	$(CC) $(CFLAGS) -o $@ models/gpt2.c runtime/lal_runtime.c -lm
 
-# === GPT-2 web server (float mode, SIMD-accelerated, with browser frontend) ===
-# Binary mode (~3 ms/step in training) is too memory-hungry for the 4 GB
-# sandbox, so the server uses float mode + SIMD. ~5× faster than the original
-# scalar server (96 ms/token vs. 490 ms/token baseline on x86_64).
-# Works on x86_64 (AVX2), ARMv7 (NEON), and AArch64 (NEON+FMA).
+# === OpenBLAS auto-detection for the float server ===
+# gpt2_server.c auto-enables BLAS matmul (cblas_sgemv) when <cblas.h> is
+# present at compile time, via __has_include. We auto-link -lopenblas here so
+# `make server` uses it out of the box on systems with libopenblas-dev.
+# On systems without it, BLAS_LIBS is empty and the server silently falls back
+# to hand-written SIMD. Override: make server BLAS_LIBS=-lopenblas (or = to disable)
+BLAS_LIBS := $(shell pkg-config --libs openblas 2>/dev/null)
+ifeq ($(BLAS_LIBS),)
+  # Fallback: detect -lopenblas by probing whether <cblas.h> preprocesses.
+  BLAS_LIBS := $(shell echo '#include <cblas.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo -lopenblas)
+endif
+
+# === GPT-2 web server (float mode, auto OpenBLAS, with browser frontend) ===
+# Float mode + (OpenBLAS if available, else hand-written SIMD). ~5× faster
+# than the original scalar server (96 ms/token vs. 490 ms/token baseline on
+# x86_64). Works on x86_64 (AVX2), ARMv7 (NEON), and AArch64 (NEON+FMA).
 server: prebuilt/gpt2_server
 
 prebuilt/gpt2_server: tools/server/gpt2_server.c tools/server/frontend.html \
 	              runtime/lal_runtime.c runtime/lal_runtime.h
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
-	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread
+	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread $(BLAS_LIBS)
+	@if [ -n "$(BLAS_LIBS)" ]; then \
+		echo "[*] built with OpenBLAS acceleration ($(BLAS_LIBS))"; \
+	else \
+		echo "[*] built with hand-written SIMD (install libopenblas-dev for ~2-3x speedup)"; \
+	fi
 
-# === GPT-2 server with OpenBLAS acceleration (float matmul via cblas_sgemv) ===
-# Requires libopenblas-dev. ~2-3x faster float matmul vs hand-written SIMD.
-# Install: apt install libopenblas-dev (Debian/Ubuntu)
-server-blas: prebuilt/gpt2_server_blas
-
-prebuilt/gpt2_server_blas: tools/server/gpt2_server.c tools/server/frontend.html \
-	              runtime/lal_runtime.c runtime/lal_runtime.h
-	$(CC) $(CFLAGS) -DUSE_OPENBLAS -Wno-unused-function -Wno-unused-variable -I. \
-	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread -lopenblas
+# server-blas: legacy alias. OpenBLAS is now auto-detected by `make server`.
+# Kept for backward compatibility with existing docs and scripts.
+server-blas: server
 
 # === Float subset extractor for --mixed-precision on memory-constrained devices ===
 # Extracts only layers 0 and 11 (24 tensors, ~54 MB) from the full 498 MB

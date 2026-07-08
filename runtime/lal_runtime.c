@@ -278,9 +278,136 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     clip_array(x, n, 10.0f);
 }
 
+/* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
+ * for every matmul (no sign binarization anywhere). Used by the teacher model
+ * in distillation — w_float holds original GPT-2 weights, never updated.
+ * Activations cache is shared with the student's structure (same shape) so we
+ * can reuse m->acts. NOTE: this does NOT overwrite student activations if
+ * called on a separate teacher Model (m->acts is per-model). */
+void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
+                                    ModelConfig *cfg, int seq_pos) {
+    int n = cfg->n_embd, m = cfg->mlp_dim;
+    float rs = cfg->residual_scale;
+    act->seq_pos = seq_pos;
+
+    memcpy(act->x_pre_norm1, x, n * sizeof(float));
+    norm_forward(act->norm1_out, x, tl->norm1_w, tl->norm1_b, cfg->norm_type, n);
+
+    if (cfg->qkv_merged) {
+        bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
+        act->k = act->q + n;
+        act->v = act->q + 2 * n;
+    } else {
+        bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
+        bin_forward_pure_float(act->k, act->norm1_out, &tl->attn_k);
+        bin_forward_pure_float(act->v, act->norm1_out, &tl->attn_v);
+    }
+
+    if (cfg->attn_type == ATTN_ROPE)
+        apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
+
+    if (g_use_real_attention && tl->_kv_k && tl->_kv_v)
+        attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                          tl->_kv_k, tl->_kv_v);
+    else
+        memcpy(act->attn_out, act->v, n * sizeof(float));
+
+    bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
+    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    clip_array(x, n, 10.0f);
+
+    memcpy(act->x_pre_norm2, x, n * sizeof(float));
+    norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
+
+    if (cfg->act_type == ACT_SWIGLU) {
+        float *gate = malloc(m * sizeof(float));
+        float *up = malloc(m * sizeof(float));
+        bin_forward_pure_float(gate, act->norm2_out, &tl->mlp_gate);
+        bin_forward_pure_float(up,   act->norm2_out, &tl->mlp_up);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
+        free(gate); free(up);
+    } else {
+        bin_forward_pure_float(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = gelu(act->mlp_hidden[i]);
+    }
+
+    bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    clip_array(x, n, 10.0f);
+}
+
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
 int g_use_ste = 0;
 int g_use_logic_binarization = 0;  /* norm-based auto logic mask in model_load */
+
+/* Adam optimizer globals (used inside bin_backward_ste when g_use_adam=1).
+ * Defaults are standard Adam (Kingma & Ba 2015).
+ * g_opt_step is incremented per model_backward call to drive bias correction. */
+int   g_use_adam = 0;
+int   g_opt_step = 0;
+float g_adam_beta1 = 0.9f;
+float g_adam_beta2 = 0.999f;
+float g_adam_eps    = 1e-8f;
+
+/* Ternary Weight Network (TWN) globals.
+ * When g_use_ternary=1, BINARY rows use {-1,0,+1}: |W|<=Δ is zeroed (Δ stored
+ * per-layer in BinLayer.ternary_delta). Triples capacity vs BWN at ~1.58 bits. */
+int   g_use_ternary = 0;
+float g_ternary_delta_factor = 0.7f;  /* Δ = factor * mean(|W_row|), TWN default */
+
+/* Cosine LR with linear warmup.
+ *   step < warmup          : lr = base * (step+1) / warmup    (linear ramp from 0)
+ *   warmup <= step < total : lr = base * 0.5 * (1 + cos(pi * progress))  (cosine)
+ *   step >= total          : lr = base * 0.01                  (floor — keep updating)
+ * Warmup tames the early-step gradient explosion (STE on bit-space is noisy).
+ * Cosine decay reduces late-step oscillation for convergence.
+ * Pass warmup=0 to disable warmup, total=0 to disable decay. */
+float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
+    if (warmup_steps > 0 && step < warmup_steps) {
+        return base_lr * (float)(step + 1) / (float)warmup_steps;
+    }
+    if (total_steps <= warmup_steps) return base_lr;  /* degenerate: no decay */
+    if (step >= total_steps) return base_lr * 0.01f;   /* floor */
+    float progress = (float)(step - warmup_steps) / (float)(total_steps - warmup_steps);
+    return base_lr * 0.5f * (1.0f + cosf((float)M_PI * progress));
+}
+
+/* Pure float forward: y[j] = sum_i w_float[j*in+i] * x[i] + bias[j].
+ * Skips sign binarization entirely. Used for the teacher model in
+ * distillation — the teacher's w_float holds the original GPT-2 weights
+ * and is never updated, so this is a faithful full-precision matmul.
+ * Logic-guided layers: CORE uses w_core (already float), BINARY uses w_float,
+ * PRUNE outputs 0 (skipped). */
+void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
+    int in = bl->in_dim, out = bl->out_dim;
+    if (bl->logic_mask) {
+        int core_idx = 0;
+        for (int j = 0; j < out; j++) {
+            uint8_t m = bl->logic_mask[j];
+            if (m == 0) {  /* CORE: float dot with w_core[core_idx] */
+                const float *wc = &bl->w_core[core_idx * in];
+                float s = bl->bias[j];
+                for (int i = 0; i < in; i++) s += wc[i] * x[i];
+                y[j] = s;
+                core_idx++;
+            } else if (m == 1) {  /* BINARY: float dot with w_float */
+                const float *wf = &bl->w_float[j * in];
+                float s = bl->bias[j];
+                for (int i = 0; i < in; i++) s += wf[i] * x[i];
+                y[j] = s;
+            } else {
+                y[j] = 0.0f;  /* PRUNE */
+            }
+        }
+    } else {
+        for (int j = 0; j < out; j++) {
+            const float *wf = &bl->w_float[j * in];
+            float s = bl->bias[j];
+            for (int i = 0; i < in; i++) s += wf[i] * x[i];
+            y[j] = s;
+        }
+    }
+}
 
 /* Auto-generate per-output logic mask based on weight norms.
  * W is [in, out] (GPT-2 Conv1D format). We compute per-output column norms.
@@ -782,6 +909,164 @@ void model_backward(Model *m, const int *tokens, int n_tokens, float lr) {
 
     for (int l = m->cfg.n_layer - 1; l >= 0; l--)
         trans_layer_backward(gh, &m->layers[l], &m->acts[l], &m->cfg, lr);
+
+    /* Increment Adam step (for bias correction in next call). */
+    if (g_use_adam) g_opt_step++;
+}
+
+/* Compute full vocab logits at target position using pure float forward.
+ * Replaces bin_forward with bin_forward_pure_float for one pass (no
+ * binarization anywhere). The result is the teacher signal for distillation.
+ * Caller must allocate logits_out[vocab_size]. */
+void model_forward_float_logits(Model *m, const int *tokens, int n_tokens,
+                                float *logits_out) {
+    int n = m->cfg.n_embd, nL = m->cfg.n_layer, vocab = m->cfg.vocab_size;
+    int t = n_tokens - 1;
+    static float x[4096];
+
+    /* Save global flag, swap to pure-float mode, restore at end. */
+    int saved = g_use_bnn_fast_path;
+    g_use_bnn_fast_path = 0;  /* never BNN for teacher */
+
+    /* Fill KV cache for context positions (if real attention is enabled). */
+    if (g_use_real_attention && m->k_cache) {
+        static float xc[4096];
+        static TransAct *scratch = NULL;
+        if (!scratch) scratch = trans_act_alloc(&m->cfg);
+        for (int p = 0; p < t; p++) {
+            for (int i = 0; i < n; i++) {
+                xc[i] = m->wte[tokens[p] * n + i];
+                if (m->wpe) xc[i] += m->wpe[p * n + i];
+            }
+            for (int l = 0; l < nL; l++)
+                trans_layer_forward_pure_float(xc, &m->layers[l], &scratch[l], &m->cfg, p);
+        }
+    }
+
+    /* Run target position forward with pure float. */
+    for (int i = 0; i < n; i++) {
+        x[i] = m->wte[tokens[t] * n + i];
+        if (m->wpe) x[i] += m->wpe[t * n + i];
+    }
+    for (int l = 0; l < nL; l++)
+        trans_layer_forward_pure_float(x, &m->layers[l], &m->acts[l], &m->cfg, t);
+
+    /* Compute logits over full vocab: logits[j] = dot(final_ln, wte[j]). */
+    norm_forward(m->final_ln, x, m->ln_f_w, m->ln_f_b, m->cfg.norm_type, n);
+    for (int j = 0; j < vocab; j++) {
+        const float *w = &m->wte[(size_t)j * n];
+        float s = 0;
+        for (int i = 0; i + 7 < n; i += 8)
+            s += m->final_ln[i+0]*w[i+0] + m->final_ln[i+1]*w[i+1]
+               + m->final_ln[i+2]*w[i+2] + m->final_ln[i+3]*w[i+3]
+               + m->final_ln[i+4]*w[i+4] + m->final_ln[i+5]*w[i+5]
+               + m->final_ln[i+6]*w[i+6] + m->final_ln[i+7]*w[i+7];
+        for (int i = (n/8)*8; i < n; i++) s += m->final_ln[i] * w[i];
+        logits_out[j] = s;
+    }
+    g_use_bnn_fast_path = saved;
+}
+
+/* Backward with distillation: hard CE (target) + soft KL(teacher || student).
+ * The KL gradient w.r.t. student logits[j] is:
+ *   d_KL/d_s[j] = T * (softmax(s/T)[j] - softmax(t/T)[j])
+ * Then w.r.t. final_ln[i]:
+ *   d_KL/d_final_ln[i] = sum_j (T * (ps[j]-pt[j])) * wte[j*n+i]
+ *
+ * Combined grad on final_ln:
+ *   gh[i] = alpha * CE_grad[i] + (1-alpha) * T^2 * KL_grad[i]
+ * (T^2 because KL of T-scaled soft targets is conventionally multiplied by T^2
+ *  to keep gradient magnitude roughly constant across T.)
+ *
+ * Teacher logits must be full vocab (computed by model_forward_float_logits).
+ * Memory cost: ~3*vocab*sizeof(float) = 600KB scratch (heap-allocated here). */
+void model_backward_distill(Model *m, const int *tokens, int n_tokens, float lr,
+                            const float *teacher_logits,
+                            float distill_alpha, float distill_T) {
+    int n = m->cfg.n_embd, vocab = m->cfg.vocab_size;
+    int target = tokens[n_tokens];
+
+    /* 1. Compute student logits at target position over full vocab. */
+    float *s_logits = malloc(vocab * sizeof(float));
+    for (int j = 0; j < vocab; j++) {
+        const float *w = &m->wte[(size_t)j * n];
+        float s = 0;
+        for (int i = 0; i + 7 < n; i += 8)
+            s += m->final_ln[i+0]*w[i+0] + m->final_ln[i+1]*w[i+1]
+               + m->final_ln[i+2]*w[i+2] + m->final_ln[i+3]*w[i+3]
+               + m->final_ln[i+4]*w[i+4] + m->final_ln[i+5]*w[i+5]
+               + m->final_ln[i+6]*w[i+6] + m->final_ln[i+7]*w[i+7];
+        for (int i = (n/8)*8; i < n; i++) s += m->final_ln[i] * w[i];
+        s_logits[j] = s;
+    }
+
+    /* 2. Softmax(student/T) and softmax(teacher/T) (numerically stable). */
+    float *ps = malloc(vocab * sizeof(float));
+    float *pt = malloc(vocab * sizeof(float));
+    float ms = s_logits[0] / distill_T, mt = teacher_logits[0] / distill_T;
+    for (int j = 1; j < vocab; j++) {
+        if (s_logits[j] / distill_T > ms) ms = s_logits[j] / distill_T;
+        if (teacher_logits[j] / distill_T > mt) mt = teacher_logits[j] / distill_T;
+    }
+    float ss = 0, st = 0;
+    for (int j = 0; j < vocab; j++) {
+        ps[j] = expf(s_logits[j] / distill_T - ms);
+        pt[j] = expf(teacher_logits[j] / distill_T - mt);
+        ss += ps[j]; st += pt[j];
+    }
+    for (int j = 0; j < vocab; j++) { ps[j] /= ss; pt[j] /= st; }
+
+    /* 3. Hard CE grad w.r.t. final_ln (sampled softmax — matches model_backward). */
+    static float gh_ce[4096];
+    unsigned int seed = 42;
+    cross_entropy_grad(gh_ce, m->final_ln, m->wte, target, vocab, n, 100, &seed);
+
+    /* 4. KL grad w.r.t. final_ln: T * sum_j (ps[j] - pt[j]) * wte[j*n + i].
+     * This is the heaviest op (vocab * n_embd FMA). Sparsify: skip near-zero diffs. */
+    static float gh_kl[4096];
+    for (int i = 0; i < n; i++) gh_kl[i] = 0.0f;
+    for (int j = 0; j < vocab; j++) {
+        float diff = ps[j] - pt[j];
+        if (fabsf(diff) < 1e-6f) continue;  /* skip — negligible contribution */
+        float coef = distill_T * diff;
+        const float *w = &m->wte[(size_t)j * n];
+        for (int i = 0; i + 7 < n; i += 8) {
+            gh_kl[i+0] += coef * w[i+0];
+            gh_kl[i+1] += coef * w[i+1];
+            gh_kl[i+2] += coef * w[i+2];
+            gh_kl[i+3] += coef * w[i+3];
+            gh_kl[i+4] += coef * w[i+4];
+            gh_kl[i+5] += coef * w[i+5];
+            gh_kl[i+6] += coef * w[i+6];
+            gh_kl[i+7] += coef * w[i+7];
+        }
+        for (int i = (n/8)*8; i < n; i++) gh_kl[i] += coef * w[i];
+    }
+
+    /* 5. Combine: total grad = alpha * CE + (1-alpha) * T^2 * KL. */
+    static float gh[4096];
+    float kl_scale = (1.0f - distill_alpha) * distill_T * distill_T;
+    float ce_scale = distill_alpha;
+    for (int i = 0; i < n; i++)
+        gh[i] = ce_scale * gh_ce[i] + kl_scale * gh_kl[i];
+
+    /* 6. Clip + backward through norm + layers (same as model_backward). */
+    float gnorm = 0;
+    for (int i = 0; i < n; i++) gnorm += gh[i] * gh[i];
+    gnorm = sqrtf(gnorm);
+    if (gnorm > 0.1f) { float clip = 0.1f / gnorm; for (int i = 0; i < n; i++) gh[i] *= clip; }
+
+    static float g_pre[4096];
+    norm_backward(g_pre, gh, m->x_before_final, m->ln_f_w,
+                  (float[]){m->final_mean, m->final_std_inv}, m->cfg.norm_type, n);
+    memcpy(gh, g_pre, n * sizeof(float));
+
+    for (int l = m->cfg.n_layer - 1; l >= 0; l--)
+        trans_layer_backward(gh, &m->layers[l], &m->acts[l], &m->cfg, lr);
+
+    if (g_use_adam) g_opt_step++;
+
+    free(s_logits); free(ps); free(pt);
 }
 
 void model_free(Model *m) {
@@ -806,9 +1091,13 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
     bl->n_words_T = (out_dim + 63) / 64;
     bl->wbits = calloc(out_dim * bl->n_words, sizeof(uint64_t));
     bl->wbits_T = calloc(in_dim * bl->n_words_T, sizeof(uint64_t));
+    bl->zbits = NULL;  /* allocated only in ternary mode (logic-guided path) */
     bl->alpha = calloc(out_dim, sizeof(float));
     bl->bias = bias ? malloc(out_dim * sizeof(float)) : calloc(out_dim, sizeof(float));
     bl->w_float = malloc((size_t)in_dim * out_dim * sizeof(float));  /* STE */
+    bl->m_adam  = calloc((size_t)in_dim * out_dim, sizeof(float));   /* Adam m */
+    bl->v_adam  = calloc((size_t)in_dim * out_dim, sizeof(float));   /* Adam v */
+    bl->ternary_delta = 0.0f;  /* BWN by default; set by bin_layer_repack_ternary */
 
     /* Copy float weights for STE updates — TRANSPOSE to [out, in] layout!
      * W is [in, out] row-major (GPT-2 Conv1D format). We store w_float as
@@ -871,16 +1160,26 @@ void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
     bl->alpha = calloc(out_dim, sizeof(float));
     bl->bias = bias ? malloc(out_dim * sizeof(float)) : calloc(out_dim, sizeof(float));
     bl->w_float = malloc((size_t)out_dim * in_dim * sizeof(float));
+    bl->m_adam  = NULL;  /* allocated below only if we keep this layer */
+    bl->v_adam  = NULL;
     bl->w_core = NULL;
     bl->logic_mask = NULL;
     bl->n_core = 0;
     bl->n_prune = 0;
+    bl->zbits = NULL;
+    bl->ternary_delta = 0.0f;
 
     if (!logic_mask) {
-        /* No logic mask → use standard binarization (all BINARY) */
+        /* No logic mask → free w_float (bin_layer_init will re-alloc) and delegate. */
+        free(bl->w_float); bl->w_float = NULL;
         bin_layer_init(bl, W, bias, in_dim, out_dim);
         return;
     }
+    /* We're keeping this layer — allocate Adam state for the BINARY/CORE
+     * STE-update path. PRUNE outputs contribute zero, but they still own a
+     * slot in w_float (so the [out*in] indexing stays uniform). */
+    bl->m_adam = calloc((size_t)out_dim * in_dim, sizeof(float));
+    bl->v_adam = calloc((size_t)out_dim * in_dim, sizeof(float));
 
     /* Copy logic mask + count categories */
     bl->logic_mask = malloc(out_dim);
@@ -949,13 +1248,24 @@ void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
             bl->wbits_T[i * bl->n_words_T + wi] = word;
         }
     }
+
+    /* Ternary mode: allocate zbits (zero mask, same shape as wbits) and
+     * compute initial ternary binarization from w_float. When ternary is off,
+     * zbits stays NULL — bin_forward uses the pure BWN ±1 path. */
+    if (g_use_ternary) {
+        bl->zbits = calloc((size_t)out_dim * bl->n_words, sizeof(uint64_t));
+        bin_layer_repack_ternary(bl);
+    }
 }
 
 void bin_layer_free(BinLayer *bl) {
-    free(bl->wbits); free(bl->wbits_T); free(bl->alpha); free(bl->bias);
+    free(bl->wbits); free(bl->wbits_T); free(bl->zbits); free(bl->alpha); free(bl->bias);
     free(bl->w_float); free(bl->w_core); free(bl->logic_mask);
-    bl->wbits = NULL; bl->wbits_T = NULL; bl->alpha = NULL; bl->bias = NULL;
+    free(bl->m_adam); free(bl->v_adam);
+    bl->wbits = NULL; bl->wbits_T = NULL; bl->zbits = NULL;
+    bl->alpha = NULL; bl->bias = NULL;
     bl->w_float = NULL; bl->w_core = NULL; bl->logic_mask = NULL;
+    bl->m_adam = NULL; bl->v_adam = NULL;
 }
 
 /* Re-pack wbits and wbits_T from sign(w_float).
@@ -1014,6 +1324,78 @@ static void bin_layer_repack(BinLayer *bl) {
     }
 }
 
+/* Ternary repack: recompute zbits (zero mask) from |w_float| vs Δ.
+ * For each BINARY output row j:
+ *   Δ_j = g_ternary_delta_factor * mean(|w_float[j]|)
+ *   zbits[j][i] = 1  if |w_float[j*in+i]| <= Δ_j  (weight zeroed → ternary 0)
+ *   zbits[j][i] = 0  otherwise                      (weight active → ±1)
+ * Also updates alpha[j] = mean(|w|) over ACTIVE weights only (standard TWN
+ * scaling: the zeroed weights contribute nothing, so scaling reflects the
+ * active subset). CORE/PRUNE rows are skipped (zbits stays 0 there).
+ *
+ * wbits (sign) is NOT recomputed here — bin_layer_repack (called separately
+ * for STE) keeps sign in sync. This function only updates the zero mask.
+ * Called at init and after every STE step when g_use_ternary is on. */
+void bin_layer_repack_ternary(BinLayer *bl) {
+    if (!bl->zbits || !bl->w_float) return;
+    int in = bl->in_dim, out = bl->out_dim, nw = bl->n_words;
+
+    for (int j = 0; j < out; j++) {
+        /* Skip non-BINARY rows — they don't use ternary (CORE=float, PRUNE=0). */
+        if (bl->logic_mask && bl->logic_mask[j] != 1) continue;
+
+        const float *wf = &bl->w_float[j * in];
+        /* Compute per-row Δ = factor * mean(|w|). */
+        float abs_sum = 0.0f;
+        for (int i = 0; i + 7 < in; i += 8) {
+            abs_sum += fabsf(wf[i+0]) + fabsf(wf[i+1]) + fabsf(wf[i+2]) + fabsf(wf[i+3]);
+            abs_sum += fabsf(wf[i+4]) + fabsf(wf[i+5]) + fabsf(wf[i+6]) + fabsf(wf[i+7]);
+        }
+        for (int i = (in/8)*8; i < in; i++) abs_sum += fabsf(wf[i]);
+        float mean_abs = abs_sum / in;
+        float delta = g_ternary_delta_factor * mean_abs;
+        bl->ternary_delta = delta;  /* store per-layer (last row wins, used for stats) */
+
+        /* Pack zbits[j]: 1 where |w| <= delta. Also sum active |w| for alpha. */
+        uint64_t *zb = &bl->zbits[(size_t)j * nw];
+        float active_abs_sum = 0.0f;
+        int n_active = 0;
+        for (int wi = 0; wi < nw; wi++) {
+            uint64_t word = 0;
+            int base = wi * 64;
+            for (int grp = 0; grp < 8; grp++) {
+                int idx = base + grp * 8;
+                if (idx + 7 < in) {
+                    for (int k = 0; k < 8; k++) {
+                        int i = idx + k;
+                        if (fabsf(wf[i]) <= delta) {
+                            word |= (1ULL << (grp*8 + k));
+                        } else {
+                            active_abs_sum += fabsf(wf[i]);
+                            n_active++;
+                        }
+                    }
+                } else {
+                    for (int k = 0; k < 8; k++) {
+                        int i = idx + k;
+                        if (i >= in) break;
+                        if (fabsf(wf[i]) <= delta) {
+                            word |= (1ULL << (grp*8 + k));
+                        } else {
+                            active_abs_sum += fabsf(wf[i]);
+                            n_active++;
+                        }
+                    }
+                }
+            }
+            zb[wi] = word;
+        }
+        /* TWN alpha: mean(|w|) over active weights. Falls back to mean over all
+         * if everything got zeroed (degenerate row). */
+        bl->alpha[j] = (n_active > 0) ? (active_abs_sum / n_active) : mean_abs;
+    }
+}
+
 /* ========================================================================
  * Binary Forward — BWN (default, matches Python STE training)
  * ========================================================================
@@ -1060,23 +1442,42 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
                 core_idx++;
                 break;
             }
-            case 1: { /* BINARY: sign(w) * alpha * K + bias */
+            case 1: { /* BINARY: sign(w) * alpha * K + bias (ternary if zbits set) */
                 const uint64_t *wb = &bl->wbits[j * nw];
+                const uint64_t *zb = bl->zbits ? &bl->zbits[j * nw] : NULL;
                 float s = 0.0f;
                 for (int wi = 0; wi < nw; wi++) {
                     uint64_t w = wb[wi];
+                    uint64_t z = zb ? zb[wi] : 0;  /* zero mask: 1=skip */
                     int base = wi * 64;
                     for (int bi = 0; bi < 8; bi++) {
                         int idx = base + bi * 8;
                         uint8_t byte = (uint8_t)((w >> (bi * 8)) & 0xFF);
+                        uint8_t zbyte = (uint8_t)((z >> (bi * 8)) & 0xFF);
                         const float *sw = sign_lut[byte];
                         if (idx + 7 < in) {
-                            s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
-                            s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                            /* Ternary: zeroed positions contribute 0.
+                             * contribution = sign * (1 - zbit) * x.
+                             * (1 - zbit) ∈ {0,1} acts as an enable mask. */
+                            if (zbyte == 0) {
+                                /* No zeros in this byte — full 8x dot product. */
+                                s += x[idx+0]*sw[0] + x[idx+1]*sw[1] + x[idx+2]*sw[2] + x[idx+3]*sw[3];
+                                s += x[idx+4]*sw[4] + x[idx+5]*sw[5] + x[idx+6]*sw[6] + x[idx+7]*sw[7];
+                            } else {
+                                /* Mixed: check each bit. zbyte bit set = skip. */
+                                s += (zbyte & 0x01) ? 0 : x[idx+0]*sw[0];
+                                s += (zbyte & 0x02) ? 0 : x[idx+1]*sw[1];
+                                s += (zbyte & 0x04) ? 0 : x[idx+2]*sw[2];
+                                s += (zbyte & 0x08) ? 0 : x[idx+3]*sw[3];
+                                s += (zbyte & 0x10) ? 0 : x[idx+4]*sw[4];
+                                s += (zbyte & 0x20) ? 0 : x[idx+5]*sw[5];
+                                s += (zbyte & 0x40) ? 0 : x[idx+6]*sw[6];
+                                s += (zbyte & 0x80) ? 0 : x[idx+7]*sw[7];
+                            }
                         } else {
                             for (int k = 0; k < 8; k++) {
                                 int i = idx + k;
-                                if (i < in) s += x[i] * sw[k];
+                                if (i < in && !((zbyte >> k) & 1)) s += x[i] * sw[k];
                             }
                         }
                     }
@@ -1416,31 +1817,101 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
     /* Part 2: STE update — w_float[j*in + i] -= lr * grad_y[j] * x[i]
      * w_float is [out, in] (transposed), so w_float[j*in + i] is CONTIGUOUS in i!
      * This means the inner loop over i is a contiguous SAXPY: w_float[j] -= scale * x
-     * The compiler auto-vectorizes this to SIMD FMA (8 floats per iteration). */
+     * The compiler auto-vectorizes this to SIMD FMA (8 floats per iteration).
+     *
+     * When g_use_adam is set, we use the Adam update instead of plain SGD:
+     *   m[i] = b1*m[i] + (1-b1)*g       (1st moment)
+     *   v[i] = b2*v[i] + (1-b2)*g*g     (2nd moment)
+     *   w  -= lr * m_hat / (sqrt(v_hat) + eps)
+     * where m_hat, v_hat are bias-corrected with g_opt_step+1. Adam dramatically
+     * stabilizes STE on bit-space: per-param adaptive lr counters the
+     * extreme gradient variance that causes SGD to mode-collapse to "servers". */
     if (bl->w_float) {
+        int t = g_opt_step + 1;  /* Adam timestep (1-indexed) */
+        float bc1 = 1.0f - powf(g_adam_beta1, (float)t);  /* bias correction 1 */
+        float bc2 = 1.0f - powf(g_adam_beta2, (float)t);  /* bias correction 2 */
         for (int j = 0; j < out; j++) {
             float gy = grad_y[j];
             if (fabsf(gy) < 1e-8f) continue;
-            float scale = lr * gy;
+            /* Skip PRUNE rows — they're zeroed and contribute nothing. */
+            if (bl->logic_mask && bl->logic_mask[j] == 2) continue;
             float *wf = &bl->w_float[j * in];  /* contiguous [in] */
-            /* SAXPY: wf[i] -= scale * x[i], 8x unrolled for SIMD */
-            for (int i = 0; i + 7 < in; i += 8) {
-                wf[i+0] -= scale * x[i+0];
-                wf[i+1] -= scale * x[i+1];
-                wf[i+2] -= scale * x[i+2];
-                wf[i+3] -= scale * x[i+3];
-                wf[i+4] -= scale * x[i+4];
-                wf[i+5] -= scale * x[i+5];
-                wf[i+6] -= scale * x[i+6];
-                wf[i+7] -= scale * x[i+7];
+            if (g_use_adam && bl->m_adam) {
+                float *m = &bl->m_adam[j * in];
+                float *v = &bl->v_adam[j * in];
+                /* Adam: per-param adaptive update. 8x unrolled for SIMD. */
+                for (int i = 0; i + 7 < in; i += 8) {
+                    float g0 = gy * x[i+0], g1 = gy * x[i+1], g2 = gy * x[i+2], g3 = gy * x[i+3];
+                    float g4 = gy * x[i+4], g5 = gy * x[i+5], g6 = gy * x[i+6], g7 = gy * x[i+7];
+                    m[i+0] = g_adam_beta1*m[i+0] + (1.0f-g_adam_beta1)*g0;
+                    m[i+1] = g_adam_beta1*m[i+1] + (1.0f-g_adam_beta1)*g1;
+                    m[i+2] = g_adam_beta1*m[i+2] + (1.0f-g_adam_beta1)*g2;
+                    m[i+3] = g_adam_beta1*m[i+3] + (1.0f-g_adam_beta1)*g3;
+                    m[i+4] = g_adam_beta1*m[i+4] + (1.0f-g_adam_beta1)*g4;
+                    m[i+5] = g_adam_beta1*m[i+5] + (1.0f-g_adam_beta1)*g5;
+                    m[i+6] = g_adam_beta1*m[i+6] + (1.0f-g_adam_beta1)*g6;
+                    m[i+7] = g_adam_beta1*m[i+7] + (1.0f-g_adam_beta1)*g7;
+                    v[i+0] = g_adam_beta2*v[i+0] + (1.0f-g_adam_beta2)*g0*g0;
+                    v[i+1] = g_adam_beta2*v[i+1] + (1.0f-g_adam_beta2)*g1*g1;
+                    v[i+2] = g_adam_beta2*v[i+2] + (1.0f-g_adam_beta2)*g2*g2;
+                    v[i+3] = g_adam_beta2*v[i+3] + (1.0f-g_adam_beta2)*g3*g3;
+                    v[i+4] = g_adam_beta2*v[i+4] + (1.0f-g_adam_beta2)*g4*g4;
+                    v[i+5] = g_adam_beta2*v[i+5] + (1.0f-g_adam_beta2)*g5*g5;
+                    v[i+6] = g_adam_beta2*v[i+6] + (1.0f-g_adam_beta2)*g6*g6;
+                    v[i+7] = g_adam_beta2*v[i+7] + (1.0f-g_adam_beta2)*g7*g7;
+                    float mh0=m[i+0]/bc1, mh1=m[i+1]/bc1, mh2=m[i+2]/bc1, mh3=m[i+3]/bc1;
+                    float mh4=m[i+4]/bc1, mh5=m[i+5]/bc1, mh6=m[i+6]/bc1, mh7=m[i+7]/bc1;
+                    float vh0=sqrtf(v[i+0]/bc2)+g_adam_eps, vh1=sqrtf(v[i+1]/bc2)+g_adam_eps;
+                    float vh2=sqrtf(v[i+2]/bc2)+g_adam_eps, vh3=sqrtf(v[i+3]/bc2)+g_adam_eps;
+                    float vh4=sqrtf(v[i+4]/bc2)+g_adam_eps, vh5=sqrtf(v[i+5]/bc2)+g_adam_eps;
+                    float vh6=sqrtf(v[i+6]/bc2)+g_adam_eps, vh7=sqrtf(v[i+7]/bc2)+g_adam_eps;
+                    wf[i+0] -= lr * mh0/vh0; wf[i+1] -= lr * mh1/vh1;
+                    wf[i+2] -= lr * mh2/vh2; wf[i+3] -= lr * mh3/vh3;
+                    wf[i+4] -= lr * mh4/vh4; wf[i+5] -= lr * mh5/vh5;
+                    wf[i+6] -= lr * mh6/vh6; wf[i+7] -= lr * mh7/vh7;
+                }
+                for (int i = (in / 8) * 8; i < in; i++) {
+                    float g = gy * x[i];
+                    m[i] = g_adam_beta1*m[i] + (1.0f-g_adam_beta1)*g;
+                    v[i] = g_adam_beta2*v[i] + (1.0f-g_adam_beta2)*g*g;
+                    wf[i] -= lr * (m[i]/bc1) / (sqrtf(v[i]/bc2) + g_adam_eps);
+                }
+            } else {
+                /* SGD: wf[i] -= lr * gy * x[i] (original path). */
+                float scale = lr * gy;
+                for (int i = 0; i + 7 < in; i += 8) {
+                    wf[i+0] -= scale * x[i+0]; wf[i+1] -= scale * x[i+1];
+                    wf[i+2] -= scale * x[i+2]; wf[i+3] -= scale * x[i+3];
+                    wf[i+4] -= scale * x[i+4]; wf[i+5] -= scale * x[i+5];
+                    wf[i+6] -= scale * x[i+6]; wf[i+7] -= scale * x[i+7];
+                }
+                for (int i = (in / 8) * 8; i < in; i++)
+                    wf[i] -= scale * x[i];
             }
-            for (int i = (in / 8) * 8; i < in; i++)
-                wf[i] -= scale * x[i];
-            /* Update bias */
+            /* Update bias (SGD always — bias is a scalar, Adam benefit marginal). */
             bl->bias[j] -= lr * gy;
         }
-        /* Re-pack binary weights from updated w_float */
+        /* Weight clipping: bound w_float to [-W_CLIP, W_CLIP].
+         * Standard technique for BWN training (cf. XNOR-Net, Real-to-Binary
+         * Networks). Prevents w_float from drifting to extreme values where
+         * Adam's adaptive update becomes numerically unstable and sign(w)
+         * starts flipping chaotically. The bound [-1, 1] is natural because
+         * alpha = mean(|w|) is in [0, 1] for typical GPT-2 weight rows.
+         * Without this, STE+Adam diverges to NaN around step 400-850. */
+        #define W_CLIP 1.0f
+        for (int i = 0; i < in * out; i++) {
+            float w = bl->w_float[i];
+            if (w > W_CLIP) bl->w_float[i] = W_CLIP;
+            else if (w < -W_CLIP) bl->w_float[i] = -W_CLIP;
+        }
+        /* Re-pack binary weights from updated (and clipped) w_float */
         bin_layer_repack(bl);
+        /* Ternary: refresh zbits (zero mask) from updated |w_float| vs Δ.
+         * This is the TWN STE dynamic — zeroed weights that received enough
+         * gradient to cross Δ "wake up" (become ±1), and active weights whose
+         * |w| dropped below Δ get zeroed. alpha is also recomputed over the
+         * new active set. Skipped automatically if zbits is NULL (BWN mode). */
+        if (bl->zbits) bin_layer_repack_ternary(bl);
     } else {
         /* No w_float — fall back to alpha-only update */
         float mean_abs_x = 0;

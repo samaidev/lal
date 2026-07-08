@@ -65,11 +65,18 @@ typedef struct {
 typedef struct {
     uint64_t *wbits;
     uint64_t *wbits_T;
+    uint64_t *zbits;    /* Ternary zero mask (same shape as wbits): 1=weight is 0, 0=active.
+                         * NULL when ternary mode is off (pure BWN, all weights ±1).
+                         * Combined with wbits (sign): ternary value = sign * (1 - zbit) ∈ {-1,0,+1}. */
     float    *alpha;
     float    *bias;
     float    *w_float;   /* STE: full-precision weights for gradient update */
     float    *w_core;    /* Logic-guided: CORE weights kept as float (not binarized) */
+    float    *m_adam;    /* Adam first moment, same shape as w_float [out*in] */
+    float    *v_adam;    /* Adam second moment */
     uint8_t  *logic_mask; /* Per-output: 0=CORE(float), 1=BINARY(sign+alpha), 2=PRUNE(zero) */
+    float     ternary_delta; /* Per-layer Δ threshold for ternary binarization. 0=BWN (no zeroing).
+                              * >0 means weights with |W|<=Δ are zeroed → ternary {-1,0,+1}. */
     int       n_core;     /* Count of CORE outputs */
     int       n_prune;    /* Count of PRUNE outputs */
     int       in_dim, out_dim, n_words, n_words_T;
@@ -85,6 +92,23 @@ void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
 void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
                           int in_dim, int out_dim, const uint8_t *logic_mask);
 void bin_layer_free(BinLayer *bl);
+
+/* Ternary Weight Network (TWN) mode.
+ * When g_use_ternary is set, BINARY rows in logic-guided layers use ternary
+ * weights {-1, 0, +1} instead of binary {-1, +1}. Weights with |W| <= Δ are
+ * zeroed (Δ = g_ternary_delta_factor * mean(|W_row|), default 0.7 per TWN paper).
+ * This triples representational capacity at ~1.58 bits/weight while keeping
+ * bit-parallel friendliness (sign stored in wbits, zero-mask in zbits).
+ *
+ * STE backward flows through ALL weights including zeroed ones — a zeroed
+ * weight can "wake up" if gradient pushes |W| past Δ, and an active weight
+ * can be zeroed if |W| drops below Δ. This is the key TWN training dynamic. */
+extern int   g_use_ternary;
+extern float g_ternary_delta_factor;  /* Δ = factor * mean(|W|), default 0.7 */
+
+/* Recompute zbits from |w_float| vs Δ. Called after STE update when ternary
+ * mode is on. Updates alpha (mean|W| over active weights) too. */
+void bin_layer_repack_ternary(BinLayer *bl);
 
 /* bin_forward (BWN, default): x stays float, only W is binarized.
  * Matches Python STE training (tools/train_binary_gpt2.py) so train/inference
@@ -122,6 +146,28 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
  * Models can set this before calling model_backward(). */
 extern int g_use_ste;
 extern int g_use_logic_binarization;  /* norm-based auto logic mask in model_load */
+
+/* Global flag: set to 1 to use Adam optimizer inside bin_backward_ste.
+ * Adam uses m_adam/v_adam per-param moments (allocated in bin_layer_init).
+ * Helps stabilize STE on bit-space (gradients are extremely noisy with SGD).
+ * Sets g_opt_step automatically per model_backward call for bias correction. */
+extern int g_use_adam;
+extern int g_opt_step;
+extern float g_adam_beta1, g_adam_beta2, g_adam_eps;
+
+/* Cosine LR schedule with linear warmup.
+ *   step < warmup          : lr = base_lr * (step+1) / warmup   (linear ramp)
+ *   warmup <= step < total : lr = base_lr * 0.5 * (1 + cos(pi * progress))
+ *   step >= total          : lr = base_lr * 0.01 (floor — don't go to zero)
+ * Prevents early mode-collapse from large initial gradient + stabilizes late
+ * training with decay. Pass warmup=0 for pure cosine, total=0 for constant lr. */
+float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr);
+
+/* Pure float forward (no binarization): y[j] = sum_i w_float[j*in+i] * x[i] + bias[j].
+ * Used for the teacher model in distillation. The teacher's w_float holds the
+ * original GPT-2 weights (loaded once, never updated), so this is a true
+ * full-precision forward pass. */
+void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl);
 
 /* Global flag: set to 1 to use the legacy BNN fast path (bin_forward_bnn) in
  * trans_layer_forward instead of the BWN default. Off by default — BNN causes
@@ -236,6 +282,12 @@ void trans_layer_free(TransLayer *tl, ModelConfig *cfg);
 void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
                          ModelConfig *cfg, int seq_pos);
 
+/* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
+ * for every matmul (no sign binarization anywhere). Used by the teacher model
+ * in distillation. Activations cache is the same shape as the student's. */
+void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
+                                    ModelConfig *cfg, int seq_pos);
+
 /* Backward: one transformer layer (updates weights, computes grad_x) */
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                           ModelConfig *cfg, float lr);
@@ -318,6 +370,22 @@ float model_forward(Model *m, const int *tokens, int n_tokens);
 
 /* Backward pass (updates all weights) */
 void model_backward(Model *m, const int *tokens, int n_tokens, float lr);
+
+/* Compute full vocab logits at the target position using pure float forward
+ * (no binarization). Used as the teacher signal in distillation.
+ * logits_out must be vocab_size floats, caller-allocated. */
+void model_forward_float_logits(Model *m, const int *tokens, int n_tokens,
+                                float *logits_out);
+
+/* Backward with distillation: combines hard CE (next-token target) with soft
+ * KL(teacher/T || student/T) gradient. The hard CE path matches model_backward.
+ * The KL path adds: T * (softmax(student_logits/T) - softmax(teacher_logits/T))
+ *   to the gradient at the student's pre-softmax hidden.
+ * distill_alpha: weight on the KL term (0 = pure CE, 1 = pure KL).
+ * teacher_logits: full vocab logits from model_forward_float_logits (same tokens). */
+void model_backward_distill(Model *m, const int *tokens, int n_tokens, float lr,
+                            const float *teacher_logits,
+                            float distill_alpha, float distill_T);
 
 /* Free model */
 void model_free(Model *m);
