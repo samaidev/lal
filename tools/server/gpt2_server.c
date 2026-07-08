@@ -945,7 +945,36 @@ static void layer_norm_simd(float *out, const float *x, const float *w, const fl
 }
 
 /* Float matmul: y[out_dim] = bias[out_dim] + x[in_dim] @ W[in_dim, out_dim]
- * W is row-major in GPT-2 Conv1D format: W[i][j] = W[i*out_dim + j].
+ */
+/* === Optional OpenBLAS acceleration for float matmul ===
+ * When compiled with -DUSE_OPENBLAS, float matmul uses cblas_sgemv instead
+ * of hand-written SIMD. OpenBLAS is highly optimized per-CPU (cache blocking,
+ * prefetching, NEON/AVX tuning). ~2-3x faster than our matmul_avx2. */
+#ifdef USE_OPENBLAS
+#include <cblas.h>
+static void matmul_blas(float *y, const float *x, const float *W, const float *b,
+                        int in_dim, int out_dim) {
+    /* y = W^T @ x + b. W is [in_dim, out_dim] row-major (GPT-2 Conv1D).
+     * cblas_sgemv: y = alpha * op(A) * x + beta * y
+     * Trans: op(A) = A^T, A is [M=in_dim, N=out_dim], x len=M, y len=N */
+    cblas_sgemv(CblasRowMajor, CblasTrans, in_dim, out_dim,
+                1.0f, W, out_dim, x, 1, 0.0f, y, 1);
+    if (b) cblas_saxpy(out_dim, 1.0f, b, 1, y, 1);
+}
+#define matmul(y, x, W, b, id, od) matmul_blas(y, x, W, b, id, od)
+/* LM head also uses BLAS */
+static void lm_head_blas(float *logits, const float *x, const float *wte,
+                         int vocab, int n_embd) {
+    cblas_sgemv(CblasRowMajor, CblasTrans, n_embd, vocab,
+                1.0f, wte, vocab, x, 1, 0.0f, logits, 1);
+}
+#define lm_head(logits, x, wte, v, ne) lm_head_blas(logits, x, wte, v, ne)
+#else
+#define matmul(y, x, W, b, id, od) matmul_avx2(y, x, W, b, id, od)
+#define lm_head(logits, x, wte, v, ne) lm_head_avx2(logits, x, wte, v, ne)
+#endif
+
+/* W is row-major in GPT-2 Conv1D format: W[i][j] = W[i*out_dim + j].
  * Process 8 output cols at a time so each W[i*out_dim + j..j+7] load is contiguous. */
 static void matmul_avx2(float *y, const float *x, const float *W, const float *b,
                         int in_dim, int out_dim) {
@@ -1034,7 +1063,7 @@ typedef struct {
 
 static void *lm_head_worker(void *arg) {
     LmHeadJob *job = (LmHeadJob *)arg;
-    lm_head_avx2(job->logits + job->vocab_start, job->x,
+    lm_head(job->logits + job->vocab_start, job->x,
                  job->wte + (size_t)job->vocab_start * job->n_embd,
                  job->vocab_end - job->vocab_start, job->n_embd);
     return NULL;
@@ -1043,7 +1072,7 @@ static void *lm_head_worker(void *arg) {
 static void lm_head_parallel(float *logits, const float *x, const float *wte,
                              int vocab, int n_embd, int n_threads) {
     if (n_threads <= 1) {
-        lm_head_avx2(logits, x, wte, vocab, n_embd);
+        lm_head(logits, x, wte, vocab, n_embd);
         return;
     }
     pthread_t threads[8];
@@ -1933,7 +1962,7 @@ static int gpt2_forward_token(int token_id, int position) {
             GPT2Layer *L = &g_layers[l];
 
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
-            matmul_avx2(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
+            matmul(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
             /* Attention: dflash > real_attention_simd > real_attention > V-copy */
             if ((g_srv_real_attention || g_use_dflash) && g_k_cache[l]) {
@@ -1946,13 +1975,13 @@ static int gpt2_forward_token(int token_id, int position) {
             } else {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
             }
-            matmul_avx2(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
+            matmul(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
             layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
-            matmul_avx2(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
+            matmul(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
             for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
-            matmul_avx2(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
+            matmul(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
         }
     }

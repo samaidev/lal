@@ -45,6 +45,16 @@ prebuilt/gpt2_server: tools/server/gpt2_server.c tools/server/frontend.html \
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
 	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread
 
+# === GPT-2 server with OpenBLAS acceleration (float matmul via cblas_sgemv) ===
+# Requires libopenblas-dev. ~2-3x faster float matmul vs hand-written SIMD.
+# Install: apt install libopenblas-dev (Debian/Ubuntu)
+server-blas: prebuilt/gpt2_server_blas
+
+prebuilt/gpt2_server_blas: tools/server/gpt2_server.c tools/server/frontend.html \
+	              runtime/lal_runtime.c runtime/lal_runtime.h
+	$(CC) $(CFLAGS) -DUSE_OPENBLAS -Wno-unused-function -Wno-unused-variable -I. \
+	      -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread -lopenblas
+
 # === Float subset extractor for --mixed-precision on memory-constrained devices ===
 # Extracts only layers 0 and 11 (24 tensors, ~54 MB) from the full 498 MB
 # gpt2_weights.bin, in the same GPW2 format, so the tablet can run
