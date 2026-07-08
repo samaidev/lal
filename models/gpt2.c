@@ -115,16 +115,22 @@ int main(int argc, char **argv) {
     float lr = argc > 2 ? atof(argv[2]) : 0.05;
     int use_ste = 0;
     int use_real_attn = 0;
+    int use_logic = 0;
     const char *export_path = NULL;
     /* Parse flags */
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--ste") == 0) use_ste = 1;
         else if (strcmp(argv[i], "--real-attention") == 0) use_real_attn = 1;
+        else if (strcmp(argv[i], "--logic") == 0) use_logic = 1;
         else if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) export_path = argv[++i];
     }
 
     printf("[*] LAL Training — GPT-2 (model-agnostic runtime, no PyTorch)\n");
-    printf("[*] steps:%d lr:%f ste:%d real_attn:%d\n", n_steps, lr, use_ste, use_real_attn);
+    printf("[*] steps:%d lr:%f ste:%d logic:%d real_attn:%d\n", n_steps, lr, use_ste, use_logic, use_real_attn);
+    if (use_logic) {
+        g_use_logic_binarization = 1;
+        printf("[*] Logic-guided binarization: top 20%% norm → CORE(float), bottom 10%% → PRUNE(zero)\n");
+    }
     if (use_ste) {
         g_use_ste = 1;
         printf("[*] STE mode: binary weights will be updated via Straight-Through Estimator\n");
