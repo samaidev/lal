@@ -2036,8 +2036,21 @@ static void handle_request(int client_fd) {
              * for the NEXT token. We can use that directly for gen=0. */
         }
 
-        /* Reset recent token tracking for repetition penalty */
+        /* Reset recent token tracking for repetition penalty.
+         * Then seed with prompt tokens so that:
+         *   (a) rep_penalty can penalize prompt-token repetition (standard HF behavior)
+         *   (b) lal_filter_topk's ban_relation can see the prompt text in _recent
+         *       (otherwise triggers like "France capital" in the prompt are invisible
+         *       to the filter and semantic constraints never fire)
+         * The ring buffer is 256; if prompt is longer, keep the last 256-n_tokens
+         * prompt tokens so generation still has room. */
         g_n_recent = 0;
+        int prompt_to_add = n_input;
+        if (prompt_to_add > 256 - n_tokens) prompt_to_add = 256 - n_tokens;
+        if (prompt_to_add < 0) prompt_to_add = 0;
+        for (int i = n_input - prompt_to_add; i < n_input; i++) {
+            g_recent_tokens[g_n_recent++] = all_tokens[i];
+        }
 
         for (int gen = 0; gen < n_tokens; gen++) {
             int pos = first_gen_position + gen;  /* position in sequence */
