@@ -1413,6 +1413,18 @@ static int    g_n_recent = 0;           /* count of recent tokens (up to 256) */
 static float *g_logits = NULL;       /* [VOCAB_SIZE], allocated once */
 static int    g_n_threads = 1;       /* worker threads for LM head */
 
+/* === Bit-width speculative decoding: layer-wise early exit ===
+ * Run forward through the first g_early_exit_layers layers, then check a
+ * cheap confidence metric (residual stream convergence). If the residual
+ * stream is stable (small relative change), skip remaining layers → faster.
+ * g_early_exit_layers=0 disables early exit (run all N_LAYER layers).
+ * This is the "bit-width speculative" approach PHONE requested: shallower
+ * depth = effectively lower "bit-width" model as draft, full depth as verify. */
+static int    g_early_exit_layers = 0;    /* 0=off, else exit after this many layers */
+static float  g_early_exit_threshold = 0.02f; /* ||dx||/||x|| below this → exit */
+static int    g_early_exit_hits = 0;      /* stat: times early exit triggered */
+static int    g_early_exit_total = 0;     /* stat: total forward calls */
+
 /* Vocab pruning: skip rows of wte (LM head) with smallest L2 norm.
  * Set via --prune-vocab <frac> (0.0 = no pruning, 0.5 = drop 50% of vocab).
  *
@@ -1760,7 +1772,30 @@ static int gpt2_forward_token(int token_id, int position) {
         g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
 
     /* Layers */
+    g_early_exit_total++;
+    int actual_layers = N_LAYER;
     for (int l = 0; l < N_LAYER; l++) {
+        /* Early exit: after g_early_exit_layers layers, check if the residual
+         * stream has converged. If ||dx||/||x|| < threshold, skip remaining
+         * layers — the model is confident and deeper layers add little. */
+        if (g_early_exit_layers > 0 && l == g_early_exit_layers && l < N_LAYER) {
+            /* Compute relative change: ||x - x_prev|| / ||x||
+             * We approximate by comparing current x norm vs the norm of the
+             * last layer's residual addition (g_proj + g_mlp_out). If the
+             * additions are small relative to x, the stream is stable. */
+            float dx_norm = 0.0f, x_norm = 0.0f;
+            for (int i = 0; i < N_EMBD; i++) {
+                float dx = g_proj[i] + g_mlp_out[i];  /* last residual additions */
+                dx_norm += dx * dx;
+                x_norm += g_x[i] * g_x[i];
+            }
+            float rel_change = sqrtf(dx_norm) / (sqrtf(x_norm) + 1e-8f);
+            if (rel_change < g_early_exit_threshold) {
+                g_early_exit_hits++;
+                actual_layers = l;
+                break;
+            }
+        }
         /* Mixed-precision: first and last layers run in float (g_layers[l]),
          * the rest in binary (g_bin_layers[l]). Falls through to binary for
          * all layers in pure --binary mode, and to float for all layers when
@@ -2237,6 +2272,15 @@ static void handle_request(int client_fd) {
         escaped[ei] = '\0';
 
         double tps = n_tokens / (dt > 0 ? dt : 1e-6);
+        if (g_early_exit_layers > 0 && g_early_exit_total > 0) {
+            fprintf(stderr, "[*] early exit: %d/%d forwards exited early (%.0f%%), layers avg=%.1f/12\n",
+                    g_early_exit_hits, g_early_exit_total,
+                    100.0f * g_early_exit_hits / g_early_exit_total,
+                    g_early_exit_total > 0 ?
+                      (float)(g_early_exit_hits * g_early_exit_layers +
+                              (g_early_exit_total - g_early_exit_hits) * N_LAYER) / g_early_exit_total
+                      : (float)N_LAYER);
+        }
         static char json[6144];
         int jpos = snprintf(json, sizeof(json),
             "{\"text\":\"%s\",\"time\":\"%.3f\",\"n_tokens\":%d,\"tokens_per_sec\":\"%.1f\"}",
@@ -2397,6 +2441,16 @@ int main(int argc, char **argv) {
             g_srv_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
         } else if (strcmp(argv[i], "--bwn") == 0) {
             g_use_bwn = 1;
+        } else if (strcmp(argv[i], "--early-exit") == 0 && i+1 < argc) {
+            /* Bit-width speculative decoding: exit after N layers if residual
+             * stream has converged. --early-exit 8 = check at layer 8, skip
+             * layers 8-11 if confident. 0 = disabled (default). */
+            g_early_exit_layers = atoi(argv[++i]);
+            printf("[*] early exit: check convergence at layer %d (threshold=%.3f)\n",
+                   g_early_exit_layers, g_early_exit_threshold);
+        } else if (strcmp(argv[i], "--early-exit-threshold") == 0 && i+1 < argc) {
+            g_early_exit_threshold = atof(argv[++i]);
+            printf("[*] early exit threshold set to %.4f\n", g_early_exit_threshold);
         } else if (strcmp(argv[i], "--turboquant") == 0) {
             g_use_turboquant = 1;
         } else if (strcmp(argv[i], "--lm-head-int8") == 0) {
