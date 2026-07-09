@@ -242,7 +242,7 @@ typedef struct {
 static BinGPT2Layer g_bin_layers[N_LAYER];
 static int g_binary_mode = 0;   /* set by --binary flag */
 static int g_use_bwn = 0;
-static int g_use_q8 = 0;       /* --q8: 8-bit per-row quantization (quality near float, 4x less mem) */
+static int g_use_q8 = 1;       /* DEFAULT: 8-bit per-row quantization (34 tok/s, coherent, 27MB) */
 static int g_use_rsign = 0;      /* --rsign: BNN with RSign (shift threshold to mean) */       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
 static int g_use_int8 = 0;      /* --int8: BWN with int8 activation quantization (2-9x speedup) */
 static int g_mixed_int8_layers = 0;  /* --mixed-int8 N: first N layers int8, rest BWN. 0=all-int8 */
@@ -2783,6 +2783,8 @@ int main(int argc, char **argv) {
             g_use_bwn = 1;
         } else if (strcmp(argv[i], "--q8") == 0) {
             g_use_q8 = 1;  /* 8-bit per-row quantization (quality near float) */
+        } else if (strcmp(argv[i], "--no-q8") == 0) {
+            g_use_q8 = 0;  /* disable Q8, use full float */
         } else if (strcmp(argv[i], "--rsign") == 0) {
             g_use_rsign = 1;  /* BNN with RSign (implies --binary) */
             g_binary_mode = 1;  /* load binary weights, use bin_matmul */
@@ -2935,6 +2937,7 @@ int main(int argc, char **argv) {
         if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
     
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
+    if (g_use_q8) printf("[*] Q8 mode: 8-bit per-row quantization (default, %d tok/s, 27MB)\n", 34);
 
         g_wte = tensor_get(g_tensors, g_n_tensors, "wte.weight");
         g_wpe = tensor_get(g_tensors, g_n_tensors, "wpe.weight");
