@@ -2,53 +2,53 @@
  * The actual NEON paths are used via #ifdef __aarch64__ in matmul functions.
  * AVX2 functions (BWN wbits, Q8 mistral 8-out) are disabled on ARM. */
 #if !defined(__x86_64__) && !defined(__AVX2__)
-  typedef struct { float v[8]; } __m256;
-  typedef struct { int v[8]; } __m256i;
-  typedef struct { float v[4]; } __m128;
-  typedef struct { int v[4]; } __m128i;
-  #define _mm256_setzero_ps() (__m256){}
-  #define _mm256_set1_ps(x) (__m256){}
-  #define _mm256_loadu_ps(p) (__m256){}
+  typedef float __m256[8] __attribute__((aligned(32)));
+  typedef int __m256i[8] __attribute__((aligned(32)));
+  typedef float __m128[4] __attribute__((aligned(16)));
+  typedef int __m128i[4] __attribute__((aligned(16)));
+  #define _mm256_setzero_ps() ((__m256){0})
+  #define _mm256_set1_ps(x) ((__m256){0})
+  #define _mm256_loadu_ps(p) ((__m256){0})
   #define _mm256_storeu_ps(p, v)
-  #define _mm256_add_ps(a, b) (__m256){}
-  #define _mm256_fmadd_ps(a, b, c) (__m256){}
-  #define _mm256_xor_ps(a, b) (__m256){}
-  #define _mm256_setzero_si256() (__m256i){}
-  #define _mm256_set1_epi16(x) (__m256i){}
-  #define _mm256_set1_epi32(x) (__m256i){}
-  #define _mm256_loadu_si256(p) (__m256i){}
-  #define _mm256_load_ps(p) (__m256){}
-  #define _mm256_add_epi32(a, b) (__m256i){}
-  #define _mm256_add_ps(a, b) (__m256){}
-  #define _mm256_maddubs_epi16(a, b) (__m256i){}
-  #define _mm256_madd_epi16(a, b) (__m256i){}
-  #define _mm256_castsi256_si128(v) (__m128i){}
-  #define _mm256_extracti128_si256(v, i) (__m128i){}
-  #define _mm256_castps256_ps128(v) (__m128){}
-  #define _mm256_extractf128_ps(v, i) (__m128){}
-  #define _mm256_hadd_ps(a, b) (__m256){}
-  #define _mm256_inserti128_si256(v, x, i) (__m256i){}
-  #define _mm256_castsi128_si256(v) (__m256i){}
-  #define _mm256_cvtepi8_epi32(v) (__m256i){}
-  #define _mm256_cvtepi32_ps(v) (__m256){}
-  #define _mm_add_ps(a, b) (__m128){}
-  #define _mm_hadd_ps(a, b) (__m128){}
+  #define _mm256_add_ps(a, b) ((__m256){0})
+  #define _mm256_fmadd_ps(a, b, c) ((__m256){0})
+  #define _mm256_xor_ps(a, b) ((__m256){0})
+  #define _mm256_setzero_si256() ((__m256i){0})
+  #define _mm256_set1_epi16(x) ((__m256i){0})
+  #define _mm256_set1_epi32(x) ((__m256i){0})
+  #define _mm256_loadu_si256(p) ((__m256i){0})
+  #define _mm256_load_ps(p) ((__m256){0})
+  #define _mm256_add_epi32(a, b) ((__m256i){0})
+  #define _mm256_add_ps(a, b) ((__m256){0})
+  #define _mm256_maddubs_epi16(a, b) ((__m256i){0})
+  #define _mm256_madd_epi16(a, b) ((__m256i){0})
+  #define _mm256_castsi256_si128(v) ((__m128i){0})
+  #define _mm256_extracti128_si256(v, i) ((__m128i){0})
+  #define _mm256_castps256_ps128(v) ((__m128){0})
+  #define _mm256_extractf128_ps(v, i) ((__m128){0})
+  #define _mm256_hadd_ps(a, b) ((__m256){0})
+  #define _mm256_inserti128_si256(v, x, i) ((__m256i){0})
+  #define _mm256_castsi128_si256(v) ((__m256i){0})
+  #define _mm256_cvtepi8_epi32(v) ((__m256i){0})
+  #define _mm256_cvtepi32_ps(v) ((__m256){0})
+  #define _mm_add_ps(a, b) ((__m128){0})
+  #define _mm_hadd_ps(a, b) ((__m128){0})
   #define _mm_cvtss_f32(v) 0.0f
-  #define _mm_load_si128(p) (__m128i){}
-  #define _mm_loadu_si128(p) (__m128i){}
-  #define _mm_set1_epi8(x) (__m128i){}
-  #define _mm_and_si128(a, b) (__m128i){}
-  #define _mm_srli_epi16(v, n) (__m128i){}
-  #define _mm_sub_epi8(a, b) (__m128i){}
-  #define _mm_unpacklo_epi8(a, b) (__m128i){}
-  #define _mm_unpackhi_epi8(a, b) (__m128i){}
-  #define _mm_add_epi32(a, b) (__m128i){}
-  #define _mm_hadd_epi32(a, b) (__m128i){}
+  #define _mm_load_si128(p) ((__m128i){0})
+  #define _mm_loadu_si128(p) ((__m128i){0})
+  #define _mm_set1_epi8(x) ((__m128i){0})
+  #define _mm_and_si128(a, b) ((__m128i){0})
+  #define _mm_srli_epi16(v, n) ((__m128i){0})
+  #define _mm_sub_epi8(a, b) ((__m128i){0})
+  #define _mm_unpacklo_epi8(a, b) ((__m128i){0})
+  #define _mm_unpackhi_epi8(a, b) ((__m128i){0})
+  #define _mm_add_epi32(a, b) ((__m128i){0})
+  #define _mm_hadd_epi32(a, b) ((__m128i){0})
   #define _mm_cvtsi128_si32(v) 0
-  #define _mm_loadl_epi64(p) (__m128i){}
-  #define _mm_setzero_si128() (__m128i){}
+  #define _mm_loadl_epi64(p) ((__m128i){0})
+  #define _mm_setzero_si128() ((__m128i){0})
   #define _mm_storeu_si128(p, v)
-  #define _mm_set1_epi32(x) (__m128i){}
+  #define _mm_set1_epi32(x) ((__m128i){0})
   #define _mm_castsi128_si128(v) (__m128i){}
   #define _mm_cvtss_f32(v) 0.0f
 #endif
