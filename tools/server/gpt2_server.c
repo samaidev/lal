@@ -1,6 +1,6 @@
-/* On non-x86 platforms, provide AVX2 type stubs.
- * Typedefs are always defined (harmless on x86, overridden by immintrin.h).
- * Macros are only defined when AVX2 is NOT available. */
+/* AVX2 type stubs for non-x86 platforms (arm64/NEON).
+ * Typedefs are ALWAYS defined — on x86 they're overridden by immintrin.h.
+ * Macro stubs only active when AVX2 is not available. */
 #if !defined(__x86_64__) && !defined(__AVX2__)
   typedef struct { float v[8]; } __m256;
   typedef struct { int v[8]; } __m256i;
@@ -52,7 +52,10 @@
   #define _mm_setzero_si128() (__stub_zero128i)
   #define _mm_set1_epi32(x) (__stub_zero128i)
   #define _mm_storeu_si128(p, v)
-#else
+#endif
+
+/* On x86, include immintrin.h for real AVX2 types */
+#if defined(__x86_64__) || defined(__AVX2__)
   #include <immintrin.h>
 #endif
 
