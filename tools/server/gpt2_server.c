@@ -1328,7 +1328,9 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w7+i))), ones));
         }
         #define HSUM32(v) ({ __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1); \
-            __m128i s=_mm_hadd_epi32(lo,hi); s=_mm_hadd_epi32(s,s); s=_mm_hadd_epi32(s,s); _mm_cvtsi128_si32(s); })
+            __m128i s=_mm_hadd_epi32(lo,hi);
+        s=_mm_hadd_epi32(s,s);
+        s=_mm_hadd_epi32(s,s); _mm_cvtsi128_si32(s); })
         y[j+0]=(float)(HSUM32(a0)-128*w_sums[j+0])*x_scale*scale[j+0]+(b?b[j+0]:0);
         y[j+1]=(float)(HSUM32(a1)-128*w_sums[j+1])*x_scale*scale[j+1]+(b?b[j+1]:0);
         y[j+2]=(float)(HSUM32(a2)-128*w_sums[j+2])*x_scale*scale[j+2]+(b?b[j+2]:0);
@@ -1347,7 +1349,9 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
         }
 #endif
         __m128i lo=_mm256_castsi256_si128(acc32), hi=_mm256_extracti128_si256(acc32,1);
-        __m128i s=_mm_hadd_epi32(lo,hi); s=_mm_hadd_epi32(s,s); s=_mm_hadd_epi32(s,s);
+        __m128i s=_mm_hadd_epi32(lo,hi);
+        s=_mm_hadd_epi32(s,s);
+        s=_mm_hadd_epi32(s,s);
         y[j]=(float)(_mm_cvtsi128_si32(s)-128*w_sums[j])*x_scale*scale[j]+(b?b[j]:0);
     }
 }
