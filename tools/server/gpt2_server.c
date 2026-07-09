@@ -250,7 +250,7 @@ static void matmul_q4(float *y, const uint8_t *q4_T, const float *scale,
         }
         /* Horizontal sum */
         int32_t dot = vaddvq_s32(acc);
-        dot -= 128 * w_sums[j];  /* zero-point already removed in x subtraction above, but keep for safety */
+        /* zero-point already removed in x subtraction (vsubq_s16 with 128) */
         y[j] = (float)dot * x_scale * scale[j] + (b ? b[j] : 0);
     }
 }
@@ -1281,10 +1281,10 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
     for (int i = 0; i < in_dim; i++) x_max = fmaxf(x_max, fabsf(x[i]));
     float x_scale = x_max / 127.0f;
     if (x_scale < 1e-8f) x_scale = 1e-8f;
-    uint8_t xq[4096];
+    int8_t xq[4096];
     for (int i = 0; i < in_dim; i++) {
-        int v = (int)lroundf(x[i] / x_scale) + 128;
-        xq[i] = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+        int v = (int)lroundf(x[i] / x_scale);
+        xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
     }
 #if defined(__aarch64__) && defined(__ARM_NEON)
     /* NEON Q8 path: 8-output parallel with SDOT (if available) or vmull_s8.
@@ -1301,7 +1301,7 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
         const int8_t *w4=q8_T+(size_t)(j+4)*in_dim,*w5=q8_T+(size_t)(j+5)*in_dim;
         const int8_t *w6=q8_T+(size_t)(j+6)*in_dim,*w7=q8_T+(size_t)(j+7)*in_dim;
         for (int i = 0; i < in_dim; i += 16) {
-            int8x16_t xv = vld1q_s8((const int8_t*)(xq + i));
+            int8x16_t xv = vld1q_s8(xq + i);
             a0=vdotq_s32(a0,xv,vld1q_s8(w0+i)); a1=vdotq_s32(a1,xv,vld1q_s8(w1+i));
             a2=vdotq_s32(a2,xv,vld1q_s8(w2+i)); a3=vdotq_s32(a3,xv,vld1q_s8(w3+i));
             a4=vdotq_s32(a4,xv,vld1q_s8(w4+i)); a5=vdotq_s32(a5,xv,vld1q_s8(w5+i));
@@ -1334,7 +1334,7 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
         const int8_t *w4=q8_T+(size_t)(j+4)*in_dim,*w5=q8_T+(size_t)(j+5)*in_dim;
         const int8_t *w6=q8_T+(size_t)(j+6)*in_dim,*w7=q8_T+(size_t)(j+7)*in_dim;
         for (int i = 0; i < in_dim; i += 8) {
-            int8x8_t xv = vld1_s8((const int8_t*)(xq + i));
+            int8x8_t xv = vld1_s8(xq + i);
             a0=vpadalq_s16(a0,vmull_s8(xv,vld1_s8(w0+i)));
             a1=vpadalq_s16(a1,vmull_s8(xv,vld1_s8(w1+i)));
             a2=vpadalq_s16(a2,vmull_s8(xv,vld1_s8(w2+i)));
