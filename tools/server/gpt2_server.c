@@ -1303,6 +1303,7 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
         dot -= 128 * w_sums[j];
         y[j] = (float)dot * x_scale * scale[j] + (b ? b[j] : 0);
     }
+    return;  /* NEON path done, skip AVX2 */
 }
 #else
     __m256i ones = _mm256_set1_epi16(1);
