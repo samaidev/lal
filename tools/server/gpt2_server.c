@@ -6,10 +6,10 @@
   typedef struct { int v[8]; } __m256i;
   typedef struct { float v[4]; } __m128;
   typedef struct { int v[4]; } __m128i;
-  static __m256 __stub_zero256 = {0};
-  static __m256i __stub_zero256i = {0};
-  static __m128 __stub_zero128 = {0};
-  static __m128i __stub_zero128i = {0};
+  static const __m256 __stub_zero256 = {0};
+  static const __m256i __stub_zero256i = {0};
+  static const __m128 __stub_zero128 = {0};
+  static const __m128i __stub_zero128i = {0};
   #define _mm256_setzero_ps() (__stub_zero256)
   #define _mm256_set1_ps(x) (__stub_zero256)
   #define _mm256_loadu_ps(p) (__stub_zero256)
