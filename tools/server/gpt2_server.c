@@ -1348,8 +1348,9 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
             acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w+i))), ones));
         }
-#endif
+    }
 }
+#endif
 
 #if USE_OPENBLAS
 #include <cblas.h>
