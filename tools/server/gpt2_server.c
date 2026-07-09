@@ -948,7 +948,8 @@ static int load_binary_weights(const char *path) {
     }
 
     fclose(f);
-    g_binary_mode = 1;
+    fprintf(stderr, "[!] --binary (BNN) is DEPRECATED: garbled output. Use default Q8 instead.\n");
+            g_binary_mode = 1;
 
     /* Int8 speedup: pre-pack sign(w) as int8 for all BINARY layers.
      * Only for non-logic-guided (GB2L all-binary) — logic_mask handled separately. */
@@ -3076,17 +3077,21 @@ int main(int argc, char **argv) {
             g_use_dflash = 1;
             g_srv_real_attention = 1;  /* dflash implies real attention (needs KV cache) */
         } else if (strcmp(argv[i], "--bwn") == 0) {
+            fprintf(stderr, "[!] --bwn is DEPRECATED: 1-bit quality is garbled. Use default Q8 instead.\n");
             g_use_bwn = 1;
         } else if (strcmp(argv[i], "--q8") == 0) {
             g_use_q8 = 1;  /* 8-bit per-row quantization (quality near float) */
         } else if (strcmp(argv[i], "--no-q8") == 0) {
             g_use_q8 = 0;  /* disable Q8, use full float */
         } else if (strcmp(argv[i], "--q4") == 0) {
-            g_use_q4 = 1; g_use_q8 = 0;  /* 4-bit (faster, less mem, slight quality loss) */
+            g_use_q4 = 1; g_use_q8 = 0;
+            printf("[*] Q4 mode: 4-bit per-row (faster, 14MB, correlation 0.998)\n");  /* 4-bit (faster, less mem, slight quality loss) */
         } else if (strcmp(argv[i], "--rsign") == 0) {
+            fprintf(stderr, "[!] --rsign is DEPRECATED: BNN variant, garbled output.\n");
             g_use_rsign = 1;  /* BNN with RSign (implies --binary) */
             g_binary_mode = 1;  /* load binary weights, use bin_matmul */
         } else if (strcmp(argv[i], "--int8") == 0) {
+            fprintf(stderr, "[!] --int8 is DEPRECATED: degraded quality. Use default Q8 instead.\n");
             g_use_bwn = 1;  /* int8 implies bwn */
             g_use_int8 = 1;
         } else if (strcmp(argv[i], "--mixed-int8") == 0 && i+1 < argc) {
@@ -3235,7 +3240,7 @@ int main(int argc, char **argv) {
         if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
     
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
-    if (g_use_q8) printf("[*] Q8 mode: 8-bit per-row quantization (default, %d tok/s, 27MB)\n", 34);
+    if (g_use_q8 && !g_use_q4) printf("[*] Q8 mode: 8-bit per-row quantization (default, %d tok/s, 27MB)\n", 34);
     /* Auto-enable int8 LM head for Q8/Q4 modes — LM head (50257x768) is the
      * biggest bottleneck. Quantizing it to int8 gives 4x speedup on that layer. */
     if ((g_use_q8 || g_use_q4) && !g_use_lm_head_int8) {
