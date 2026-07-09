@@ -3023,6 +3023,12 @@ int main(int argc, char **argv) {
     
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
     if (g_use_q8) printf("[*] Q8 mode: 8-bit per-row quantization (default, %d tok/s, 27MB)\n", 34);
+    /* Auto-enable int8 LM head for Q8/Q4 modes — LM head (50257x768) is the
+     * biggest bottleneck. Quantizing it to int8 gives 4x speedup on that layer. */
+    if ((g_use_q8 || g_use_q4) && !g_use_lm_head_int8) {
+        g_use_lm_head_int8 = 1;
+        printf("[*] Auto-enabling int8 LM head for %s mode\n", g_use_q4 ? "Q4" : "Q8");
+    }
 
         g_wte = tensor_get(g_tensors, g_n_tensors, "wte.weight");
         g_wpe = tensor_get(g_tensors, g_n_tensors, "wpe.weight");
