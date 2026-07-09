@@ -1349,11 +1349,6 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w+i))), ones));
         }
 #endif
-        /* Portable scalar tail (AVX2 stubs return 0 on ARM, so dot=0) */
-        int32_t dot = 0;
-        dot -= 128 * w_sums[j];
-        y[j] = (float)dot * x_scale * scale[j] + (b ? b[j] : 0);
-    }
 }
 
 #if USE_OPENBLAS
