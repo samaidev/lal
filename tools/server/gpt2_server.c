@@ -1281,10 +1281,10 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
     for (int i = 0; i < in_dim; i++) x_max = fmaxf(x_max, fabsf(x[i]));
     float x_scale = x_max / 127.0f;
     if (x_scale < 1e-8f) x_scale = 1e-8f;
-    int8_t xq[4096];
+    uint8_t xq[4096];
     for (int i = 0; i < in_dim; i++) {
-        int v = (int)lroundf(x[i] / x_scale);
-        xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+        int v = (int)lroundf(x[i] / x_scale) + 128;
+        xq[i] = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
     }
 #if defined(__aarch64__) && defined(__ARM_NEON)
     /* NEON Q8 path: 8-output parallel with SDOT (if available) or vmull_s8.
@@ -1307,21 +1307,21 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             a4=vdotq_s32(a4,xv,vld1q_s8(w4+i)); a5=vdotq_s32(a5,xv,vld1q_s8(w5+i));
             a6=vdotq_s32(a6,xv,vld1q_s8(w6+i)); a7=vdotq_s32(a7,xv,vld1q_s8(w7+i));
         }
-        y[j+0]=(float)vaddvq_s32(a0)*x_scale*scale[j+0]+(b?b[j+0]:0);
-        y[j+1]=(float)vaddvq_s32(a1)*x_scale*scale[j+1]+(b?b[j+1]:0);
-        y[j+2]=(float)vaddvq_s32(a2)*x_scale*scale[j+2]+(b?b[j+2]:0);
-        y[j+3]=(float)vaddvq_s32(a3)*x_scale*scale[j+3]+(b?b[j+3]:0);
-        y[j+4]=(float)vaddvq_s32(a4)*x_scale*scale[j+4]+(b?b[j+4]:0);
-        y[j+5]=(float)vaddvq_s32(a5)*x_scale*scale[j+5]+(b?b[j+5]:0);
-        y[j+6]=(float)vaddvq_s32(a6)*x_scale*scale[j+6]+(b?b[j+6]:0);
-        y[j+7]=(float)vaddvq_s32(a7)*x_scale*scale[j+7]+(b?b[j+7]:0);
+        y[j+0]=(float)(vaddvq_s32(a0)-128*w_sums[j+0])*x_scale*scale[j+0]+(b?b[j+0]:0);
+        y[j+1]=(float)(vaddvq_s32(a1)-128*w_sums[j+1])*x_scale*scale[j+1]+(b?b[j+1]:0);
+        y[j+2]=(float)(vaddvq_s32(a2)-128*w_sums[j+2])*x_scale*scale[j+2]+(b?b[j+2]:0);
+        y[j+3]=(float)(vaddvq_s32(a3)-128*w_sums[j+3])*x_scale*scale[j+3]+(b?b[j+3]:0);
+        y[j+4]=(float)(vaddvq_s32(a4)-128*w_sums[j+4])*x_scale*scale[j+4]+(b?b[j+4]:0);
+        y[j+5]=(float)(vaddvq_s32(a5)-128*w_sums[j+5])*x_scale*scale[j+5]+(b?b[j+5]:0);
+        y[j+6]=(float)(vaddvq_s32(a6)-128*w_sums[j+6])*x_scale*scale[j+6]+(b?b[j+6]:0);
+        y[j+7]=(float)(vaddvq_s32(a7)-128*w_sums[j+7])*x_scale*scale[j+7]+(b?b[j+7]:0);
     }
     for (; j < out_dim; j++) {
         const int8_t *w = q8_T + (size_t)j * in_dim;
         int32x4_t acc = vdupq_n_s32(0);
         for (int i = 0; i < in_dim; i += 16)
             acc = vdotq_s32(acc, vld1q_s8((const int8_t*)(xq+i)), vld1q_s8(w+i));
-        y[j]=(float)vaddvq_s32(acc)*x_scale*scale[j]+(b?b[j]:0);
+        y[j]=(float)(vaddvq_s32(acc)-128*w_sums[j])*x_scale*scale[j]+(b?b[j]:0);
     }
     return;
 #else
@@ -1344,21 +1344,21 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             a6=vpadalq_s16(a6,vmull_s8(xv,vld1_s8(w6+i)));
             a7=vpadalq_s16(a7,vmull_s8(xv,vld1_s8(w7+i)));
         }
-        y[j+0]=(float)vaddvq_s32(a0)*x_scale*scale[j+0]+(b?b[j+0]:0);
-        y[j+1]=(float)vaddvq_s32(a1)*x_scale*scale[j+1]+(b?b[j+1]:0);
-        y[j+2]=(float)vaddvq_s32(a2)*x_scale*scale[j+2]+(b?b[j+2]:0);
-        y[j+3]=(float)vaddvq_s32(a3)*x_scale*scale[j+3]+(b?b[j+3]:0);
-        y[j+4]=(float)vaddvq_s32(a4)*x_scale*scale[j+4]+(b?b[j+4]:0);
-        y[j+5]=(float)vaddvq_s32(a5)*x_scale*scale[j+5]+(b?b[j+5]:0);
-        y[j+6]=(float)vaddvq_s32(a6)*x_scale*scale[j+6]+(b?b[j+6]:0);
-        y[j+7]=(float)vaddvq_s32(a7)*x_scale*scale[j+7]+(b?b[j+7]:0);
+        y[j+0]=(float)(vaddvq_s32(a0)-128*w_sums[j+0])*x_scale*scale[j+0]+(b?b[j+0]:0);
+        y[j+1]=(float)(vaddvq_s32(a1)-128*w_sums[j+1])*x_scale*scale[j+1]+(b?b[j+1]:0);
+        y[j+2]=(float)(vaddvq_s32(a2)-128*w_sums[j+2])*x_scale*scale[j+2]+(b?b[j+2]:0);
+        y[j+3]=(float)(vaddvq_s32(a3)-128*w_sums[j+3])*x_scale*scale[j+3]+(b?b[j+3]:0);
+        y[j+4]=(float)(vaddvq_s32(a4)-128*w_sums[j+4])*x_scale*scale[j+4]+(b?b[j+4]:0);
+        y[j+5]=(float)(vaddvq_s32(a5)-128*w_sums[j+5])*x_scale*scale[j+5]+(b?b[j+5]:0);
+        y[j+6]=(float)(vaddvq_s32(a6)-128*w_sums[j+6])*x_scale*scale[j+6]+(b?b[j+6]:0);
+        y[j+7]=(float)(vaddvq_s32(a7)-128*w_sums[j+7])*x_scale*scale[j+7]+(b?b[j+7]:0);
     }
     for (; j < out_dim; j++) {
         const int8_t *w = q8_T + (size_t)j * in_dim;
         int32x4_t acc = vdupq_n_s32(0);
         for (int i = 0; i < in_dim; i += 8)
             acc = vpadalq_s16(acc, vmull_s8(vld1_s8((const int8_t*)(xq+i)), vld1_s8(w+i)));
-        y[j]=(float)vaddvq_s32(acc)*x_scale*scale[j]+(b?b[j]:0);
+        y[j]=(float)(vaddvq_s32(acc)-128*w_sums[j])*x_scale*scale[j]+(b?b[j]:0);
     }
     return;
 #endif
@@ -1386,10 +1386,7 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w6+i))), ones));
             a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w7+i))), ones));
         }
-        #define HSUM32(v) ({ __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1); \
-            __m128i s=_mm_hadd_epi32(lo,hi);
-        s=_mm_hadd_epi32(s,s);
-        s=_mm_hadd_epi32(s,s); _mm_cvtsi128_si32(s); })
+        #define HSUM32(v) ({ __m128i _lo=_mm256_castsi256_si128(v), _hi=_mm256_extracti128_si256(v,1); __m128i _s=_mm_add_epi32(_lo,_hi); _s=_mm_hadd_epi32(_s,_s); _s=_mm_hadd_epi32(_s,_s); _mm_cvtsi128_si32(_s); })
         y[j+0]=(float)(HSUM32(a0)-128*w_sums[j+0])*x_scale*scale[j+0]+(b?b[j+0]:0);
         y[j+1]=(float)(HSUM32(a1)-128*w_sums[j+1])*x_scale*scale[j+1]+(b?b[j+1]:0);
         y[j+2]=(float)(HSUM32(a2)-128*w_sums[j+2])*x_scale*scale[j+2]+(b?b[j+2]:0);
