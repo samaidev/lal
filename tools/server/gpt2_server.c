@@ -1746,9 +1746,32 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
         }
         dot = hsum_epi32(acc);
         for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+        /* NEON SDOT: 16 int8 × 16 int8 → 4 int32 per instruction */
+        #if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t acc = vdupq_n_s32(0);
+        int i = 0;
+        for (; i + 16 <= n_embd; i += 16) {
+            int8x16_t xv = vld1q_s8(xq + i);
+            int8x16_t wv_vec = vld1q_s8(wv + i);
+            acc = vdotq_s32(acc, xv, wv_vec);
+        }
+        dot = vaddvq_s32(acc);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        #else
+        /* NEON vmull_s8 fallback */
+        int32x4_t acc = vdupq_n_s32(0);
+        int i = 0;
+        for (; i + 8 <= n_embd; i += 8) {
+            int8x8_t xv = vld1_s8(xq + i);
+            int8x8_t wv_vec = vld1_s8(wv + i);
+            acc = vpadalq_s16(acc, vmull_s8(xv, wv_vec));
+        }
+        dot = vaddvq_s32(acc);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        #endif
 #else
-        /* Scalar/NEON fallback: plain widening. Still bandwidth-bound, so
-         * the 4x memory reduction still pays off even without SIMD compute. */
+        /* Pure scalar fallback */
         for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
 #endif
         logits[v] = scale_x * ws[v] * (float)dot;
