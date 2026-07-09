@@ -1,6 +1,6 @@
-/* On non-x86 platforms, provide AVX2 type stubs to avoid compile errors.
- * The actual NEON paths are used via #ifdef __aarch64__ in matmul functions.
- * AVX2 functions (BWN wbits, Q8 mistral 8-out) are disabled on ARM. */
+/* On non-x86 platforms, provide AVX2 type stubs.
+ * Typedefs are always defined (harmless on x86, overridden by immintrin.h).
+ * Macros are only defined when AVX2 is NOT available. */
 #if !defined(__x86_64__) && !defined(__AVX2__)
   typedef struct { float v[8]; } __m256;
   typedef struct { int v[8]; } __m256i;
@@ -14,6 +14,7 @@
   #define _mm256_set1_ps(x) (__stub_zero256)
   #define _mm256_loadu_ps(p) (__stub_zero256)
   #define _mm256_storeu_ps(p, v)
+  #define _mm256_load_ps(p) (__stub_zero256)
   #define _mm256_add_ps(a, b) (__stub_zero256)
   #define _mm256_fmadd_ps(a, b, c) (__stub_zero256)
   #define _mm256_xor_ps(a, b) (__stub_zero256)
@@ -21,9 +22,7 @@
   #define _mm256_set1_epi16(x) (__stub_zero256i)
   #define _mm256_set1_epi32(x) (__stub_zero256i)
   #define _mm256_loadu_si256(p) (__stub_zero256i)
-  #define _mm256_load_ps(p) (__stub_zero256)
   #define _mm256_add_epi32(a, b) (__stub_zero256i)
-  #define _mm256_add_ps(a, b) (__stub_zero256)
   #define _mm256_maddubs_epi16(a, b) (__stub_zero256i)
   #define _mm256_madd_epi16(a, b) (__stub_zero256i)
   #define _mm256_castsi256_si128(v) (__stub_zero128i)
@@ -51,10 +50,10 @@
   #define _mm_cvtsi128_si32(v) 0
   #define _mm_loadl_epi64(p) (__stub_zero128i)
   #define _mm_setzero_si128() (__stub_zero128i)
-  #define _mm_storeu_si128(p, v)
   #define _mm_set1_epi32(x) (__stub_zero128i)
-  #define _mm_castsi128_si128(v) (__m128i){}
-  #define _mm_cvtss_f32(v) 0.0f
+  #define _mm_storeu_si128(p, v)
+#else
+  #include <immintrin.h>
 #endif
 
 /* gpt2_server.c — GPT-2 HTTP server (optimized, SIMD-accelerated)
