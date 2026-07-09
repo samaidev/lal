@@ -12,7 +12,7 @@ else ifeq ($(UNAME_M),i386)
   SIMD_FLAGS ?= -msse4.1
 else ifneq (,$(filter $(UNAME_M),arm armv7l armv7-a))
   # ARMv7 has NEON; -mfpu=neon is needed on 32-bit
-  SIMD_FLAGS ?= -mfpu=neon
+  SIMD_FLAGS ?= -march=armv7-a -mfpu=neon -mfloat-abi=softfp
 else ifneq (,$(filter $(UNAME_M),aarch64 arm64))
   # AArch64 has NEON + FMA by default
   SIMD_FLAGS ?=
