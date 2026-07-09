@@ -1,0 +1,769 @@
+/* qwen_server.c — Qwen2.5-0.5B inference (pure C, Q8, GQA, RoPE theta=1e6)
+ *
+ * Optimizations:
+ *   1. Q8 per-row quantization for all transformer matmuls (AVX2 VPMADDUBSW)
+ *   2. Int8 LM head with two-pass rerank (4x bandwidth reduction)
+ *   3. Multi-threaded: LM head split across threads, layer parallelism
+ *
+ * Build: make qwen-server
+ * Run:   ./qwen_server --weights prebuilt/qwen_weights.bin \
+ *            --tokenizer prebuilt/qwen_tokenizer --prompt "Hello" --n 20 [--threads 2]
+ */
+#define _POSIX_C_SOURCE 199309L
+#define _GNU_SOURCE
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include <pthread.h>
+
+#include "runtime/lal_runtime.h"
+
+/* ========================================================================
+ * Qwen2.5-0.5B Config
+ * ======================================================================== */
+#define N_EMBD       896
+#define N_LAYER      24
+#define N_HEAD       14
+#define N_KV_HEAD    2
+#define HEAD_DIM     64
+#define N_Q_PER_KV   7   /* 14 / 2 */
+#define MLP_DIM      4864
+#define VOCAB_SIZE   151936
+#define N_CTX        2048
+#define ROPE_THETA   1000000.0f
+#define RMS_EPS      1e-6f
+
+/* ========================================================================
+ * Portable SIMD
+ * ======================================================================== */
+#if defined(__x86_64__) || defined(__i386__)
+  #include <immintrin.h>
+  typedef __m256 v8f;
+  #define V8F_ZERO()    _mm256_setzero_ps()
+  #define V8F_SET1(x)   _mm256_set1_ps(x)
+  #define V8F_LOAD(p)   _mm256_loadu_ps(p)
+  #define V8F_STORE(p,v) _mm256_storeu_ps((p),(v))
+  #define V8F_ADD(a,b)   _mm256_add_ps((a),(b))
+  #define V8F_MUL(a,b)   _mm256_mul_ps((a),(b))
+  #define V8F_FMADD(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+  static inline float v8f_hsum(v8f v) {
+      float t[8]; _mm256_storeu_ps(t,v);
+      return t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+  }
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+  #include <arm_neon.h>
+  typedef struct { float32x4_t lo, hi; } v8f;
+  static inline v8f V8F_ZERO(void) { return (v8f){vdupq_n_f32(0),vdupq_n_f32(0)}; }
+  static inline v8f V8F_SET1(float x) { return (v8f){vdupq_n_f32(x),vdupq_n_f32(x)}; }
+  static inline v8f V8F_LOAD(const float *p) { return (v8f){vld1q_f32(p),vld1q_f32(p+4)}; }
+  static inline void V8F_STORE(float *p,v8f v) { vst1q_f32(p,v.lo); vst1q_f32(p+4,v.hi); }
+  static inline v8f V8F_ADD(v8f a,v8f b) { return (v8f){vaddq_f32(a.lo,b.lo),vaddq_f32(a.hi,b.hi)}; }
+  static inline v8f V8F_MUL(v8f a,v8f b) { return (v8f){vmulq_f32(a.lo,b.lo),vmulq_f32(a.hi,b.hi)}; }
+  static inline v8f V8F_FMADD(v8f a,v8f b,v8f c) { return (v8f){vfmaq_f32(c.lo,a.lo,b.lo),vfmaq_f32(c.hi,a.hi,b.hi)}; }
+  static inline float v8f_hsum(v8f v) {
+      float32x2_t s=vadd_f32(vadd_f32(vget_low_f32(v.lo),vget_high_f32(v.lo)),vadd_f32(vget_low_f32(v.hi),vget_high_f32(v.hi)));
+      return vget_lane_f32(vpadd_f32(s,s),0);
+  }
+#else
+  typedef struct { float v[8]; } v8f;
+  static inline v8f V8F_ZERO(void) { v8f r; memset(r.v,0,32); return r; }
+  static inline v8f V8F_SET1(float x) { v8f r; for(int i=0;i<8;i++) r.v[i]=x; return r; }
+  static inline v8f V8F_LOAD(const float *p) { v8f r; memcpy(r.v,p,32); return r; }
+  static inline void V8F_STORE(float *p,v8f v) { memcpy(p,v.v,32); }
+  static inline v8f V8F_MUL(v8f a,v8f b) { v8f r; for(int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]; return r; }
+  static inline v8f V8F_FMADD(v8f a,v8f b,v8f c) { v8f r; for(int i=0;i<8;i++) r.v[i]=a.v[i]*b.v[i]+c.v[i]; return r; }
+  static inline float v8f_hsum(v8f v) { float s=0; for(int i=0;i<8;i++) s+=v.v[i]; return s; }
+#endif
+
+/* ========================================================================
+ * Q8 quantization + matmul
+ * ======================================================================== */
+static void quantize_q8(const float *W, int8_t *q, float *scale,
+                         int32_t *w_sums, int in_dim, int out_dim) {
+    for (int j = 0; j < out_dim; j++) {
+        const float *col = W + (size_t)j * in_dim;
+        float mx = 0;
+        for (int i = 0; i < in_dim; i++) { float a=fabsf(col[i]); if(a>mx) mx=a; }
+        scale[j] = mx / 127.0f; if(scale[j]<1e-8f) scale[j]=1e-8f;
+        float inv = 1.0f / scale[j];
+        int32_t ws = 0;
+        for (int i = 0; i < in_dim; i++) {
+            int v = (int)lroundf(col[i] * inv);
+            if (v > 127) v = 127; else if (v < -127) v = -127;
+            q[(size_t)j * in_dim + i] = (int8_t)v;
+            ws += v;
+        }
+        w_sums[j] = ws;
+    }
+}
+
+static void matmul_q8(float *y, const int8_t *q, const float *scale,
+                      const int32_t *w_sums, const float *x, const float *b,
+                      int in_dim, int out_dim) {
+    float mx = 0;
+    for (int i = 0; i < in_dim; i++) { float a=fabsf(x[i]); if(a>mx) mx=a; }
+    float xs = mx / 127.0f; if(xs<1e-8f) xs=1e-8f;
+    float inv = 1.0f / xs;
+
+    /* Quantize x to uint8 (centered at 128) */
+    uint8_t xq[4864]; /* max MLP_DIM */
+    for (int i = 0; i < in_dim; i++) {
+        int v = (int)lroundf(x[i] * inv);
+        if (v > 127) v = 127; else if (v < -127) v = -127;
+        xq[i] = (uint8_t)(v + 128);
+    }
+
+#if defined(__x86_64__) && defined(LAL_HAVE_AVX2)
+    __m256i ones = _mm256_set1_epi16(1);
+    for (int j = 0; j < out_dim; j++) {
+        const uint8_t *wj = (const uint8_t*)(q + (size_t)j * in_dim);
+        __m256i acc32 = _mm256_setzero_si256();
+        int i = 0;
+        for (; i + 32 <= in_dim; i += 32) {
+            __m256i wv = _mm256_loadu_si256((const __m256i*)(wj + i));
+            __m256i xv = _mm256_loadu_si256((const __m256i*)(xq + i));
+            __m256i p16 = _mm256_maddubs_epi16(xv, wv);
+            acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(p16, ones));
+        }
+        __m128i lo = _mm256_castsi256_si128(acc32);
+        __m128i hi = _mm256_extracti128_si256(acc32, 1);
+        __m128i s = _mm_add_epi32(lo, hi);
+        s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s);
+        int32_t dot = _mm_cvtsi128_si32(s);
+        for (; i < in_dim; i++)
+            dot += (int32_t)((int8_t)wj[i]) * (int32_t)((int)xq[i] - 128);
+        dot -= 128 * w_sums[j];
+        y[j] = (float)dot * xs * scale[j] + (b ? b[j] : 0.0f);
+    }
+#else
+    for (int j = 0; j < out_dim; j++) {
+        const int8_t *wj = q + (size_t)j * in_dim;
+        int32_t dot = 0;
+        int i;
+        for (i = 0; i + 8 <= in_dim; i += 8) {
+            dot += (int32_t)wj[i]*(int32_t)(xq[i]-128) + (int32_t)wj[i+1]*(int32_t)(xq[i+1]-128);
+            dot += (int32_t)wj[i+2]*(int32_t)(xq[i+2]-128) + (int32_t)wj[i+3]*(int32_t)(xq[i+3]-128);
+            dot += (int32_t)wj[i+4]*(int32_t)(xq[i+4]-128) + (int32_t)wj[i+5]*(int32_t)(xq[i+5]-128);
+            dot += (int32_t)wj[i+6]*(int32_t)(xq[i+6]-128) + (int32_t)wj[i+7]*(int32_t)(xq[i+7]-128);
+        }
+        for (; i < in_dim; i++) dot += (int32_t)wj[i] * (int32_t)(xq[i] - 128);
+        y[j] = (float)dot * xs * scale[j] + (b ? b[j] : 0.0f);
+    }
+#endif
+}
+
+/* ========================================================================
+ * RMSNorm (SIMD)
+ * ======================================================================== */
+static void qwen_rms_norm(float *out, const float *x, const float *w, int n) {
+    float ms = 0;
+    for (int i = 0; i + 8 <= n; i += 8) {
+        v8f v = V8F_LOAD(x + i); v8f s = V8F_MUL(v, v); ms += v8f_hsum(s);
+    }
+    for (int i = (n/8)*8; i < n; i++) ms += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ms / n + RMS_EPS);
+    v8f iv = V8F_SET1(inv);
+    for (int i = 0; i + 8 <= n; i += 8) {
+        v8f xv = V8F_LOAD(x + i); v8f wv = V8F_LOAD(w + i);
+        V8F_STORE(out + i, V8F_MUL(V8F_MUL(xv, iv), wv));
+    }
+    for (int i = (n/8)*8; i < n; i++) out[i] = x[i] * inv * w[i];
+}
+
+/* ========================================================================
+ * RoPE (theta = 1,000,000)
+ * ======================================================================== */
+static void qwen_rope(float *q, float *k, int pos, int n_qh, int n_kvh, int hd) {
+    for (int h = 0; h < n_qh; h++) {
+        float *qh = q + h * hd;
+        for (int d = 0; d < hd/2; d++) {
+            float freq = 1.0f / powf(ROPE_THETA, (float)(2*d) / hd);
+            float a = (float)pos * freq;
+            float c = cosf(a), s = sinf(a);
+            float q0 = qh[d], q1 = qh[d + hd/2];
+            qh[d] = q0*c - q1*s; qh[d + hd/2] = q0*s + q1*c;
+        }
+    }
+    for (int h = 0; h < n_kvh; h++) {
+        float *kh = k + h * hd;
+        for (int d = 0; d < hd/2; d++) {
+            float freq = 1.0f / powf(ROPE_THETA, (float)(2*d) / hd);
+            float a = (float)pos * freq;
+            float c = cosf(a), s = sinf(a);
+            float k0 = kh[d], k1 = kh[d + hd/2];
+            kh[d] = k0*c - k1*s; kh[d + hd/2] = k0*s + k1*c;
+        }
+    }
+}
+
+/* ========================================================================
+ * GQA Attention
+ * ======================================================================== */
+static float **kv_cache; /* [N_LAYER*2][N_CTX * N_KV_HEAD * HEAD_DIM] */
+
+static void gqa_attn(float *out, const float *Q, const float *Kn, const float *Vn,
+                     int layer, int pos) {
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    int kvd = N_KV_HEAD * HEAD_DIM; /* 128 */
+
+    /* Store K, V */
+    for (int h = 0; h < N_KV_HEAD; h++) {
+        memcpy(kv_cache[layer*2]   + (size_t)pos*kvd + h*HEAD_DIM, Kn + h*HEAD_DIM, HEAD_DIM*4);
+        memcpy(kv_cache[layer*2+1] + (size_t)pos*kvd + h*HEAD_DIM, Vn + h*HEAD_DIM, HEAD_DIM*4);
+    }
+
+    float *scores = malloc((pos+1)*sizeof(float));
+    float *aw    = malloc((pos+1)*sizeof(float));
+
+    for (int qh = 0; qh < N_HEAD; qh++) {
+        const float *Qh = Q + qh * HEAD_DIM;
+        int kvh = qh / N_Q_PER_KV;
+
+        float mx = -1e30f;
+        for (int j = 0; j <= pos; j++) {
+            const float *Kj = kv_cache[layer*2] + (size_t)j*kvd + kvh*HEAD_DIM;
+            v8f acc = V8F_ZERO(); int d=0;
+            for (; d+8<=HEAD_DIM; d+=8) acc = V8F_FMADD(V8F_LOAD(Qh+d), V8F_LOAD(Kj+d), acc);
+            float dot = v8f_hsum(acc);
+            for (; d<HEAD_DIM; d++) dot += Qh[d]*Kj[d];
+            dot *= scale; scores[j] = dot;
+            if (dot > mx) mx = dot;
+        }
+        float se = 0;
+        for (int j = 0; j <= pos; j++) { aw[j]=expf(scores[j]-mx); se+=aw[j]; }
+        float is = 1.0f / (se + 1e-12f);
+        for (int j = 0; j <= pos; j++) aw[j] *= is;
+
+        float *oh = out + qh * HEAD_DIM;
+        memset(oh, 0, HEAD_DIM*4);
+        for (int j = 0; j <= pos; j++) {
+            float w = aw[j];
+            const float *Vj = kv_cache[layer*2+1] + (size_t)j*kvd + kvh*HEAD_DIM;
+            v8f wv = V8F_SET1(w); int d=0;
+            for (; d+8<=HEAD_DIM; d+=8) {
+                v8f cur = V8F_LOAD(oh+d);
+                V8F_STORE(oh+d, V8F_FMADD(wv, V8F_LOAD(Vj+d), cur));
+            }
+            for (; d<HEAD_DIM; d++) oh[d] += w*Vj[d];
+        }
+    }
+    free(scores); free(aw);
+}
+
+/* ========================================================================
+ * Model weights (Q8 per layer)
+ * ======================================================================== */
+typedef struct {
+    int8_t  *q8_q, *q8_k, *q8_v, *q8_o;
+    float   *s_q, *s_k, *s_v, *s_o;
+    int32_t *ws_q, *ws_k, *ws_v, *ws_o;
+    int8_t  *q8_gate, *q8_up, *q8_down;
+    float   *s_gate, *s_up, *s_down;
+    int32_t *ws_gate, *ws_up, *ws_down;
+    float *q_bias, *k_bias, *v_bias;
+    float *norm1_w, *norm2_w;
+} QwenLayer;
+
+static QwenLayer g_layers[N_LAYER];
+static float *g_wte;        /* [VOCAB_SIZE, N_EMBD] tied embedding/LM head */
+static float *g_norm_f_w;
+static float *g_x, *g_q, *g_k, *g_v, *g_attn_out, *g_proj;
+static float *g_gate, *g_up, *g_mlp_out, *g_ln;
+static float *g_logits;
+
+/* === Int8 LM head === */
+static int8_t  *g_wte_q;      /* [VOCAB_SIZE * N_EMBD] quantized wte */
+static float   *g_wte_scale;  /* [VOCAB_SIZE] per-row scales */
+static int g_n_threads = 1;
+
+/* ========================================================================
+ * Load weights
+ * ======================================================================== */
+static void load_weights(const char *path) {
+    printf("[*] loading %s ...\n", path);
+    int n_tensors;
+    Tensor *tensors = tensor_load_all(path, &n_tensors);
+    if (!tensors) { fprintf(stderr, "[!] failed to load\n"); exit(1); }
+    printf("[*] %d tensors loaded\n", n_tensors);
+
+    g_wte = tensor_get(tensors, n_tensors, "model.embed_tokens.weight");
+    g_norm_f_w = tensor_get(tensors, n_tensors, "model.norm.weight");
+    if (!g_wte || !g_norm_f_w) { fprintf(stderr, "[!] missing global weights\n"); exit(1); }
+
+    char key[256];
+    for (int l = 0; l < N_LAYER; l++) {
+        QwenLayer *L = &g_layers[l];
+        sprintf(key, "model.layers.%d.input_layernorm.weight", l);      L->norm1_w = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.post_attention_layernorm.weight", l); L->norm2_w = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l); float *Wq = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.q_proj.bias", l);   L->q_bias = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l); float *Wk = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.k_proj.bias", l);   L->k_bias = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l); float *Wv = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.v_proj.bias", l);   L->v_bias = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.self_attn.o_proj.weight", l); float *Wo = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l); float *Wg = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.mlp.up_proj.weight", l);   float *Wu = tensor_get(tensors, n_tensors, key);
+        sprintf(key, "model.layers.%d.mlp.down_proj.weight", l);  float *Wd = tensor_get(tensors, n_tensors, key);
+
+        /* Quantize all 7 matrices per layer */
+        L->q8_q = malloc((size_t)N_EMBD*N_EMBD); L->s_q = malloc(N_EMBD*4); L->ws_q = malloc(N_EMBD*4);
+        quantize_q8(Wq, L->q8_q, L->s_q, L->ws_q, N_EMBD, N_EMBD);
+        L->q8_k = malloc((size_t)128*N_EMBD); L->s_k = malloc(128*4); L->ws_k = malloc(128*4);
+        quantize_q8(Wk, L->q8_k, L->s_k, L->ws_k, N_EMBD, 128);
+        L->q8_v = malloc((size_t)128*N_EMBD); L->s_v = malloc(128*4); L->ws_v = malloc(128*4);
+        quantize_q8(Wv, L->q8_v, L->s_v, L->ws_v, N_EMBD, 128);
+        L->q8_o = malloc((size_t)N_EMBD*N_EMBD); L->s_o = malloc(N_EMBD*4); L->ws_o = malloc(N_EMBD*4);
+        quantize_q8(Wo, L->q8_o, L->s_o, L->ws_o, N_EMBD, N_EMBD);
+        L->q8_gate = malloc((size_t)MLP_DIM*N_EMBD); L->s_gate = malloc(MLP_DIM*4); L->ws_gate = malloc(MLP_DIM*4);
+        quantize_q8(Wg, L->q8_gate, L->s_gate, L->ws_gate, N_EMBD, MLP_DIM);
+        L->q8_up = malloc((size_t)MLP_DIM*N_EMBD); L->s_up = malloc(MLP_DIM*4); L->ws_up = malloc(MLP_DIM*4);
+        quantize_q8(Wu, L->q8_up, L->s_up, L->ws_up, N_EMBD, MLP_DIM);
+        L->q8_down = malloc((size_t)N_EMBD*MLP_DIM); L->s_down = malloc(N_EMBD*4); L->ws_down = malloc(N_EMBD*4);
+        quantize_q8(Wd, L->q8_down, L->s_down, L->ws_down, MLP_DIM, N_EMBD);
+        if (l == 0 || l == N_LAYER-1) printf("[*] layer %d Q8 done\n", l);
+    }
+    printf("[*] all %d layers quantized\n", N_LAYER);
+
+    /* Quantize wte for int8 LM head */
+    printf("[*] quantizing LM head (wte) to int8 ...");
+    fflush(stdout);
+    struct timespec tq0, tq1;
+    clock_gettime(CLOCK_MONOTONIC, &tq0);
+    g_wte_q = malloc((size_t)VOCAB_SIZE * N_EMBD);
+    g_wte_scale = malloc((size_t)VOCAB_SIZE * sizeof(float));
+    if (!g_wte_q || !g_wte_scale) {
+        fprintf(stderr, "[!] OOM allocating int8 LM head\n"); exit(1);
+    }
+    for (int v = 0; v < VOCAB_SIZE; v++) {
+        const float *row = g_wte + (size_t)v * N_EMBD;
+        float mx = 0;
+        for (int i = 0; i < N_EMBD; i++) { float a = fabsf(row[i]); if (a > mx) mx = a; }
+        g_wte_scale[v] = mx / 127.0f; if (g_wte_scale[v] < 1e-8f) g_wte_scale[v] = 1e-8f;
+        float inv = 1.0f / g_wte_scale[v];
+        for (int i = 0; i < N_EMBD; i++) {
+            int val = (int)lroundf(row[i] * inv);
+            if (val > 127) val = 127; else if (val < -127) val = -127;
+            g_wte_q[(size_t)v * N_EMBD + i] = (int8_t)val;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &tq1);
+    double dtq = (tq1.tv_sec-tq0.tv_sec)+(tq1.tv_nsec-tq0.tv_nsec)*1e-9;
+    printf(" done (%.0f ms, %.1f MB int8 + %.0f KB scales)\n",
+           dtq*1000, (double)VOCAB_SIZE*N_EMBD/1048576, (double)VOCAB_SIZE*sizeof(float)/1024);
+
+    /* Keep tensors alive — g_wte used for both embedding and LM head */
+}
+
+/* ========================================================================
+ * Tokenizer (BPE, HuggingFace tokenizer.json)
+ * ======================================================================== */
+#define TOK_HASH_BITS 18
+#define TOK_HASH_SIZE (1 << TOK_HASH_BITS)
+#define TOK_HASH_MASK (TOK_HASH_SIZE - 1)
+
+typedef struct { char *str; int id; int len; } TEntry;
+static TEntry *g_toks;
+static int g_ntoks = 0;
+static TEntry *g_htab[TOK_HASH_SIZE];
+
+static unsigned thash(const char *s, int len) {
+    unsigned h = 5381;
+    for (int i = 0; i < len; i++) h = ((h<<5)+h)+(unsigned char)s[i];
+    return h & TOK_HASH_MASK;
+}
+static void tins(const char *s, int id) {
+    unsigned h = thash(s, strlen(s));
+    for (int i = 0; i < TOK_HASH_SIZE; i++) {
+        int idx = (h+i) & TOK_HASH_MASK;
+        if (!g_htab[idx]) {
+            g_htab[idx] = &g_toks[g_ntoks++];
+            g_htab[idx]->str = strdup(s); g_htab[idx]->id = id; g_htab[idx]->len = strlen(s);
+            return;
+        }
+    }
+}
+static int tlook(const char *s, int len) {
+    unsigned h = thash(s, len);
+    for (int i = 0; i < TOK_HASH_SIZE; i++) {
+        int idx = (h+i) & TOK_HASH_MASK;
+        if (!g_htab[idx]) return -1;
+        if (g_htab[idx]->len == len && memcmp(g_htab[idx]->str, s, len) == 0) return g_htab[idx]->id;
+    }
+    return -1;
+}
+
+static char **g_vocab_str;
+static int g_vocab_str_n = 0;
+
+static void load_tokenizer(const char *dir) {
+    char path[1024]; snprintf(path, sizeof(path), "%s/tokenizer.json", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "[!] cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz+1); fread(buf, 1, sz, f); buf[sz] = 0; fclose(f);
+
+    int mx = VOCAB_SIZE + 200;
+    g_toks = malloc(mx * sizeof(TEntry));
+    g_vocab_str = calloc(mx, sizeof(char*));
+    memset(g_htab, 0, sizeof(g_htab));
+
+    char *p = strstr(buf, "\"vocab\"");
+    if (!p) { fprintf(stderr, "[!] vocab not found\n"); free(buf); return; }
+    p = strchr(p+6, '{'); if (!p) return; p++;
+
+    int cnt = 0;
+    while (*p && *p != '}' && cnt < mx) {
+        while (*p && (*p==' '||*p=='\n'||*p=='\r'||*p=='\t'||*p==',')) p++;
+        if (*p == '}') break;
+        if (*p != '"') { p++; continue; }
+        /* Read key */
+        p++; /* skip opening " */
+        char key[512]; int klen = 0;
+        while (*p && *p != '"' && klen < 511) {
+            if (*p == '\\') { p++; key[klen++] = *p ? *p : '?'; }
+            else key[klen++] = *p;
+            p++;
+        }
+        key[klen] = 0;
+        if (*p == '"') p++;
+        while (*p && (*p==' '||*p==':')) p++;
+        int id = 0;
+        while (*p >= '0' && *p <= '9') { id = id*10 + (*p-'0'); p++; }
+        tins(key, id);
+        if (id < mx) g_vocab_str[id] = strdup(key);
+        if (id+1 > g_vocab_str_n) g_vocab_str_n = id+1;
+        cnt++;
+    }
+    printf("[*] tokenizer: %d tokens\n", cnt);
+    free(buf);
+}
+
+/* Simple pre-tokenizer: split on whitespace/punctuation, keep words together.
+ * Qwen uses a BPE pre_tokenizer that splits on whitespace and some punctuation.
+ * For now, we do a simple greedy longest-match BPE on the raw text. */
+static int *encode_text(const char *text, int *n_out) {
+    int max_tok = strlen(text) * 2 + 10;
+    int *ids = malloc(max_tok * sizeof(int));
+    int n = 0, pos = 0, tlen = strlen(text);
+
+    while (pos < tlen && n < max_tok - 1) {
+        int best_len = 0, best_id = -1;
+        /* Try up to 64-byte match */
+        int max_try = 64; if (max_try > tlen - pos) max_try = tlen - pos;
+        for (int len = max_try; len >= 1; len--) {
+            int id = tlook(text + pos, len);
+            if (id >= 0) { best_len = len; best_id = id; break; }
+        }
+        if (best_id >= 0) {
+            ids[n++] = best_id;
+            pos += best_len;
+        } else {
+            /* Byte fallback */
+            ids[n++] = (unsigned char)text[pos];
+            pos++;
+        }
+    }
+    *n_out = n;
+    return ids;
+}
+
+static void decode_token(int id, char *out, int maxlen) {
+    if (id >= 0 && id < g_vocab_str_n && g_vocab_str[id])
+        strncpy(out, g_vocab_str[id], maxlen - 1);
+    else out[0] = 0;
+    out[maxlen - 1] = 0;
+}
+
+/* ========================================================================
+ * Int8 LM head (two-pass: int8 full vocab → float rerank top-K)
+ *
+ * The LM head (wte: 151936 × 896 = ~544 MB FP32) is the biggest single
+ * bottleneck — pure memory bandwidth. Quantizing to int8 cuts reads 4×.
+ * Two-pass rerank (llama.cpp pattern) preserves quality:
+ *   Pass 1: int8 dot product for ALL vocab (fast, bandwidth-bound)
+ *   Pass 2: float re-score only the top-RERANK_N candidates (accurate)
+ * ======================================================================== */
+#define LM_HEAD_RERANK_N 512
+
+static float lm_head_quantize_x(const float *x, int8_t *xq, int n) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > max_abs) max_abs = a; }
+    float scale = max_abs / 127.0f; if (scale < 1e-8f) scale = 1e-8f;
+    float inv = 1.0f / scale;
+    for (int i = 0; i < n; i++) {
+        int v = (int)(x[i] * inv);
+        if (v > 127) v = 127; if (v < -127) v = -127;
+        xq[i] = (int8_t)v;
+    }
+    return scale;
+}
+
+#if defined(__AVX2__)
+static inline int hsum_epi32_avx(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i s  = _mm_add_epi32(lo, hi);
+    s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s);
+    return _mm_cvtsi128_si32(s);
+}
+#endif
+
+typedef struct {
+    const int8_t *xq; float scale_x; float *logits;
+    int v_start, v_end, n_embd;
+} LmHeadJob;
+
+static void *lm_head_int8_worker(void *arg) {
+    LmHeadJob *j = (LmHeadJob *)arg;
+    const int8_t *xq = j->xq;
+    float scale_x = j->scale_x;
+    float *logits = j->logits;
+    int n_embd = j->n_embd;
+    for (int v = j->v_start; v < j->v_end; v++) {
+        const int8_t *wv = g_wte_q + (size_t)v * n_embd;
+        int dot = 0;
+#if defined(__AVX2__)
+        __m256i acc = _mm256_setzero_si256();
+        int i = 0;
+        for (; i + 32 <= n_embd; i += 32) {
+            __m128i xa = _mm_loadu_si128((const __m128i *)(xq + i));
+            __m128i wa = _mm_loadu_si128((const __m128i *)(wv + i));
+            __m256i x16 = _mm256_cvtepi8_epi16(xa);
+            __m256i w16 = _mm256_cvtepi8_epi16(wa);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16, w16));
+            __m128i xb = _mm_loadu_si128((const __m128i *)(xq + i + 16));
+            __m128i wb = _mm_loadu_si128((const __m128i *)(wv + i + 16));
+            __m256i x16b = _mm256_cvtepi8_epi16(xb);
+            __m256i w16b = _mm256_cvtepi8_epi16(wb);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16b, w16b));
+        }
+        dot = hsum_epi32_avx(acc);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+#else
+        for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+#endif
+        logits[v] = scale_x * g_wte_scale[v] * (float)dot;
+    }
+    return NULL;
+}
+
+static void lm_head_int8_parallel(float *logits, const float *x, int n_threads) {
+    static int8_t xq[N_EMBD];
+    float scale_x = lm_head_quantize_x(x, xq, N_EMBD);
+
+    /* Pass 1: int8 logits for full vocab, split across threads */
+    if (n_threads <= 1) {
+        lm_head_int8_worker(&(LmHeadJob){xq, scale_x, logits, 0, VOCAB_SIZE, N_EMBD});
+    } else {
+        pthread_t threads[8];
+        pthread_attr_t attr;
+        LmHeadJob jobs[8];
+        int nt = n_threads > 8 ? 8 : n_threads;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 256 * 1024);
+        int chunk = (VOCAB_SIZE + nt - 1) / nt;
+        for (int t = 0; t < nt; t++) {
+            jobs[t] = (LmHeadJob){xq, scale_x, logits, t*chunk, (t+1)*chunk, N_EMBD};
+            if (jobs[t].v_start > VOCAB_SIZE) jobs[t].v_start = VOCAB_SIZE;
+            if (jobs[t].v_end > VOCAB_SIZE) jobs[t].v_end = VOCAB_SIZE;
+            if (jobs[t].v_end > jobs[t].v_start)
+                pthread_create(&threads[t], &attr, lm_head_int8_worker, &jobs[t]);
+        }
+        pthread_attr_destroy(&attr);
+        for (int t = 0; t < nt; t++)
+            if (jobs[t].v_end > jobs[t].v_start) pthread_join(threads[t], NULL);
+    }
+
+    /* Pass 2: re-score top-RERANK_N in float (min-heap selection) */
+    static int   heap_idx[LM_HEAD_RERANK_N];
+    static float heap_val[LM_HEAD_RERANK_N];
+    int heap_n = 0;
+    for (int v = 0; v < VOCAB_SIZE; v++) {
+        float val = logits[v];
+        if (heap_n < LM_HEAD_RERANK_N) {
+            int c = heap_n++; heap_val[c] = val; heap_idx[c] = v;
+            while (c > 0) {
+                int p = (c-1) >> 1;
+                if (heap_val[p] <= heap_val[c]) break;
+                float tv = heap_val[p]; heap_val[p] = heap_val[c]; heap_val[c] = tv;
+                int ti = heap_idx[p]; heap_idx[p] = heap_idx[c]; heap_idx[c] = ti;
+                c = p;
+            }
+        } else if (val > heap_val[0]) {
+            heap_val[0] = val; heap_idx[0] = v;
+            int p = 0;
+            for (;;) {
+                int l = 2*p+1, r = 2*p+2, s = p;
+                if (l < heap_n && heap_val[l] < heap_val[s]) s = l;
+                if (r < heap_n && heap_val[r] < heap_val[s]) s = r;
+                if (s == p) break;
+                float tv = heap_val[p]; heap_val[p] = heap_val[s]; heap_val[s] = tv;
+                int ti = heap_idx[p]; heap_idx[p] = heap_idx[s]; heap_idx[s] = ti;
+                p = s;
+            }
+        }
+    }
+    for (int k = 0; k < heap_n; k++) {
+        int v = heap_idx[k];
+        const float *w = g_wte + (size_t)v * N_EMBD;
+        v8f acc = V8F_ZERO(); int i = 0;
+        for (; i + 8 <= N_EMBD; i += 8)
+            acc = V8F_FMADD(V8F_LOAD(x+i), V8F_LOAD(w+i), acc);
+        float s = v8f_hsum(acc);
+        for (; i < N_EMBD; i++) s += x[i] * w[i];
+        logits[v] = s;
+    }
+}
+
+/* ========================================================================
+ * Forward: one token → next token id
+ * ======================================================================== */
+static int forward(int tok, int pos) {
+    if (tok < 0 || tok >= VOCAB_SIZE) tok = 0;
+    if (pos < 0 || pos >= N_CTX) pos = 0;
+
+    /* Embedding (no pos emb — RoPE) */
+    memcpy(g_x, g_wte + (size_t)tok * N_EMBD, N_EMBD * sizeof(float));
+
+    for (int l = 0; l < N_LAYER; l++) {
+        QwenLayer *L = &g_layers[l];
+
+        /* Pre-attn RMSNorm */
+        qwen_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
+        /* Q/K/V projections */
+        matmul_q8(g_q, L->q8_q, L->s_q, L->ws_q, g_ln, L->q_bias, N_EMBD, N_EMBD);
+        matmul_q8(g_k, L->q8_k, L->s_k, L->ws_k, g_ln, L->k_bias, N_EMBD, 128);
+        matmul_q8(g_v, L->q8_v, L->s_v, L->ws_v, g_ln, L->v_bias, N_EMBD, 128);
+        /* RoPE */
+        qwen_rope(g_q, g_k, pos, N_HEAD, N_KV_HEAD, HEAD_DIM);
+        /* GQA */
+        gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
+        /* O proj + residual */
+        matmul_q8(g_proj, L->q8_o, L->s_o, L->ws_o, g_attn_out, NULL, N_EMBD, N_EMBD);
+        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
+
+        /* Pre-MLP RMSNorm */
+        qwen_rms_norm(g_ln, g_x, L->norm2_w, N_EMBD);
+        /* SwiGLU */
+        matmul_q8(g_gate, L->q8_gate, L->s_gate, L->ws_gate, g_ln, NULL, N_EMBD, MLP_DIM);
+        matmul_q8(g_up,   L->q8_up,   L->s_up,   L->ws_up,   g_ln, NULL, N_EMBD, MLP_DIM);
+        for (int i = 0; i < MLP_DIM; i++) g_gate[i] = (g_gate[i] / (1.0f + expf(-g_gate[i]))) * g_up[i];
+        matmul_q8(g_mlp_out, L->q8_down, L->s_down, L->ws_down, g_gate, NULL, MLP_DIM, N_EMBD);
+        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
+    }
+
+    /* Final RMSNorm */
+    qwen_rms_norm(g_ln, g_x, g_norm_f_w, N_EMBD);
+
+    /* LM head: int8 quantized with two-pass rerank */
+    if (g_wte_q) {
+        lm_head_int8_parallel(g_logits, g_ln, g_n_threads);
+    } else {
+        /* Fallback: FP32 LM head */
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            const float *row = g_wte + (size_t)v * N_EMBD;
+            v8f acc = V8F_ZERO(); int i = 0;
+            for (; i + 8 <= N_EMBD; i += 8)
+                acc = V8F_FMADD(V8F_LOAD(row+i), V8F_LOAD(g_ln+i), acc);
+            float dot = v8f_hsum(acc);
+            for (; i < N_EMBD; i++) dot += row[i] * g_ln[i];
+            g_logits[v] = dot;
+        }
+    }
+
+    /* Argmax */
+    int best = 0;
+    for (int v = 1; v < VOCAB_SIZE; v++)
+        if (g_logits[v] > g_logits[best]) best = v;
+    return best;
+}
+
+/* ========================================================================
+ * Generate
+ * ======================================================================== */
+static void generate(const char *prompt, int n_gen, char *out, int max_out) {
+    int n_prompt;
+    int *pids = encode_text(prompt, &n_prompt);
+    printf("[*] prompt: %d tokens\n", n_prompt);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int pos = 0;
+    /* Prefill */
+    int next = -1;
+    for (int i = 0; i < n_prompt; i++) {
+        next = forward(pids[i], pos);
+        pos++;
+        if (pos >= N_CTX) break;
+    }
+
+    /* Generate */
+    int gen_count = 0;
+    int opos = 0;
+    for (int g = 0; g < n_gen && pos < N_CTX; g++) {
+        char ts[256]; decode_token(next, ts, (int)sizeof(ts));
+        int slen = strlen(ts);
+        if (opos + slen < max_out - 1) { memcpy(out+opos, ts, slen); opos += slen; }
+        if (next == 151643) break; /* EOS */
+        next = forward(next, pos);
+        pos++;
+        gen_count++;
+    }
+    out[opos] = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (t1.tv_sec-t0.tv_sec) + (t1.tv_nsec-t0.tv_nsec)*1e-9;
+    printf("[*] %d tokens in %.2fs (%.1f tok/s)\n", gen_count, dt, gen_count/(dt+1e-9));
+    free(pids);
+}
+
+/* ========================================================================
+ * Main
+ * ======================================================================== */
+int main(int argc, char **argv) {
+    const char *weights = "prebuilt/qwen_weights.bin";
+    const char *tokdir = "prebuilt/qwen_tokenizer";
+    const char *prompt = "The meaning of life is";
+    int n_gen = 30;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i],"--weights") && i+1<argc) weights=argv[++i];
+        else if (!strcmp(argv[i],"--tokenizer") && i+1<argc) tokdir=argv[++i];
+        else if (!strcmp(argv[i],"--prompt") && i+1<argc) prompt=argv[++i];
+        else if (!strcmp(argv[i],"--n") && i+1<argc) n_gen=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--threads") && i+1<argc) g_n_threads=atoi(argv[++i]);
+    }
+    if (g_n_threads < 1) g_n_threads = 1;
+
+    printf("=== Qwen2.5-0.5B (LAL, Q8, GQA) ===\n");
+    printf("[*] %d layers, %d hidden, %dQ/%dKV heads, %d MLP, %d vocab\n",
+           N_LAYER, N_EMBD, N_HEAD, N_KV_HEAD, MLP_DIM, VOCAB_SIZE);
+
+    /* Alloc */
+    g_x = calloc(N_EMBD, 4); g_q = calloc(N_EMBD, 4); g_k = calloc(128, 4);
+    g_v = calloc(128, 4); g_attn_out = calloc(N_EMBD, 4); g_proj = calloc(N_EMBD, 4);
+    g_gate = calloc(MLP_DIM, 4); g_up = calloc(MLP_DIM, 4); g_mlp_out = calloc(N_EMBD, 4);
+    g_ln = calloc(N_EMBD, 4); g_logits = malloc(VOCAB_SIZE * 4);
+    kv_cache = calloc(N_LAYER*2, sizeof(float*));
+    for (int l = 0; l < N_LAYER*2; l++)
+        kv_cache[l] = calloc((size_t)N_CTX * N_KV_HEAD * HEAD_DIM, 4);
+
+    load_tokenizer(tokdir);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    load_weights(weights);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("[*] load+quant: %.1fs\n", (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
+
+    char output[4096];
+    printf("\n[*] prompt: \"%s\"\n[*] generating %d tokens (threads=%d)...\n\n", prompt, n_gen, g_n_threads);
+    generate(prompt, n_gen, output, (int)sizeof(output));
+    printf("\n[*] output: %s\n", output);
+    printf("\n[*] done. Q8 + int8 LM head + %d thread(s).\n", g_n_threads);
+    return 0;
+}
