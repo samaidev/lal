@@ -1461,6 +1461,8 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
             __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
             acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w+i))), ones));
         }
+        /* FIX: was missing — acc32 computed but y[j] never set */
+        y[j] = (float)(HSUM32(acc32) - 128 * w_sums[j]) * x_scale * scale[j] + (b ? b[j] : 0);
     }
 }
 #endif
@@ -1815,7 +1817,7 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
         dot = vaddvq_s32(acc);
         for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
         #else
-        /* NEON vmull_s8 fallback */
+        /* NEON vmull_s8 fallback (AArch64 without SDOT) */
         int32x4_t acc = vdupq_n_s32(0);
         int i = 0;
         for (; i + 8 <= n_embd; i += 8) {
@@ -1826,6 +1828,16 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
         dot = vaddvq_s32(acc);
         for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
         #endif
+#elif defined(__ARM_NEON) && !defined(__aarch64__)
+        /* ARMv7 NEON: vmull_s8 + manual hadd (no vaddvq_s32) */
+        int32x4_t acc = vdupq_n_s32(0);
+        int i = 0;
+        for (; i + 8 <= n_embd; i += 8) {
+            acc = vpadalq_s16(acc, vmull_s8(vld1_s8(xq + i), vld1_s8(wv + i)));
+        }
+        int32x2_t p = vpadd_s32(vget_low_s32(acc), vget_high_s32(acc));
+        dot = vget_lane_s32(p, 0) + vget_lane_s32(p, 1);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
 #else
         /* Pure scalar fallback */
         for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
