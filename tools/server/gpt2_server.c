@@ -1260,6 +1260,88 @@ static void quantize_q8_per_row(const float *W, int8_t *q8_T, float *scale,
         }
     }
 }
+/* Multi-threaded Q8 matmul worker */
+typedef struct {
+    float *y;
+    const int8_t *q8_T;
+    const float *scale;
+    const int32_t *w_sums;
+    const float *x;
+    const float *b;
+    int in_dim, v_start, v_end;
+    /* Copy of xq (each thread needs its own, but xq is computed once) */
+    const uint8_t *xq;
+    float x_scale;
+} Q8MatmulJob;
+
+static void *q8_matmul_worker(void *arg) {
+    Q8MatmulJob *j = (Q8MatmulJob *)arg;
+    /* Scalar fallback for the thread's range — simple and correct.
+     * The SIMD kernels are in matmul_q8; here we just do the range [v_start, v_end). */
+    const int8_t *q8_T = j->q8_T;
+    const float *scale = j->scale;
+    const int32_t *w_sums = j->w_sums;
+    const uint8_t *xq = j->xq;
+    float x_scale = j->x_scale;
+    int in_dim = j->in_dim;
+
+#if defined(__AVX2__)
+    __m256i ones = _mm256_set1_epi16(1);
+    int j_out = j->v_start;
+    for (; j_out + 8 <= j->v_end; j_out += 8) {
+        const int8_t *w0=q8_T+(size_t)(j_out+0)*in_dim, *w1=q8_T+(size_t)(j_out+1)*in_dim;
+        const int8_t *w2=q8_T+(size_t)(j_out+2)*in_dim, *w3=q8_T+(size_t)(j_out+3)*in_dim;
+        const int8_t *w4=q8_T+(size_t)(j_out+4)*in_dim, *w5=q8_T+(size_t)(j_out+5)*in_dim;
+        const int8_t *w6=q8_T+(size_t)(j_out+6)*in_dim, *w7=q8_T+(size_t)(j_out+7)*in_dim;
+        __m256i a0=_mm256_setzero_si256(),a1=_mm256_setzero_si256();
+        __m256i a2=_mm256_setzero_si256(),a3=_mm256_setzero_si256();
+        __m256i a4=_mm256_setzero_si256(),a5=_mm256_setzero_si256();
+        __m256i a6=_mm256_setzero_si256(),a7=_mm256_setzero_si256();
+        for (int i = 0; i < in_dim; i += 32) {
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w0+i))), ones));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w1+i))), ones));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w2+i))), ones));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w3+i))), ones));
+            a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w4+i))), ones));
+            a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w5+i))), ones));
+            a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w6+i))), ones));
+            a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w7+i))), ones));
+        }
+        #define HSUM32(v) ({ __m128i _lo=_mm256_castsi256_si128(v), _hi=_mm256_extracti128_si256(v,1); __m128i _s=_mm_add_epi32(_lo,_hi); _s=_mm_hadd_epi32(_s,_s); _s=_mm_hadd_epi32(_s,_s); _mm_cvtsi128_si32(_s); })
+        j->y[j_out+0]=(float)(HSUM32(a0)-128*w_sums[j_out+0])*x_scale*scale[j_out+0]+(j->b?j->b[j_out+0]:0);
+        j->y[j_out+1]=(float)(HSUM32(a1)-128*w_sums[j_out+1])*x_scale*scale[j_out+1]+(j->b?j->b[j_out+1]:0);
+        j->y[j_out+2]=(float)(HSUM32(a2)-128*w_sums[j_out+2])*x_scale*scale[j_out+2]+(j->b?j->b[j_out+2]:0);
+        j->y[j_out+3]=(float)(HSUM32(a3)-128*w_sums[j_out+3])*x_scale*scale[j_out+3]+(j->b?j->b[j_out+3]:0);
+        j->y[j_out+4]=(float)(HSUM32(a4)-128*w_sums[j_out+4])*x_scale*scale[j_out+4]+(j->b?j->b[j_out+4]:0);
+        j->y[j_out+5]=(float)(HSUM32(a5)-128*w_sums[j_out+5])*x_scale*scale[j_out+5]+(j->b?j->b[j_out+5]:0);
+        j->y[j_out+6]=(float)(HSUM32(a6)-128*w_sums[j_out+6])*x_scale*scale[j_out+6]+(j->b?j->b[j_out+6]:0);
+        j->y[j_out+7]=(float)(HSUM32(a7)-128*w_sums[j_out+7])*x_scale*scale[j_out+7]+(j->b?j->b[j_out+7]:0);
+        #undef HSUM32
+    }
+    for (; j_out < j->v_end; j_out++) {
+        const int8_t *w = q8_T + (size_t)j_out * in_dim;
+        __m256i acc32 = _mm256_setzero_si256();
+        for (int i = 0; i < in_dim; i += 32) {
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
+            acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(w+i))), ones));
+        }
+        #define HSUM32b(v) ({ __m128i _lo=_mm256_castsi256_si128(v), _hi=_mm256_extracti128_si256(v,1); __m128i _s=_mm_add_epi32(_lo,_hi); _s=_mm_hadd_epi32(_s,_s); _s=_mm_hadd_epi32(_s,_s); _mm_cvtsi128_si32(_s); })
+        j->y[j_out] = (float)(HSUM32b(acc32) - 128 * w_sums[j_out]) * x_scale * scale[j_out] + (j->b ? j->b[j_out] : 0);
+        #undef HSUM32b
+    }
+#else
+    /* Scalar fallback for non-AVX2 */
+    for (int j_out = j->v_start; j_out < j->v_end; j_out++) {
+        const int8_t *w = q8_T + (size_t)j_out * in_dim;
+        int32_t dot = 0;
+        for (int i = 0; i < in_dim; i++) dot += (int)(xq[i] - 128) * (int)w[i];
+        j->y[j_out] = (float)dot * x_scale * scale[j_out] + (j->b ? j->b[j_out] : 0);
+    }
+#endif
+    return NULL;
+}
+
 /* Pre-compute per-output sum of weights for zero-point removal (mistral.rs: avoid per-call overhead) */
 static void compute_w_sums(const int8_t *q8_T, int32_t *w_sums, int in_dim, int out_dim) {
     for (int j = 0; j < out_dim; j++) {
@@ -1276,6 +1358,55 @@ static void compute_w_sums(const int8_t *q8_T, int32_t *w_sums, int in_dim, int 
  * 2. x loaded once, shared across 8 outputs (register blocking)
  * 3. Pre-computed w_sums eliminates per-call overhead (zero-point removal)
  * 4x faster than single-output version. */
+/* Multi-threaded Q8 matmul dispatch: split out_dim across g_n_threads.
+ * Falls back to single-threaded matmul_q8 if n_threads <= 1. */
+static void matmul_q8_mt(float *y, const int8_t *q8_T, const float *scale,
+                         const int32_t *w_sums, const float *x, const float *b,
+                         int in_dim, int out_dim, int n_threads) {
+    if (n_threads <= 1 || out_dim < 4096) {
+        /* Single-threaded for small matrices or few cores.
+         * pthread overhead > parallel benefit when out_dim < 4096 or n_threads <= 1.
+         * amd64 (2 cores): always single-thread (42 tok/s, MT is slower).
+         * arm64 (8 cores): multi-thread for large matmuls (mlp_fc/proj). */
+        matmul_q8(y, q8_T, scale, w_sums, x, b, in_dim, out_dim);
+        return;
+    }
+    /* Quantize x once (shared across threads) */
+    float x_max = 0;
+    for (int i = 0; i < in_dim; i++) x_max = fmaxf(x_max, fabsf(x[i]));
+    float x_scale = x_max / 127.0f;
+    if (x_scale < 1e-8f) x_scale = 1e-8f;
+    static uint8_t xq[4096];
+    for (int i = 0; i < in_dim; i++) {
+        int v = (int)lroundf(x[i] / x_scale) + 128;
+        xq[i] = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+    }
+
+    pthread_t threads[8];
+    Q8MatmulJob jobs[8];
+    if (n_threads > 8) n_threads = 8;
+    int chunk = (out_dim + n_threads - 1) / n_threads;
+    for (int t = 0; t < n_threads; t++) {
+        jobs[t].y = y;
+        jobs[t].q8_T = q8_T;
+        jobs[t].scale = scale;
+        jobs[t].w_sums = w_sums;
+        jobs[t].x = x;
+        jobs[t].b = b;
+        jobs[t].in_dim = in_dim;
+        jobs[t].v_start = t * chunk;
+        jobs[t].v_end = (t + 1) * chunk;
+        jobs[t].xq = xq;
+        jobs[t].x_scale = x_scale;
+        if (jobs[t].v_start > out_dim) jobs[t].v_start = out_dim;
+        if (jobs[t].v_end > out_dim) jobs[t].v_end = out_dim;
+        if (jobs[t].v_end <= jobs[t].v_start) continue;
+        pthread_create(&threads[t], NULL, q8_matmul_worker, &jobs[t]);
+    }
+    for (int t = 0; t < n_threads; t++)
+        if (jobs[t].v_end > jobs[t].v_start) pthread_join(threads[t], NULL);
+}
+
 static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
                       const int32_t *w_sums, const float *x, const float *b,
                       int in_dim, int out_dim) {
@@ -2546,17 +2677,17 @@ static int gpt2_forward_token(int token_id, int position) {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
             }
             if (g_use_q4) matmul_q4(g_proj, L->q4_c_proj, L->q4_c_proj_s, L->q4_c_proj_ws, g_attn_out, L->c_proj_b, N_EMBD, N_EMBD);
-            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_proj, L->q8_c_proj, L->q8_c_proj_s, L->q8_w_sums[1], g_attn_out, L->c_proj_b, N_EMBD, N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8_mt(g_proj, L->q8_c_proj, L->q8_c_proj_s, L->q8_w_sums[1], g_attn_out, L->c_proj_b, N_EMBD, N_EMBD, g_n_threads);
             else matmul(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
             layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
             if (g_use_q4) matmul_q4(g_fc, L->q4_mlp_fc, L->q4_mlp_fc_s, L->q4_mlp_fc_ws, g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM);
-            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_fc, L->q8_mlp_fc, L->q8_mlp_fc_s, L->q8_w_sums[2], g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8_mt(g_fc, L->q8_mlp_fc, L->q8_mlp_fc_s, L->q8_w_sums[2], g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM, g_n_threads);
             else matmul(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
             for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
             if (g_use_q4) matmul_q4(g_mlp_out, L->q4_mlp_proj, L->q4_mlp_proj_s, L->q4_mlp_proj_ws, g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD);
-            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_mlp_out, L->q8_mlp_proj, L->q8_mlp_proj_s, L->q8_w_sums[3], g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8_mt(g_mlp_out, L->q8_mlp_proj, L->q8_mlp_proj_s, L->q8_w_sums[3], g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD, g_n_threads);
             else matmul(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
         }
