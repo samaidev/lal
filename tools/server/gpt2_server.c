@@ -164,6 +164,11 @@
 
 #include "runtime/lal_runtime.h"
 
+/* mmap loader (defined in lal_runtime.c) */
+extern Tensor *tensor_load_all_mmap(const char *path, int *n_tensors);
+extern void tensor_free_all_mmap(Tensor *tensors, int n);
+static int g_use_mmap = 0;  /* set when LAL_MMAP=1 */
+
 #define VOCAB_SIZE 50257
 
 /* Q4 per-row quantization: W [in,out] → q4_T [out, in/2] (packed 2 per byte) + scale[out] */
@@ -3576,7 +3581,15 @@ int main(int argc, char **argv) {
         const char *weight_path = getenv("LAL_WEIGHTS");
         if (!weight_path) weight_path = "prebuilt/gpt2_weights.bin";
 
-        g_tensors = tensor_load_all(weight_path, &g_n_tensors);
+        if (getenv("LAL_MMAP")) {
+            g_use_mmap = 1;
+            g_tensors = tensor_load_all_mmap(weight_path, &g_n_tensors);
+            printf("[*] mmap mode enabled (LAL_MMAP=1): weights are demand-paged,\n");
+            printf("    free-float-weights optimization is disabled in this mode.\n");
+            fflush(stdout);
+        } else {
+            g_tensors = tensor_load_all(weight_path, &g_n_tensors);
+        }
         if (!g_tensors) { fprintf(stderr, "[!] failed to load weights from %s\n", weight_path); return 1; }
     
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
@@ -3679,7 +3692,7 @@ int main(int argc, char **argv) {
          * want to free, free their data buffers, set pointers to NULL.
          * g_tensors itself is kept (small overhead, ~148 × sizeof(Tensor)).
          */
-        if (g_use_q8 || g_use_q4) {
+        if ((g_use_q8 || g_use_q4) && !g_use_mmap) {
             const char *free_keys[] = {
                 /* 12 layers × 4 weight matrices = 48 keys */
                 /* Filled in dynamically below since keys have layer index */
@@ -3761,8 +3774,11 @@ int main(int argc, char **argv) {
 
             /* Free float wte — embedding lookup will dequantize on-the-fly
              * from g_wte_q + g_wte_scale (recovers ~154 MB RSS).
-             * Only safe when g_wte_q is populated (Q8/Q4 modes). */
-            for (int ti = 0; ti < g_n_tensors; ti++) {
+             * Only safe when g_wte_q is populated (Q8/Q4 modes) AND not mmap. */
+            if (g_use_mmap) {
+                printf("[*] mmap mode: keeping float wte in page cache (no free)\n");
+                fflush(stdout);
+            } else for (int ti = 0; ti < g_n_tensors; ti++) {
                 if (g_tensors[ti].data && strcmp(g_tensors[ti].key, "wte.weight") == 0) {
                     free(g_tensors[ti].data);
                     g_tensors[ti].data = NULL;
