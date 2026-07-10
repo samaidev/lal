@@ -6,18 +6,117 @@ A high-performance CPU LLM inference runtime with Q8 per-row quantization (mistr
 
 ## Quick start
 
+> **Prerequisite**: weights must be downloaded separately — see [Setup](#setup) below.
+> The repo ships the binary + tokenizer, but **not** the 474 MB weights file.
+
 ```bash
-# Build (auto-detects OpenBLAS on x86, SDOT on arm64)
+# 1. Download weights (474 MB) — pick ONE method:
+#    a) GitHub Release (recommended, includes both binary + float weights)
+       curl -L -o prebuilt/gpt2_weights.bin \
+         https://github.com/samaidev/lal/releases/download/weights-v1/gpt2_weights.bin
+#    b) Build from HuggingFace (for network-restricted environments — see Setup)
+
+# 2. Build (auto-detects OpenBLAS on x86, SDOT on arm64)
 make server
 
-# Run (optimal config is DEFAULT — no flags needed)
-./prebuilt/gpt2_server                        # Q8: 42 tok/s, coherent, 27MB
+# 3. Run (optimal config is DEFAULT — no flags needed)
+./prebuilt/gpt2_server                        # Q8: 42 tok/s, coherent, 27MB weights
+./prebuilt/gpt2_server 8082                   # custom port (default 8080)
 
 # Optional modes (lower performance, kept for compatibility)
 ./prebuilt/gpt2_server --q8-mixed             # Layer 0+11 float: better quality, 21 tok/s
 ./prebuilt/gpt2_server --no-q8                # float: 6 tok/s, best quality, 108MB
 ./prebuilt/gpt2_server --q4                   # Q4: 49 tok/s, slight quality loss, 14MB
 ```
+
+
+## Setup
+
+### System requirements
+
+- **OS**: Linux x86_64 / arm64 / armv7, macOS (x86_64 / arm64)
+- **CPU**: AVX2 (x86) or NEON (ARM) required for SIMD acceleration
+- **RAM**: 1 GB free (peak RSS during inference: ~625 MB — see [Memory breakdown](#memory-breakdown))
+- **GLIBC**: >= 2.38 to run the prebuilt binary; >= 2.31 to build from source
+
+### Build dependencies
+
+```bash
+# Debian / Ubuntu
+apt-get install -y build-essential libopenblas-dev pkg-config
+
+# Fedora / RHEL
+dnf install -y gcc make openblas-devel pkgconfig
+
+# Alpine
+apk add build-base openblas-dev pkgconf
+```
+
+`libopenblas-dev` is **optional** — the Makefile auto-detects it via `pkg-config`. Without
+it, the server falls back to hand-written SIMD (still fast, ~2-3x slower on x86).
+
+### Weights
+
+The repo does **not** ship `prebuilt/gpt2_weights.bin` (474 MB). You must obtain it
+in one of two ways:
+
+#### Option A — Download the prebuilt file (recommended)
+
+```bash
+# From GitHub Releases (fastest if github.com is reachable)
+curl -L -o prebuilt/gpt2_weights.bin \
+  https://github.com/samaidev/lal/releases/download/weights-v1/gpt2_weights.bin
+
+# Verify: magic bytes should be "GPW2", file size 497,763,872 bytes
+head -c 4 prebuilt/gpt2_weights.bin   # -> GPW2
+ls -la prebuilt/gpt2_weights.bin      # -> 497763872 bytes
+```
+
+For faster multi-connection downloads, use `aria2c`:
+
+```bash
+aria2c -x 16 -s 16 -d prebuilt -o gpt2_weights.bin \
+  https://github.com/samaidev/lal/releases/download/weights-v1/gpt2_weights.bin
+```
+
+#### Option B — Convert from HuggingFace safetensors
+
+Use this when `github.com` is unreachable but `huggingface.co` mirrors are. Tested
+on a cloud container where `github.com` was blocked but `hf-mirror.com` worked.
+
+```bash
+# 1. Download GPT-2 safetensors from a HF mirror
+aria2c -x 16 -s 16 -d /tmp -o gpt2.safetensors \
+  https://hf-mirror.com/openai-community/gpt2/resolve/main/model.safetensors
+# Expected size: 548,105,171 bytes (522 MiB)
+
+# 2. Convert safetensors -> GPW2 format (drops 12 attn.bias buffers)
+python3 scripts/convert_safetensors_to_gpw2.py /tmp/gpt2.safetensors prebuilt/gpt2_weights.bin
+# Expected output: 148 tensors, 497,763,872 bytes (matches official release byte-for-byte)
+```
+
+The conversion script lives at `scripts/convert_safetensors_to_gpw2.py`. If it does
+not exist yet in your checkout, see [scripts/](scripts/) or write it inline — the
+format is documented in `tools/export_gpt2_weights.py`.
+
+### Memory breakdown
+
+The "27 MB" headline figure refers to **Q8-quantized weight memory only**. Actual
+process RSS at steady state on amd64 is roughly:
+
+| Component | Size |
+|---|---|
+| Float weights (loaded then Q8-quantized at startup) | 474 MB |
+| Q8 quantized weights (live during inference) | 27 MB |
+| int8 LM head + scales | 37 MB |
+| KV cache (real causal attention, 1024 ctx x 12 layers x 2 x 768) | 72 MB |
+| Tokenizer hash table (50257 entries) | ~4 MB |
+| OpenBLAS thread state + buffers | ~10 MB |
+| **Peak RSS** | **~625 MB** |
+
+If you need lower memory, use `--q4` (Q4 weights, ~14 MB) or run with
+`--no-q8` disabled and explicitly free float weights after Q8 quantization
+(not currently done — see [Known limitations](#known-limitations)).
 
 ## Default optimizations (no flags needed)
 
@@ -199,8 +298,103 @@ lal/
 └── prebuilt/                # Pre-built binaries
 ```
 
+## Troubleshooting
+
+### `GLIBC_2.38 not found` when running the prebuilt binary
+
+The prebuilt `prebuilt/gpt2_server` is compiled against glibc 2.38. On older
+distros (e.g. Debian 12 / bookworm ships glibc 2.36), `ldd` reports:
+
+```
+prebuilt/gpt2_server: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+```
+
+**Fix**: rebuild from source — the source builds cleanly on glibc 2.31+:
+
+```bash
+apt-get install -y build-essential libopenblas-dev pkg-config
+make server   # overwrites prebuilt/gpt2_server with a locally-built binary
+```
+
+### `error: static declaration of matmul_q8 follows non-static declaration`
+
+This was a source bug fixed in commit `a79f8db`. If you encounter it, you are
+on a checkout older than the fix. Update, or apply the forward declaration
+manually — see the commit message for details.
+
+### `bind: Address already in use`
+
+The default port 8080 is taken. Pass a custom port as the first argument:
+
+```bash
+./prebuilt/gpt2_server 8082           # use port 8082
+./prebuilt/gpt2_server 9000           # use port 9000
+```
+
+### Weights download is extremely slow (single-digit KB/s)
+
+GitHub Release CDN rate-limits aggressively from some cloud providers.
+Workarounds, in order of preference:
+
+1. Use `aria2c -x 16 -s 16` for multi-connection download (16x speedup typical)
+2. Switch to a HuggingFace mirror — see [Option B under Setup](#option-b--convert-from-huggingface-safetensors)
+3. Wait — the throttle usually lifts after a few minutes of idle time
+
+### `github.com` is unreachable, but `api.github.com` works
+
+This is common in some cloud containers (e.g. Alibaba Cloud, where
+`github.com` resolves but TCP resets, yet `api.github.com`, `codeload.github.com`,
+and `objects.githubusercontent.com` are reachable). Workarounds:
+
+- **Source code**: download the tarball via the API:
+  ```bash
+  curl -L -o lal.tar.gz \
+    https://api.github.com/repos/samaidev/lal/tarball/main
+  ```
+- **Weights**: download via the asset API (redirects to `objects.githubusercontent.com`):
+  ```bash
+  curl -L -H "Accept: application/octet-stream" -o prebuilt/gpt2_weights.bin \
+    https://api.github.com/repos/samaidev/lal/releases/assets/468875704
+  ```
+
+### Server starts but generation produces word-salad
+
+Likely causes:
+
+1. **Bad weights file** — verify magic bytes are `GPW2` and size is `497,763,872`.
+   If you used `aria2c` and interrupted it, the file may be a sparse file with
+   zero gaps. Re-download.
+2. **Greedy decoding (temperature=0)** — GPT-2 124M degenerates into repetition
+   loops under greedy decoding. This is a model-size limitation, not a LAL bug.
+   Use the default `temperature=0.8, top_k=40` for coherent sampling.
+3. **Wrong tokenizer** — `prebuilt/gpt2_tokenizer.bin` must match the weights.
+   Re-download from the same release.
+
+## Known limitations
+
+- **GPT-2 124M is small**. Even with perfect quantization, it cannot answer
+  factual questions reliably (e.g. "capital of France" -> wrong answers). Use it
+  for short-form creative text completion, not for Q&A. The 27 MB / 42 tok/s
+  numbers are about **runtime efficiency**, not model capability.
+- **Greedy decoding loops**. Under `temperature=0`, GPT-2 124M falls into
+  repetition within ~10 tokens. This is intrinsic to the model. The default
+  sampling parameters (`temperature=0.8, top_k=40, rep_penalty=1.1`) mitigate
+  this; keep them on.
+- **Float weights remain in memory after Q8 quantization**. The startup path
+  loads 474 MB of float weights, quantizes them to Q8 (27 MB), but does not
+  free the float copy. Peak RSS is therefore ~625 MB even though the steady-state
+  inference only needs ~150 MB. Fixing this is a one-line `free()` — see `main()`
+  in `tools/server/gpt2_server.c`.
+- **No GPU support**. This is a CPU-only runtime by design. For GPU inference,
+  use `llama.cpp` or `mistral.rs`.
+- **Single-user server**. The HTTP server is single-threaded (per-request).
+  Concurrent requests serialize. For multi-user deployment, front it with a
+  queue or run multiple instances behind a load balancer.
+
 ## Recent fixes
 
+- **`matmul_q8` forward declaration**: gcc 12+ rejects the source because `matmul_q8_mt`
+  calls `matmul_q8` before its definition. Added a static forward declaration.
 - **Q8 NEON zero-point fix**: vsubq_s8 removes zero-point (was garbled on ARM)
 - **ARMv7 NEON path**: added vmull_s8 + manual hadd (was using AVX2 stubs = zeros)
 - **LM head multi-thread crash fix**: `n_embd` field was never set in job struct
