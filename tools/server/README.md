@@ -26,9 +26,12 @@ So the server uses the **float path** with **AVX2+FMA SIMD** to recover as much 
 ## Build & run
 
 ```bash
-# from repo root
+# from repo root — using the Makefile (auto-detects OpenBLAS)
+make server
+
+# or, build directly
 gcc -O3 -mavx2 -mfma -o prebuilt/gpt2_server \
-    tools/server/gpt2_server.c runtime/lal_runtime.c -lm
+    tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread
 
 ./prebuilt/gpt2_server          # serves on :8080
 ./prebuilt/gpt2_server 9000     # custom port
@@ -36,7 +39,24 @@ gcc -O3 -mavx2 -mfma -o prebuilt/gpt2_server \
 
 Open `http://localhost:8080`.
 
+### Compatibility notes
+
+- **GLIBC**: the prebuilt binary in `prebuilt/gpt2_server` requires GLIBC ≥ 2.38.
+  On older systems (e.g. Debian 12 ships 2.36), rebuild from source — see the
+  top-level [README troubleshooting section](../../README.md#troubleshooting).
+- **Port conflicts**: if port 8080 is taken (common in cloud containers that
+  run other agents on 8080/8090), pass a custom port as the first arg.
+- **Weights**: the server loads `prebuilt/gpt2_weights.bin` (474 MB) at startup.
+  This file is **not** in the repo — see [Setup](../../README.md#setup) for
+  download instructions.
+- **OpenBLAS**: optional but recommended (~2-3x speedup on float ops). The
+  Makefile auto-detects it via `pkg-config`. Without it, the server uses
+  hand-written AVX2 SIMD.
+
 ## API
+
+> The server listens on `localhost:8080` by default (override with the first
+> CLI argument). All endpoints accept JSON and return JSON.
 
 | Route | Method | Body | Response |
 |-------|--------|------|----------|
@@ -52,9 +72,14 @@ curl -X POST http://localhost:8080/generate \
 
 ## Architecture note (quality vs. speed)
 
-Both this server and the binary runtime use **simplified attention**: `attn_out = V` (no actual QK softmax). This is a known limitation of the current LAL runtime — see `runtime/lal_runtime.c:224`. It's why the model degenerates to repetition ("fox fox fox ...") on long prompts.
+The server implements **real causal self-attention** with a multi-head QK softmax
+and a head-major KV cache (72 MB for 1024 ctx × 12 layers × 2 × 768). This
+replaced an earlier `attn_out = V` simplification that caused repetition loops
+on long prompts. Real attention is enabled by default; the legacy V-copy path
+is kept behind `--vcopy` for benchmark comparison only.
 
-To fix quality without changing speed, the next step is implementing real causal self-attention with a KV cache in `trans_layer_forward`. The SIMD matmul infrastructure in this file is reusable for that.
+Residual repetition under `temperature=0` is now intrinsic to GPT-2 124M (not
+a runtime artifact) — see [Known limitations](../../README.md#known-limitations).
 
 ## Files
 
