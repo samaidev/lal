@@ -1358,6 +1358,14 @@ static void compute_w_sums(const int8_t *q8_T, int32_t *w_sums, int in_dim, int 
  * 2. x loaded once, shared across 8 outputs (register blocking)
  * 3. Pre-computed w_sums eliminates per-call overhead (zero-point removal)
  * 4x faster than single-output version. */
+/* Forward declaration: matmul_q8_mt (below) calls matmul_q8 (defined further
+ * down). Without this, gcc 12+ rejects the file with
+ *   error: static declaration of 'matmul_q8' follows non-static declaration
+ * because the implicit first declaration is non-static. */
+static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
+                      const int32_t *w_sums, const float *x, const float *b,
+                      int in_dim, int out_dim);
+
 /* Multi-threaded Q8 matmul dispatch: split out_dim across g_n_threads.
  * Falls back to single-threaded matmul_q8 if n_threads <= 1. */
 static void matmul_q8_mt(float *y, const int8_t *q8_T, const float *scale,
