@@ -434,6 +434,7 @@ static int g_binary_mode = 0;   /* set by --binary flag */
 static int g_use_bwn = 0;
 static int g_use_q8 = 1;       /* DEFAULT: 8-bit per-row quantization (34 tok/s, coherent, 27MB) */
 static int g_use_q4 = 0;       /* --q4: 4-bit per-row quantization (faster, 2x less mem, slight quality loss) */
+static int g_q8_mixed = 0;     /* --q8-mixed: keep layer 0 and 11 in float, middle in Q8 */
 static int g_use_rsign = 0;      /* --rsign: BNN with RSign (shift threshold to mean) */       /* --bwn: BWN mode (float x @ sign(w), training-consistent) */
 static int g_use_int8 = 0;      /* --int8: BWN with int8 activation quantization (2-9x speedup) */
 static int g_mixed_int8_layers = 0;  /* --mixed-int8 N: first N layers int8, rest BWN. 0=all-int8 */
@@ -2516,7 +2517,7 @@ static int gpt2_forward_token(int token_id, int position) {
 
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             if (g_use_q4) matmul_q4(g_qkv, L->q4_c_attn, L->q4_c_attn_s, L->q4_c_attn_ws, g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
-            else if (g_use_q8) matmul_q8(g_qkv, L->q8_c_attn, L->q8_c_attn_s, L->q8_w_sums[0], g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_qkv, L->q8_c_attn, L->q8_c_attn_s, L->q8_w_sums[0], g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
             else matmul(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
             /* Attention: dflash > real_attention_simd > real_attention > V-copy */
@@ -2531,17 +2532,17 @@ static int gpt2_forward_token(int token_id, int position) {
                 memcpy(g_attn_out, g_qkv + 2*N_EMBD, N_EMBD * sizeof(float));
             }
             if (g_use_q4) matmul_q4(g_proj, L->q4_c_proj, L->q4_c_proj_s, L->q4_c_proj_ws, g_attn_out, L->c_proj_b, N_EMBD, N_EMBD);
-            else if (g_use_q8) matmul_q8(g_proj, L->q8_c_proj, L->q8_c_proj_s, L->q8_w_sums[1], g_attn_out, L->c_proj_b, N_EMBD, N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_proj, L->q8_c_proj, L->q8_c_proj_s, L->q8_w_sums[1], g_attn_out, L->c_proj_b, N_EMBD, N_EMBD);
             else matmul(g_proj, g_attn_out, L->c_proj_w, L->c_proj_b, N_EMBD, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
             layer_norm_simd(g_ln2, g_x, L->ln2_w, L->ln2_b, N_EMBD);
             if (g_use_q4) matmul_q4(g_fc, L->q4_mlp_fc, L->q4_mlp_fc_s, L->q4_mlp_fc_ws, g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM);
-            else if (g_use_q8) matmul_q8(g_fc, L->q8_mlp_fc, L->q8_mlp_fc_s, L->q8_w_sums[2], g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_fc, L->q8_mlp_fc, L->q8_mlp_fc_s, L->q8_w_sums[2], g_ln2, L->mlp_fc_b, N_EMBD, MLP_DIM);
             else matmul(g_fc, g_ln2, L->mlp_fc_w, L->mlp_fc_b, N_EMBD, MLP_DIM);
             for (int i = 0; i < MLP_DIM; i++) g_fc[i] = gelu_fast(g_fc[i]);
             if (g_use_q4) matmul_q4(g_mlp_out, L->q4_mlp_proj, L->q4_mlp_proj_s, L->q4_mlp_proj_ws, g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD);
-            else if (g_use_q8) matmul_q8(g_mlp_out, L->q8_mlp_proj, L->q8_mlp_proj_s, L->q8_w_sums[3], g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_mlp_out, L->q8_mlp_proj, L->q8_mlp_proj_s, L->q8_w_sums[3], g_fc, L->mlp_proj_b, MLP_DIM, N_EMBD);
             else matmul(g_mlp_out, g_fc, L->mlp_proj_w, L->mlp_proj_b, MLP_DIM, N_EMBD);
             for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
         }
@@ -3139,6 +3140,9 @@ int main(int argc, char **argv) {
             g_use_q8 = 0;  /* disable Q8, use full float */
         } else if (strcmp(argv[i], "--q4") == 0) {
             g_use_q4 = 1; g_use_q8 = 0;
+        } else if (strcmp(argv[i], "--q8-mixed") == 0) {
+            /* Mixed: layer 0 + 11 float, layers 1-10 Q8 */
+            g_q8_mixed = 1; g_use_q8 = 1;
             printf("[*] Q4 mode: 4-bit per-row (faster, 14MB, correlation 0.998)\n");  /* 4-bit (faster, less mem, slight quality loss) */
         } else if (strcmp(argv[i], "--rsign") == 0) {
             fprintf(stderr, "[!] --rsign is DEPRECATED: BNN variant, garbled output.\n");
@@ -3295,6 +3299,7 @@ int main(int argc, char **argv) {
     
     printf("[*] loaded %d tensors\n", g_n_tensors); fflush(stdout);
     if (g_use_q8 && !g_use_q4) printf("[*] Q8 mode: 8-bit per-row quantization (default, %d tok/s, 27MB)\n", 34);
+    if (g_q8_mixed) printf("[*] Q8-mixed: layer 0 and %d in float, layers 1-%d in Q8 (better quality)\n", N_LAYER-1, N_LAYER-2);
     /* Auto-enable int8 LM head for Q8/Q4 modes — LM head (50257x768) is the
      * biggest bottleneck. Quantizing it to int8 gives 4x speedup on that layer. */
     if ((g_use_q8 || g_use_q4) && !g_use_lm_head_int8) {
