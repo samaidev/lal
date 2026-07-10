@@ -370,6 +370,7 @@ static float *g_ln_f_w, *g_ln_f_b;
  * Orthogonal to --prune-vocab (drops rows) and --turboquant (quantizes
  * KV cache, a different tensor) — all three can stack. */
 static int8_t *g_wte_q;          /* [vocab, n_embd] int8, quantized at load */
+static int32_t *g_wte_q_sums;    /* [vocab] pre-computed sum(w) for maddubs zero-point */
 static float  *g_wte_scale;      /* [vocab] per-row scale = max|row|/127 */
 static int     g_use_lm_head_int8 = 0;  /* set by --lm-head-int8 */
 
@@ -1787,22 +1788,22 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
         const int8_t *wv = wq + (size_t)v * n_embd;
         int dot = 0;
 #if defined(__AVX2__)
+        /* Optimized: VPMADDUBSW (uint8×int8→int16) like Q8 matmul.
+         * xq is signed int8[-127,127]; add 128 → uint8[1,255] for maddubs.
+         * Then subtract 128*w_sum to remove zero-point. */
+        static uint8_t xq_u[4096];
+        for (int i = 0; i < n_embd; i++) {
+            int v = (int)xq[i] + 128;
+            xq_u[i] = (uint8_t)(v > 255 ? 255 : v);
+        }
+        __m256i ones = _mm256_set1_epi16(1);
         __m256i acc = _mm256_setzero_si256();
         int i = 0;
         for (; i + 32 <= n_embd; i += 32) {
-            /* 16 int8 → 16 int16 → 8 int32 (pairwise products summed). */
-            __m128i xa = _mm_loadu_si128((const __m128i *)(xq + i));
-            __m128i wa = _mm_loadu_si128((const __m128i *)(wv + i));
-            __m256i x16 = _mm256_cvtepi8_epi16(xa);
-            __m256i w16 = _mm256_cvtepi8_epi16(wa);
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16, w16));
-            __m128i xb = _mm_loadu_si128((const __m128i *)(xq + i + 16));
-            __m128i wb = _mm_loadu_si128((const __m128i *)(wv + i + 16));
-            __m256i x16b = _mm256_cvtepi8_epi16(xb);
-            __m256i w16b = _mm256_cvtepi8_epi16(wb);
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16b, w16b));
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq_u + i));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(wv + i))), ones));
         }
-        dot = hsum_epi32(acc);
+        dot = hsum_epi32(acc) - 128 * g_wte_q_sums[v];
         for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
 #elif defined(__aarch64__) && defined(__ARM_NEON)
         /* NEON SDOT: 16 int8 × 16 int8 → 4 int32 per instruction */
@@ -3417,9 +3418,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[!] OOM allocating int8 LM head cache; disabling --lm-head-int8\n");
             g_use_lm_head_int8 = 0;
         } else {
+            g_wte_q_sums = malloc(VOCAB_SIZE * sizeof(int32_t));
             for (int v = 0; v < VOCAB_SIZE; v++) {
                 const float *row = g_wte + (size_t)v * N_EMBD;
                 g_wte_scale[v] = lm_head_quantize_x(row, g_wte_q + (size_t)v * N_EMBD, N_EMBD);
+                /* Pre-compute sum(w) for maddubs zero-point removal */
+                int32_t s = 0;
+                const int8_t *wv = g_wte_q + (size_t)v * N_EMBD;
+                for (int i = 0; i < N_EMBD; i++) s += wv[i];
+                g_wte_q_sums[v] = s;
             }
             clock_gettime(CLOCK_MONOTONIC, &tq1);
             double qt = (tq1.tv_sec - tq0.tv_sec) + (tq1.tv_nsec - tq0.tv_nsec) * 1e-9;
