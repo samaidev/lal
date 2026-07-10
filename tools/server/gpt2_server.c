@@ -1366,6 +1366,88 @@ static void matmul_q8(float *y, const int8_t *q8_T, const float *scale,
                       const int32_t *w_sums, const float *x, const float *b,
                       int in_dim, int out_dim);
 
+/* === mistral.rs sign-trick Q8 matmul (faster than the +128 trick) ===
+ *
+ * mistral.rs / llama.cpp use _mm256_sign_epi8 to convert int8-pair-dot
+ * into uint8-x-int8 for VPMADDUBSW, avoiding the +128 offset and the
+ * per-output zero-point subtraction. Faster on AVX2 because:
+ *   - x quantization: 1 fewer add per element (no +128)
+ *   - kernel: 2 sign_epi8 per 32-byte chunk, but no -128*w_sums at end
+ *   - memory: no w_sums array needed
+ *
+ * The trick:
+ *   ax = sign_epi8(x, x)   // |x|, in uint8 range [0, 127]
+ *   sw = sign_epi8(w, x)   // sign(x) * w, still int8 range
+ *   maddubs(ax, sw)        // uint8 x int8 -> int16 (correct sign)
+ *   madd_epi16(...)        // int16 pairs -> int32
+ * Result: dot = sum_i x[i] * w[i], no offset correction needed.
+ */
+#if defined(__AVX2__)
+static void matmul_q8_st(float *y, const int8_t *q8_T, const float *scale,
+                         const float *x, const float *b,
+                         int in_dim, int out_dim) {
+    /* Quantize x to int8 directly (no +128 offset) */
+    float x_max = 0;
+    for (int i = 0; i < in_dim; i++) x_max = fmaxf(x_max, fabsf(x[i]));
+    float x_scale = x_max / 127.0f;
+    if (x_scale < 1e-8f) x_scale = 1e-8f;
+    int8_t xq[4096] __attribute__((aligned(32)));
+    float inv = 1.0f / x_scale;
+    for (int i = 0; i < in_dim; i++) {
+        int v = (int)lroundf(x[i] * inv);
+        xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+    }
+
+    __m256i ones = _mm256_set1_epi16(1);
+    int j = 0;
+    /* 8-output parallel: 8 accumulators in registers, x loaded once per chunk */
+    for (; j + 8 <= out_dim; j += 8) {
+        const int8_t *w0=q8_T+(size_t)(j+0)*in_dim, *w1=q8_T+(size_t)(j+1)*in_dim;
+        const int8_t *w2=q8_T+(size_t)(j+2)*in_dim, *w3=q8_T+(size_t)(j+3)*in_dim;
+        const int8_t *w4=q8_T+(size_t)(j+4)*in_dim, *w5=q8_T+(size_t)(j+5)*in_dim;
+        const int8_t *w6=q8_T+(size_t)(j+6)*in_dim, *w7=q8_T+(size_t)(j+7)*in_dim;
+        __m256i a0=_mm256_setzero_si256(),a1=_mm256_setzero_si256();
+        __m256i a2=_mm256_setzero_si256(),a3=_mm256_setzero_si256();
+        __m256i a4=_mm256_setzero_si256(),a5=_mm256_setzero_si256();
+        __m256i a6=_mm256_setzero_si256(),a7=_mm256_setzero_si256();
+        for (int i = 0; i < in_dim; i += 32) {
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
+            __m256i ax = _mm256_sign_epi8(xv, xv);
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w0+i)), xv)), ones));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w1+i)), xv)), ones));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w2+i)), xv)), ones));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w3+i)), xv)), ones));
+            a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w4+i)), xv)), ones));
+            a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w5+i)), xv)), ones));
+            a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w6+i)), xv)), ones));
+            a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w7+i)), xv)), ones));
+        }
+        #define HSUM32_ST(v) ({ __m128i _lo=_mm256_castsi256_si128(v), _hi=_mm256_extracti128_si256(v,1); __m128i _s=_mm_add_epi32(_lo,_hi); _s=_mm_hadd_epi32(_s,_s); _s=_mm_hadd_epi32(_s,_s); _mm_cvtsi128_si32(_s); })
+        y[j+0]=(float)(HSUM32_ST(a0))*x_scale*scale[j+0]+(b?b[j+0]:0);
+        y[j+1]=(float)(HSUM32_ST(a1))*x_scale*scale[j+1]+(b?b[j+1]:0);
+        y[j+2]=(float)(HSUM32_ST(a2))*x_scale*scale[j+2]+(b?b[j+2]:0);
+        y[j+3]=(float)(HSUM32_ST(a3))*x_scale*scale[j+3]+(b?b[j+3]:0);
+        y[j+4]=(float)(HSUM32_ST(a4))*x_scale*scale[j+4]+(b?b[j+4]:0);
+        y[j+5]=(float)(HSUM32_ST(a5))*x_scale*scale[j+5]+(b?b[j+5]:0);
+        y[j+6]=(float)(HSUM32_ST(a6))*x_scale*scale[j+6]+(b?b[j+6]:0);
+        y[j+7]=(float)(HSUM32_ST(a7))*x_scale*scale[j+7]+(b?b[j+7]:0);
+        #undef HSUM32_ST
+    }
+    for (; j < out_dim; j++) {
+        const int8_t *w = q8_T + (size_t)j * in_dim;
+        __m256i acc32 = _mm256_setzero_si256();
+        for (int i = 0; i < in_dim; i += 32) {
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
+            __m256i ax = _mm256_sign_epi8(xv, xv);
+            acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w+i)), xv)), ones));
+        }
+        #define HSUM32_ST_T(v) ({ __m128i _lo=_mm256_castsi256_si128(v), _hi=_mm256_extracti128_si256(v,1); __m128i _s=_mm_add_epi32(_lo,_hi); _s=_mm_hadd_epi32(_s,_s); _s=_mm_hadd_epi32(_s,_s); _mm_cvtsi128_si32(_s); })
+        y[j] = (float)(HSUM32_ST_T(acc32)) * x_scale * scale[j] + (b ? b[j] : 0);
+        #undef HSUM32_ST_T
+    }
+}
+#endif  /* __AVX2__ */
+
 /* Multi-threaded Q8 matmul dispatch: split out_dim across g_n_threads.
  * Falls back to single-threaded matmul_q8 if n_threads <= 1. */
 static void matmul_q8_mt(float *y, const int8_t *q8_T, const float *scale,
@@ -1376,7 +1458,12 @@ static void matmul_q8_mt(float *y, const int8_t *q8_T, const float *scale,
          * pthread overhead > parallel benefit when out_dim < 4096 or n_threads <= 1.
          * amd64 (2 cores): always single-thread (42 tok/s, MT is slower).
          * arm64 (8 cores): multi-thread for large matmuls (mlp_fc/proj). */
+#if defined(__AVX2__)
+        /* mistral.rs sign-trick path: faster, no zero-point correction */
+        matmul_q8_st(y, q8_T, scale, x, b, in_dim, out_dim);
+#else
         matmul_q8(y, q8_T, scale, w_sums, x, b, in_dim, out_dim);
+#endif
         return;
     }
     /* Quantize x once (shared across threads) */
@@ -1923,26 +2010,41 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
                                int v_start, int v_end, int n_embd) {
     const int8_t *wq = g_wte_q;
     const float  *ws = g_wte_scale;
+#if defined(__AVX2__)
+    /* Hoist xq sign-trick prep out of the per-v loop:
+     *   ax = |xq| (uint8), computed once per call (not per v).
+     * Old code recomputed xq_u 50257 times per token (768 bytes each = 38 MB
+     * of redundant work per token). */
+    static uint8_t ax[4096] __attribute__((aligned(32)));
+    static int8_t  sx[4096] __attribute__((aligned(32)));  /* sign(xq) for sign_epi8 */
+    __m256i xq_vec;
+    for (int i = 0; i < n_embd; i += 32) {
+        xq_vec = _mm256_loadu_si256((__m256i*)(xq + i));
+        /* |xq| as uint8: sign_epi8(x, x) gives |x| (interpreted as uint8) */
+        __m256i abs_xq = _mm256_sign_epi8(xq_vec, xq_vec);
+        _mm256_storeu_si256((__m256i*)(ax + i), abs_xq);
+        /* sign(xq) byte: sign_epi8(ones, xq) gives +1 / -1 / 0 per byte */
+        __m256i ones_v = _mm256_set1_epi8(1);
+        __m256i sign_xq = _mm256_sign_epi8(ones_v, xq_vec);
+        _mm256_storeu_si256((__m256i*)(sx + i), sign_xq);
+    }
+    __m256i ones = _mm256_set1_epi16(1);
+#endif
     for (int v = v_start; v < v_end; v++) {
         const int8_t *wv = wq + (size_t)v * n_embd;
         int dot = 0;
 #if defined(__AVX2__)
-        /* Optimized: VPMADDUBSW (uint8×int8→int16) like Q8 matmul.
-         * xq is signed int8[-127,127]; add 128 → uint8[1,255] for maddubs.
-         * Then subtract 128*w_sum to remove zero-point. */
-        static uint8_t xq_u[4096];
-        for (int i = 0; i < n_embd; i++) {
-            int v = (int)xq[i] + 128;
-            xq_u[i] = (uint8_t)(v > 255 ? 255 : v);
-        }
-        __m256i ones = _mm256_set1_epi16(1);
+        /* Sign-trick: maddubs(|xq|, sign(xq)*wv) = sum_i xq[i] * wv[i]
+         * No -128*w_sum zero-point subtraction needed. */
         __m256i acc = _mm256_setzero_si256();
         int i = 0;
         for (; i + 32 <= n_embd; i += 32) {
-            __m256i xv = _mm256_loadu_si256((__m256i*)(xq_u + i));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, _mm256_loadu_si256((__m256i*)(wv + i))), ones));
+            __m256i ax_v = _mm256_loadu_si256((__m256i*)(ax + i));
+            __m256i sw_v = _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(wv + i)),
+                                            _mm256_loadu_si256((__m256i*)(xq + i)));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, sw_v), ones));
         }
-        dot = hsum_epi32(acc) - 128 * g_wte_q_sums[v];
+        dot = hsum_epi32(acc);
         for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
 #elif defined(__aarch64__) && defined(__ARM_NEON)
         /* NEON SDOT: 16 int8 × 16 int8 → 4 int32 per instruction */
@@ -2688,7 +2790,13 @@ static int gpt2_forward_token(int token_id, int position) {
 
             layer_norm_simd(g_ln1, g_x, L->ln1_w, L->ln1_b, N_EMBD);
             if (g_use_q4) matmul_q4(g_qkv, L->q4_c_attn, L->q4_c_attn_s, L->q4_c_attn_ws, g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
-            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) matmul_q8(g_qkv, L->q8_c_attn, L->q8_c_attn_s, L->q8_w_sums[0], g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
+            else if (g_use_q8 && !(g_q8_mixed && (l == 0 || l == N_LAYER-1))) {
+#if defined(__AVX2__)
+                matmul_q8_st(g_qkv, L->q8_c_attn, L->q8_c_attn_s, g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
+#else
+                matmul_q8(g_qkv, L->q8_c_attn, L->q8_c_attn_s, L->q8_w_sums[0], g_ln1, L->c_attn_b, N_EMBD, 3*N_EMBD);
+#endif
+            }
             else matmul(g_qkv, g_ln1, L->c_attn_w, L->c_attn_b, N_EMBD, 3*N_EMBD);
 
             /* Attention: dflash > real_attention_simd > real_attention > V-copy */
