@@ -25,6 +25,9 @@
 
 #include "runtime/lal_runtime.h"
 
+#define XQ_MAX 4864
+#include "runtime/lal_q8_kernel.h"
+
 /* ========================================================================
  * Qwen2.5-0.5B Config
  * ======================================================================== */
@@ -533,35 +536,9 @@ typedef struct {
 
 static void *lm_head_int8_worker(void *arg) {
     LmHeadJob *j = (LmHeadJob *)arg;
-    const int8_t *xq = j->xq;
-    float scale_x = j->scale_x;
-    float *logits = j->logits;
-    int n_embd = j->n_embd;
-    for (int v = j->v_start; v < j->v_end; v++) {
-        const int8_t *wv = g_wte_q + (size_t)v * n_embd;
-        int dot = 0;
-#if defined(__AVX2__)
-        __m256i acc = _mm256_setzero_si256();
-        int i = 0;
-        for (; i + 32 <= n_embd; i += 32) {
-            __m128i xa = _mm_loadu_si128((const __m128i *)(xq + i));
-            __m128i wa = _mm_loadu_si128((const __m128i *)(wv + i));
-            __m256i x16 = _mm256_cvtepi8_epi16(xa);
-            __m256i w16 = _mm256_cvtepi8_epi16(wa);
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16, w16));
-            __m128i xb = _mm_loadu_si128((const __m128i *)(xq + i + 16));
-            __m128i wb = _mm_loadu_si128((const __m128i *)(wv + i + 16));
-            __m256i x16b = _mm256_cvtepi8_epi16(xb);
-            __m256i w16b = _mm256_cvtepi8_epi16(wb);
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16b, w16b));
-        }
-        dot = hsum_epi32_avx(acc);
-        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
-#else
-        for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
-#endif
-        logits[v] = scale_x * g_wte_scale[v] * (float)dot;
-    }
+    lal_lm_head_int8_range(j->logits, j->xq, j->scale_x,
+                           g_wte_q, g_wte_scale,
+                           j->v_start, j->v_end, j->n_embd);
     return NULL;
 }
 
@@ -794,15 +771,15 @@ static int forward(int tok, int pos) {
         /* Pre-attn RMSNorm */
         qwen_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
         /* Q/K/V projections */
-        matmul_q8(g_q, L->q8_q, L->s_q, L->ws_q, g_ln, L->q_bias, N_EMBD, N_EMBD);
-        matmul_q8(g_k, L->q8_k, L->s_k, L->ws_k, g_ln, L->k_bias, N_EMBD, 128);
-        matmul_q8(g_v, L->q8_v, L->s_v, L->ws_v, g_ln, L->v_bias, N_EMBD, 128);
+        lal_matmul_q8_signtrick(g_q, L->q8_q, L->s_q, g_ln, L->q_bias, N_EMBD, N_EMBD);
+        lal_matmul_q8_signtrick(g_k, L->q8_k, L->s_k, g_ln, L->k_bias, N_EMBD, 128);
+        lal_matmul_q8_signtrick(g_v, L->q8_v, L->s_v, g_ln, L->v_bias, N_EMBD, 128);
         /* RoPE (precomputed table) */
         qwen_rope(g_q, g_k, pos, N_HEAD, N_KV_HEAD, HEAD_DIM);
         /* GQA (zero-malloc) */
         gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
         /* O proj + residual */
-        matmul_q8(g_proj, L->q8_o, L->s_o, L->ws_o, g_attn_out, NULL, N_EMBD, N_EMBD);
+        lal_matmul_q8_signtrick(g_proj, L->q8_o, L->s_o, g_attn_out, NULL, N_EMBD, N_EMBD);
         for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
 
         /* Pre-MLP RMSNorm */
