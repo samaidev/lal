@@ -11,7 +11,7 @@
  *
  * Build: make qwen-server
  * Run:   ./qwen_server --weights prebuilt/qwen_weights.bin \
- *            --tokenizer prebuilt/qwen_tokenizer --prompt "Hello" --n 20 [--threads 2]
+ *            --tokenizer prebuilt/qwen_tokenizer --prompt "Hello" --n 20 [--threads 2] [--temp 0.8] [--top-k 40] [--rep-penalty 1.1]
  */
 #define _POSIX_C_SOURCE 199309L
 #define _GNU_SOURCE
@@ -296,6 +296,74 @@ static int8_t  *g_wte_q;      /* [VOCAB_SIZE * N_EMBD] quantized wte */
 static float   *g_wte_scale;  /* [VOCAB_SIZE] per-row scales */
 static int g_n_threads = 1;
 
+/* Sampling parameters (mistral.rs / GPT-2 style) */
+static float g_temperature = 0.8f;
+static int   g_top_k = 40;
+static float g_rep_penalty = 1.1f;
+static int   g_recent_tokens[256];
+static int   g_n_recent = 0;
+
+/* Sample next token from g_logits using temperature + top-k + rep_penalty.
+ * Returns token id. If temperature==0, falls back to argmax. */
+static int sample_next_token(void) {
+    if (g_temperature <= 0.0f || g_top_k <= 0) {
+        /* Argmax (greedy) */
+        int best = 0;
+        for (int v = 1; v < VOCAB_SIZE; v++)
+            if (g_logits[v] > g_logits[best]) best = v;
+        return best;
+    }
+
+    /* Apply repetition penalty to recent tokens */
+    if (g_rep_penalty > 1.0f) {
+        for (int i = 0; i < g_n_recent; i++) {
+            int t = g_recent_tokens[i];
+            if (t >= 0 && t < VOCAB_SIZE) {
+                if (g_logits[t] > 0) g_logits[t] /= g_rep_penalty;
+                else g_logits[t] *= g_rep_penalty;
+            }
+        }
+    }
+
+    /* Find top-k threshold via k passes of find-max-and-mask */
+    int top_k = g_top_k;
+    if (top_k > VOCAB_SIZE) top_k = VOCAB_SIZE;
+    float threshold = -1e30f;
+    {
+        static float tmp_logits[151936 + 200];
+        memcpy(tmp_logits, g_logits, VOCAB_SIZE * sizeof(float));
+        for (int k = 0; k < top_k; k++) {
+            int mi = 0;
+            for (int v = 1; v < VOCAB_SIZE; v++)
+                if (tmp_logits[v] > tmp_logits[mi]) mi = v;
+            threshold = tmp_logits[mi];
+            tmp_logits[mi] = -1e30f;
+        }
+    }
+
+    /* Softmax over top-k tokens (those >= threshold), with temperature */
+    float max_l = -1e30f;
+    for (int v = 0; v < VOCAB_SIZE; v++)
+        if (g_logits[v] >= threshold && g_logits[v] > max_l) max_l = g_logits[v];
+    float sum = 0;
+    static float probs[151936 + 200];
+    for (int v = 0; v < VOCAB_SIZE; v++) {
+        if (g_logits[v] >= threshold) {
+            probs[v] = expf((g_logits[v] - max_l) / g_temperature);
+            sum += probs[v];
+        } else probs[v] = 0;
+    }
+
+    /* Sample from the distribution */
+    float r = (float)rand() / (float)RAND_MAX * sum;
+    float acc = 0;
+    for (int v = 0; v < VOCAB_SIZE; v++) {
+        acc += probs[v];
+        if (r <= acc) return v;
+    }
+    return VOCAB_SIZE - 1;  /* fallback */
+}
+
 /* ========================================================================
  * Load weights
  * ======================================================================== */
@@ -372,7 +440,59 @@ static void load_weights(const char *path) {
     printf(" done (%.0f ms, %.1f MB int8 + %.0f KB scales)\n",
            dtq*1000, (double)VOCAB_SIZE*N_EMBD/1048576, (double)VOCAB_SIZE*sizeof(float)/1024);
 
-    /* Keep tensors alive — g_wte used for both embedding and LM head */
+    /* Free float weights — recover ~1.7 GB RSS.
+     * After Q8 quantization, the float copies of q/k/v/o/gate/up/down weights
+     * are never read again. Free them by walking tensors and matching keys.
+     * Keep: norm1_w, norm2_w, q/k/v/o/gate/up/down biases (still needed),
+     *       g_norm_f_w, and g_wte (freed separately below after we rewire
+     *       embedding lookup + rerank to use int8). */
+    {
+        int n_freed = 0;
+        size_t bytes_freed = 0;
+        for (int l = 0; l < N_LAYER; l++) {
+            const char *layer_keys[7];
+            char k[256];
+            sprintf(k, "model.layers.%d.self_attn.q_proj.weight", l);   layer_keys[0] = strdup(k);
+            sprintf(k, "model.layers.%d.self_attn.k_proj.weight", l);   layer_keys[1] = strdup(k);
+            sprintf(k, "model.layers.%d.self_attn.v_proj.weight", l);   layer_keys[2] = strdup(k);
+            sprintf(k, "model.layers.%d.self_attn.o_proj.weight", l);   layer_keys[3] = strdup(k);
+            sprintf(k, "model.layers.%d.mlp.gate_proj.weight", l);      layer_keys[4] = strdup(k);
+            sprintf(k, "model.layers.%d.mlp.up_proj.weight", l);        layer_keys[5] = strdup(k);
+            sprintf(k, "model.layers.%d.mlp.down_proj.weight", l);      layer_keys[6] = strdup(k);
+            for (int ki = 0; ki < 7; ki++) {
+                for (int ti = 0; ti < n_tensors; ti++) {
+                    if (tensors[ti].data && strcmp(tensors[ti].key, layer_keys[ki]) == 0) {
+                        size_t sz = sizeof(float);
+                        for (int d = 0; d < tensors[ti].ndim; d++) sz *= tensors[ti].shape[d];
+                        bytes_freed += sz;
+                        free(tensors[ti].data);
+                        tensors[ti].data = NULL;
+                        n_freed++;
+                        break;
+                    }
+                }
+            }
+            for (int ki = 0; ki < 7; ki++) free((void*)layer_keys[ki]);
+        }
+        printf("[*] freed %d float weight tensors after Q8 quantization (%.1f MB recovered)\n",
+               n_freed, bytes_freed / (1024.0 * 1024.0));
+    }
+
+    /* Free float g_wte — embedding lookup + LM head rerank use int8.
+     * Embedding lookup: dequantize row on-the-fly from g_wte_q + g_wte_scale.
+     * LM head rerank: dequantize each candidate row into static buffer. */
+    {
+        for (int ti = 0; ti < n_tensors; ti++) {
+            if (tensors[ti].data && strcmp(tensors[ti].key, "model.embed_tokens.weight") == 0) {
+                free(tensors[ti].data);
+                tensors[ti].data = NULL;
+                printf("[*] freed float wte (%.1f MB) — embedding lookup dequantizes from int8\n",
+                       (double)VOCAB_SIZE * N_EMBD * 4 / (1024.0 * 1024.0));
+                break;
+            }
+        }
+        g_wte = NULL;
+    }
 }
 
 /* ========================================================================
@@ -489,10 +609,29 @@ static int *encode_text(const char *text, int *n_out) {
 }
 
 static void decode_token(int id, char *out, int maxlen) {
-    if (id >= 0 && id < g_vocab_str_n && g_vocab_str[id])
-        strncpy(out, g_vocab_str[id], maxlen - 1);
-    else out[0] = 0;
-    out[maxlen - 1] = 0;
+    if (id < 0 || id >= g_vocab_str_n || !g_vocab_str[id]) { out[0] = 0; return; }
+    /* Decode GPT-2 BPE byte encoding: Ġ=space, Ċ=newline, etc.
+     * The vocab strings use the standard HF byte-to-unicode map where
+     * bytes 33-126 + 161-172 + 174-255 map to themselves, and
+     * bytes 0-32 + 127-160 + 173 map to Ā(0) .. Ń(32), etc.
+     * For Qwen2.5 tokenizer.json the most common ones are:
+     *   Ġ (U+0120) = space (0x20)
+     *   Ċ (U+010A) = newline (0x0A)
+     *   Ď (U+010E) = carriage return (0x0D)
+     *   ĥ (U+0125) = tab (0x09)
+     * We handle these common ones plus pass through UTF-8 for CJK. */
+    const char *src = g_vocab_str[id];
+    int o = 0;
+    for (int i = 0; src[i] && o < maxlen - 4; i++) {
+        unsigned char c = (unsigned char)src[i];
+        /* Check for 2-byte UTF-8 sequence (Ġ, Ċ, etc. are 0xC4 0xA0 range) */
+        if (c == 0xC4 && (unsigned char)src[i+1] == 0xA0) { out[o++] = ' '; i++; }
+        else if (c == 0xC4 && (unsigned char)src[i+1] == 0x8A) { out[o++] = '\n'; i++; }
+        else if (c == 0xC4 && (unsigned char)src[i+1] == 0x8E) { out[o++] = '\r'; i++; }
+        else if (c == 0xC4 && (unsigned char)src[i+1] == 0xA5) { out[o++] = '\t'; i++; }
+        else out[o++] = c;
+    }
+    out[o] = 0;
 }
 
 /* ========================================================================
@@ -600,13 +739,27 @@ static void lm_head_int8_parallel(float *logits, const float *x, int n_threads) 
     }
     for (int k = 0; k < heap_n; k++) {
         int v = heap_idx[k];
-        const float *w = g_wte + (size_t)v * N_EMBD;
-        v8f acc = V8F_ZERO(); int i = 0;
-        for (; i + 8 <= N_EMBD; i += 8)
-            acc = V8F_FMADD(V8F_LOAD(x+i), V8F_LOAD(w+i), acc);
-        float s = v8f_hsum(acc);
-        for (; i < N_EMBD; i++) s += x[i] * w[i];
-        logits[v] = s;
+        /* Dequantize wte row on-the-fly from int8 (g_wte was freed) */
+        static float w_row[N_EMBD];
+        if (g_wte) {
+            const float *w = g_wte + (size_t)v * N_EMBD;
+            v8f acc = V8F_ZERO(); int i = 0;
+            for (; i + 8 <= N_EMBD; i += 8)
+                acc = V8F_FMADD(V8F_LOAD(x+i), V8F_LOAD(w+i), acc);
+            float s = v8f_hsum(acc);
+            for (; i < N_EMBD; i++) s += x[i] * w[i];
+            logits[v] = s;
+        } else {
+            const int8_t *wq = g_wte_q + (size_t)v * N_EMBD;
+            float scale = g_wte_scale[v];
+            for (int i = 0; i < N_EMBD; i++) w_row[i] = wq[i] * scale;
+            v8f acc = V8F_ZERO(); int i = 0;
+            for (; i + 8 <= N_EMBD; i += 8)
+                acc = V8F_FMADD(V8F_LOAD(x+i), V8F_LOAD(w_row+i), acc);
+            float s = v8f_hsum(acc);
+            for (; i < N_EMBD; i++) s += x[i] * w_row[i];
+            logits[v] = s;
+        }
     }
 }
 
@@ -763,7 +916,14 @@ static int forward(int tok, int pos) {
     if (pos < 0 || pos >= N_CTX) pos = 0;
 
     /* Embedding (no pos emb — RoPE) */
-    memcpy(g_x, g_wte + (size_t)tok * N_EMBD, N_EMBD * sizeof(float));
+    if (g_wte) {
+        memcpy(g_x, g_wte + (size_t)tok * N_EMBD, N_EMBD * sizeof(float));
+    } else {
+        /* Int8 dequantize path: g_wte was freed, reconstruct from g_wte_q */
+        const int8_t *wq = g_wte_q + (size_t)tok * N_EMBD;
+        float scale = g_wte_scale[tok];
+        for (int i = 0; i < N_EMBD; i++) g_x[i] = wq[i] * scale;
+    }
 
     for (int l = 0; l < N_LAYER; l++) {
         QwenLayer *L = &g_layers[l];
@@ -810,11 +970,12 @@ static int forward(int tok, int pos) {
         }
     }
 
-    /* Argmax */
-    int best = 0;
-    for (int v = 1; v < VOCAB_SIZE; v++)
-        if (g_logits[v] > g_logits[best]) best = v;
-    return best;
+    /* Sample (temperature + top_k + rep_penalty) or argmax */
+    int next = sample_next_token();
+    /* Track for repetition penalty */
+    if (g_n_recent < 256) g_recent_tokens[g_n_recent++] = next;
+    else { memmove(g_recent_tokens, g_recent_tokens+1, 255*sizeof(int)); g_recent_tokens[255] = next; }
+    return next;
 }
 
 /* ========================================================================
@@ -861,6 +1022,7 @@ static void generate(const char *prompt, int n_gen, char *out, int max_out) {
  * Main
  * ======================================================================== */
 int main(int argc, char **argv) {
+    srand((unsigned)time(NULL));
     const char *weights = "prebuilt/qwen_weights.bin";
     const char *tokdir = "prebuilt/qwen_tokenizer";
     const char *prompt = "The meaning of life is";
@@ -871,6 +1033,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--prompt") && i+1<argc) prompt=argv[++i];
         else if (!strcmp(argv[i],"--n") && i+1<argc) n_gen=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--threads") && i+1<argc) g_n_threads=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--temp") && i+1<argc) g_temperature=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--top-k") && i+1<argc) g_top_k=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--rep-penalty") && i+1<argc) g_rep_penalty=atof(argv[++i]);
     }
     if (g_n_threads < 1) g_n_threads = 1;
 
