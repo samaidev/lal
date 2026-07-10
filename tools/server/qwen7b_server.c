@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -85,19 +86,50 @@ typedef struct {
 static Layer g_layers[N_LAYER];
 
 /* === Global state === */
-static float *g_wte;          /* [VOCAB, N_EMBD] float (from file) */
+static float *g_wte;          /* [VOCAB, N_EMBD] float (from file, for embedding lookup) */
 static float *g_norm_f_w;
-static int8_t *g_wte_q;       /* [VOCAB, N_EMBD] int8 (quantized at startup) */
-static float *g_wte_scale;    /* [VOCAB] */
+static int8_t *g_lm_head_q;   /* [VOCAB, N_EMBD] int8 (lm_head quantized at startup) */
+static float  *g_lm_head_s;   /* [VOCAB] per-row scale */
 static float *g_x, *g_ln, *g_q, *g_k, *g_v, *g_attn_out, *g_proj;
 static float *g_gate, *g_up, *g_gate_up, *g_mlp_out;
 static float *g_logits;
+static int8_t *g_xq_cache;    /* [N_EMBD] int8 buffer for LM head input quantization */
 static float **kv_k, **kv_v;  /* [N_LAYER][N_CTX * KV_DIM] */
 static int g_n_threads = 1;
 static float g_temperature = 0.8f;
 static int g_top_k = 40;
 static float g_rep_penalty = 1.1f;
 static int g_recent[256], g_n_recent = 0;
+
+/* === Thread pool for parallel matmul (OpenMP) ===
+ * Splits each matmul's output dimension across g_n_threads threads.
+ * Each thread computes y[start..end) = q8[start..end, :] @ x.
+ * OpenMP handles thread creation/sync automatically. */
+static inline void parallel_matmul(float *y, const int8_t *q8_T, const float *scale,
+                                    const float *x, const float *b,
+                                    int in_dim, int out_dim) {
+    if (g_n_threads <= 1 || out_dim < 2048) {
+        lal_matmul_q8_signtrick(y, q8_T, scale, x, b, in_dim, out_dim);
+        return;
+    }
+    #pragma omp parallel num_threads(g_n_threads)
+    {
+        int tid = omp_get_thread_num();
+        int n   = omp_get_num_threads();
+        int chunk = (out_dim + n - 1) / n;
+        int start = tid * chunk;
+        int end = start + chunk;
+        if (end > out_dim) end = out_dim;
+        if (start < out_dim) {
+            lal_matmul_q8_signtrick(y + start,
+                                    q8_T + (size_t)start * in_dim,
+                                    scale + start,
+                                    x,
+                                    b ? b + start : NULL,
+                                    in_dim, end - start);
+        }
+    }
+}
 
 /* === GPQ8 tensor (loaded from file) === */
 typedef struct {
@@ -254,34 +286,39 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
                          const float *x, float *out, int in_dim, int hid, int out_dim) {
     static float gate_buf[MLP_DIM], up_buf[MLP_DIM], act_buf[MLP_DIM];
     /* gate = q_gate @ x */
-    lal_matmul_q8_signtrick(gate_buf, q_gate, s_gate, x, NULL, in_dim, hid);
+    parallel_matmul(gate_buf, q_gate, s_gate, x, NULL, in_dim, hid);
     /* up = q_up @ x */
-    lal_matmul_q8_signtrick(up_buf, q_up, s_up, x, NULL, in_dim, hid);
+    parallel_matmul(up_buf, q_up, s_up, x, NULL, in_dim, hid);
     /* SiLU(gate) * up */
     for (int i = 0; i < hid; i++)
         act_buf[i] = (gate_buf[i] / (1.0f + expf(-gate_buf[i]))) * up_buf[i];
     /* down = q_down @ act */
-    lal_matmul_q8_signtrick(out, q_down, s_down, act_buf, NULL, hid, out_dim);
+    parallel_matmul(out, q_down, s_down, act_buf, NULL, hid, out_dim);
 }
 
 /* === Forward pass === */
 static int forward(int tok, int pos) {
-    /* Embedding lookup */
+    /* Embedding lookup (F32 from mmap'd embed_tokens) */
+    if (tok < 0 || tok >= VOCAB_SIZE) {
+        fprintf(stderr, "[!] forward: token %d out of range [0,%d)\n", tok, VOCAB_SIZE);
+        tok = 0;
+    }
+    memcpy(g_x, g_wte + (size_t)tok * N_EMBD, N_EMBD * sizeof(float));
 
     for (int l = 0; l < N_LAYER; l++) {
         Layer *L = &g_layers[l];
         /* Pre-attn RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
         /* Q/K/V projections (Q8 from GPQ8 file, no runtime quantization) */
-        lal_matmul_q8_signtrick(g_q, L->q8_q, L->s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
-        lal_matmul_q8_signtrick(g_k, L->q8_k, L->s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
-        lal_matmul_q8_signtrick(g_v, L->q8_v, L->s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
+        parallel_matmul(g_q, L->q8_q, L->s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
+        parallel_matmul(g_k, L->q8_k, L->s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
+        parallel_matmul(g_v, L->q8_v, L->s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
         /* RoPE */
         rope_apply(g_q, g_k, pos);
         /* GQA Attention */
         gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
         /* O proj + residual */
-        lal_matmul_q8_signtrick(g_proj, L->q8_o, L->s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
+        parallel_matmul(g_proj, L->q8_o, L->s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
         for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
         /* Pre-MLP RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm2_w, N_EMBD);
@@ -294,16 +331,13 @@ static int forward(int tok, int pos) {
     /* Final RMSNorm */
     qwen7b_rms_norm(g_ln, g_x, g_norm_f_w, N_EMBD);
 
-    /* LM head: F32 dot product (logits = wte @ x) */
-    for (int v = 0; v < VOCAB_SIZE; v++) {
-        const float *row = g_wte + (size_t)v * N_EMBD;
-        v8f acc = V8F_ZERO(); int i = 0;
-        for (; i + 8 <= N_EMBD; i += 8)
-            acc = V8F_FMADD(V8F_LOAD(g_ln+i), V8F_LOAD(row+i), acc);
-        float dot = v8f_hsum(acc);
-        for (; i < N_EMBD; i++) dot += g_ln[i] * row[i];
-        g_logits[v] = dot;
-    }
+    /* LM head: int8 dot product (logits = lm_head_q @ x)
+     * lm_head was quantized to int8 at startup (per-row scale).
+     * Uses sign-trick kernel for 4x less memory bandwidth than F32. */
+    float scale_x = lal_quantize_x_int8(g_ln, g_xq_cache, N_EMBD);
+    lal_lm_head_int8_range(g_logits, g_xq_cache, scale_x,
+                           g_lm_head_q, g_lm_head_s,
+                           0, VOCAB_SIZE, N_EMBD);
 
     /* Sample */
     int next = lal_sample_token(g_logits, VOCAB_SIZE, g_temperature, g_top_k, g_rep_penalty, g_recent, g_n_recent);
@@ -379,14 +413,33 @@ static void load_tokenizer(const char *dir) {
     free(buf);
 }
 
-/* Simple text encoder: word-level + space token (Qwen BPE simplified) */
+/* Qwen2.5-Instruct chat template special tokens */
+#define TOK_IM_START  151644
+#define TOK_IM_END    151643
+
+/* Byte-level BPE fallback: encode one byte as its GPT-2 unicode char,
+ * then look up the single-char vocab string.
+ * Returns token id or -1 if not found. */
+static int encode_byte(unsigned char b) {
+    unsigned int cp = lal_bpe_cp_for_byte(b);
+    char buf[5] = {0};
+    int n = lal_utf8_encode(cp, buf);
+    buf[n] = 0;
+    return tok_find(buf);
+}
+
+/* Simple text encoder: word-level + space-prefix; byte-level fallback.
+ * No BPE merges (would need merges.txt). For words in the vocab as single
+ * tokens (common for short English words), this is exact. For unknown
+ * words, falls back to per-byte encoding (one token per byte).
+ * Newlines are emitted as Ċ tokens; spaces are absorbed into the next
+ * word's Ġ-prefix (per GPT-2 BPE convention). */
 static int *encode_text(const char *text, int *n_out) {
-    int *ids = malloc(strlen(text) * 4 * sizeof(int));
+    int *ids = malloc((strlen(text) + 4) * 4 * sizeof(int));
     int n = 0;
-    /* Try encoding as space-prefixed words */
     char word[512];
     int wlen = 0;
-    int first = 1;
+    int first = 1;  /* 1 = next word has no space prefix (start of line / after \n) */
     for (const char *p = text; ; p++) {
         if (*p == ' ' || *p == '\0' || *p == '\n') {
             if (wlen > 0) {
@@ -394,27 +447,28 @@ static int *encode_text(const char *text, int *n_out) {
                 char prefixed[513];
                 snprintf(prefixed, sizeof(prefixed), "%s%s", first ? "" : " ", word);
                 int id = tok_find(prefixed);
-                if (id >= 0) ids[n++] = id;
-                else {
-                    /* Try without prefix */
-                    id = tok_find(word);
-                    if (id >= 0) ids[n++] = id;
-                    else {
-                        /* Fall back: encode each char */
-                        for (int i = 0; i < wlen; i++) {
-                            char c[2] = {word[i], 0};
-                            int cid = tok_find(c);
-                            if (cid >= 0) ids[n++] = cid;
-                        }
+                if (id < 0) id = tok_find(word);  /* try without prefix */
+                if (id >= 0) {
+                    ids[n++] = id;
+                } else {
+                    /* Byte-level fallback: encode each byte as its BPE char */
+                    for (int i = 0; i < wlen; i++) {
+                        int bid = encode_byte((unsigned char)word[i]);
+                        if (bid >= 0) ids[n++] = bid;
                     }
                 }
                 wlen = 0;
                 first = 0;
             }
-            if (*p == ' ') { /* skip */ }
-            else if (*p == '\0') break;
+            if (*p == ' ') {
+                /* Space absorbed into next word's prefix; nothing to emit */
+            } else if (*p == '\n') {
+                int sid = tok_find("\xC4\x8A");  /* Ċ = newline token */
+                if (sid >= 0) ids[n++] = sid;
+                first = 1;  /* new line resets word boundary */
+            } else if (*p == '\0') break;
         } else {
-            word[wlen++] = *p;
+            if (wlen < 511) word[wlen++] = *p;
         }
     }
     *n_out = n;
@@ -442,6 +496,8 @@ int main(int argc, char **argv) {
     printf("=== Qwen2.5-7B-Instruct (LAL, Q8, GQA, GPQ8) ===\n");
     printf("[*] %d layers, %d hidden, %dQ/%dKV heads, %d head_dim, %d MLP, %d vocab\n",
            N_LAYER, N_EMBD, N_HEAD, N_KV_HEAD, HEAD_DIM, MLP_DIM, VOCAB_SIZE);
+    if (g_n_threads > 1)
+        printf("[*] OpenMP: %d threads\n", g_n_threads);
 
     /* Load GPQ8 weights */
     load_gpq8(weights);
@@ -467,7 +523,20 @@ int main(int argc, char **argv) {
     }
 
 /* F32 LM head (no int8 quantization) */
-    printf("[*] using F32 LM head\n"); fflush(stdout);
+    printf("[*] using int8 LM head (untied lm_head.weight)\n"); fflush(stdout);
+
+    /* Quantize lm_head.weight (F32 in file) to int8 for fast LM head dot product.
+     * Qwen2.5-Instruct has UNTIED embeddings, so lm_head is a separate matrix
+     * (NOT embed_tokens). Using embed_tokens would produce garbage logits. */
+    float *lm_head_f = get_f32("lm_head.weight");
+    g_lm_head_q = memalign(32, (size_t)VOCAB_SIZE * N_EMBD);
+    g_lm_head_s = memalign(32, VOCAB_SIZE * sizeof(float));
+    printf("[*] quantizing lm_head to int8 (%.0f MB -> %.0f MB)...\n",
+           (double)VOCAB_SIZE * N_EMBD * 4 / 1048576,
+           (double)VOCAB_SIZE * N_EMBD / 1048576); fflush(stdout);
+    lal_quantize_q8_per_row(lm_head_f, g_lm_head_q, g_lm_head_s, N_EMBD, VOCAB_SIZE);
+    /* Note: lm_head_f stays mmap'd (read-only, no extra RSS) */
+    g_xq_cache = memalign(32, N_EMBD);
 
         /* Allocate working buffers */
     g_x = memalign(32, N_EMBD * sizeof(float));
@@ -504,9 +573,35 @@ int main(int argc, char **argv) {
            prompt, g_temperature, g_top_k, g_rep_penalty);
     printf("[*] generating %d tokens (threads=%d)...\n\n", n_gen, g_n_threads);
 
-    int n_prompt;
-    int *pids = encode_text(prompt, &n_prompt);
-    printf("[*] prompt: %d tokens\n", n_prompt);
+    /* Build chat-templated prompt token sequence:
+     *   <|im_start|>user \n {prompt} <|im_end|> \n <|im_start|>assistant \n
+     * Special tokens are inserted by ID; text parts via encode_text(). */
+    int *pids = malloc((strlen(prompt) + 64) * 4 * sizeof(int));
+    int n_prompt = 0;
+    int newline_tok = tok_find("\xC4\x8A");  /* Ċ = newline */
+    int nu, np, na;
+    int *uids, *ppids, *aids;
+
+    pids[n_prompt++] = TOK_IM_START;
+    uids = encode_text("user", &nu);
+    for (int i = 0; i < nu; i++) pids[n_prompt++] = uids[i];
+    free(uids);
+    if (newline_tok >= 0) pids[n_prompt++] = newline_tok;
+
+    ppids = encode_text(prompt, &np);
+    for (int i = 0; i < np; i++) pids[n_prompt++] = ppids[i];
+    free(ppids);
+
+    pids[n_prompt++] = TOK_IM_END;
+    if (newline_tok >= 0) pids[n_prompt++] = newline_tok;
+
+    pids[n_prompt++] = TOK_IM_START;
+    aids = encode_text("assistant", &na);
+    for (int i = 0; i < na; i++) pids[n_prompt++] = aids[i];
+    free(aids);
+    if (newline_tok >= 0) pids[n_prompt++] = newline_tok;
+
+    printf("[*] prompt: %d tokens (incl. chat template)\n", n_prompt);
 
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     int pos = 0, next = -1;
