@@ -1835,10 +1835,10 @@ static void lm_head_int8_range(float *logits, const int8_t *xq, float scale_x,
 }
 
 typedef struct {
-    const int8_t *xq;
-    float scale_x;
-    float *logits;
-    int v_start, v_end, n_embd;
+    const int8_t *xq;   /* 8 bytes, offset 0 */
+    float *logits;      /* 8 bytes, offset 8 (was misaligned at 12!) */
+    float scale_x;      /* 4 bytes, offset 16 */
+    int v_start, v_end, n_embd;  /* 12 bytes, offset 20, total 32 bytes */
 } LmHeadInt8Job;
 
 static void *lm_head_int8_worker(void *arg) {
@@ -1884,6 +1884,7 @@ static void lm_head_int8_parallel(float *logits, const float *x, int n_threads) 
             jobs[t].logits = logits;
             jobs[t].v_start = t * chunk;
             jobs[t].v_end = (t + 1) * chunk;
+            jobs[t].n_embd = N_EMBD;  /* CRITICAL: was missing, caused garbage n_embd in workers */
             if (jobs[t].v_start > VOCAB_SIZE) jobs[t].v_start = VOCAB_SIZE;
             if (jobs[t].v_end > VOCAB_SIZE) jobs[t].v_end = VOCAB_SIZE;
             if (jobs[t].v_end <= jobs[t].v_start) continue;
@@ -3211,10 +3212,13 @@ int main(int argc, char **argv) {
      * register save/restore issue). Force single-threaded on all ARM.
      * x86_64 works fine with multi-threading. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-#if defined(__arm__) || defined(__aarch64__)
-    g_n_threads = 1;  /* ARM: single-threaded (pthread+NEON crashes) */
+#if defined(__aarch64__)
+    g_n_threads = (ncpu >= 4) ? 4 : (int)ncpu;
+    if (g_n_threads > 8) g_n_threads = 8;
+#elif defined(__arm__)
+    g_n_threads = 1;  /* ARMv7: single-threaded */
 #else
-    g_n_threads = (ncpu >= 4) ? (int)ncpu : 1;
+    g_n_threads = (ncpu >= 2) ? (int)ncpu : 1;
     if (g_n_threads > 8) g_n_threads = 8;
 #endif
 
