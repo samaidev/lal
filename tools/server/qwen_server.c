@@ -325,20 +325,48 @@ static int sample_next_token(void) {
         }
     }
 
-    /* Find top-k threshold via k passes of find-max-and-mask */
+    /* Find top-k threshold via min-heap of size k.
+     * Old code: O(k*V) = 40*151936 = 6M comparisons.
+     * New code: O(V log k) = 151936*6 = 900K comparisons. ~7x faster. */
     int top_k = g_top_k;
     if (top_k > VOCAB_SIZE) top_k = VOCAB_SIZE;
     float threshold = -1e30f;
     {
-        static float tmp_logits[151936 + 200];
-        memcpy(tmp_logits, g_logits, VOCAB_SIZE * sizeof(float));
-        for (int k = 0; k < top_k; k++) {
-            int mi = 0;
-            for (int v = 1; v < VOCAB_SIZE; v++)
-                if (tmp_logits[v] > tmp_logits[mi]) mi = v;
-            threshold = tmp_logits[mi];
-            tmp_logits[mi] = -1e30f;
+        /* Min-heap: heap[0] is the SMALLEST logit in the current top-k set.
+         * For each vocab token: if its logit > heap[0], replace and sift down. */
+        static float heap_val[64];  /* max top_k = 64 */
+        static int   heap_idx[64];
+        int heap_n = 0;
+        for (int v = 0; v < VOCAB_SIZE; v++) {
+            float val = g_logits[v];
+            if (heap_n < top_k) {
+                /* Heap not full yet: insert at end, sift up */
+                int c = heap_n++;
+                heap_val[c] = val; heap_idx[c] = v;
+                while (c > 0) {
+                    int p = (c - 1) >> 1;
+                    if (heap_val[p] <= heap_val[c]) break;
+                    float tv = heap_val[p]; heap_val[p] = heap_val[c]; heap_val[c] = tv;
+                    int ti = heap_idx[p]; heap_idx[p] = heap_idx[c]; heap_idx[c] = ti;
+                    c = p;
+                }
+            } else if (val > heap_val[0]) {
+                /* Replace min, sift down */
+                heap_val[0] = val; heap_idx[0] = v;
+                int p = 0;
+                for (;;) {
+                    int l = 2*p + 1, r = 2*p + 2, s = p;
+                    if (l < heap_n && heap_val[l] < heap_val[s]) s = l;
+                    if (r < heap_n && heap_val[r] < heap_val[s]) s = r;
+                    if (s == p) break;
+                    float tv = heap_val[p]; heap_val[p] = heap_val[s]; heap_val[s] = tv;
+                    int ti = heap_idx[p]; heap_idx[p] = heap_idx[s]; heap_idx[s] = ti;
+                    p = s;
+                }
+            }
         }
+        /* threshold = smallest value in the top-k set = heap[0] */
+        threshold = heap_val[0];
     }
 
     /* Softmax over top-k tokens (those >= threshold), with temperature */
@@ -919,10 +947,25 @@ static int forward(int tok, int pos) {
     if (g_wte) {
         memcpy(g_x, g_wte + (size_t)tok * N_EMBD, N_EMBD * sizeof(float));
     } else {
-        /* Int8 dequantize path: g_wte was freed, reconstruct from g_wte_q */
+        /* Int8 dequantize path with AVX2 SIMD (8-wide fmadd).
+         * 768 scalar mults -> 96 AVX2 mults. ~8x faster. */
         const int8_t *wq = g_wte_q + (size_t)tok * N_EMBD;
         float scale = g_wte_scale[tok];
+#if defined(__AVX2__)
+        __m256 v_scale = _mm256_set1_ps(scale);
+        int i = 0;
+        for (; i + 8 <= N_EMBD; i += 8) {
+            /* Load 8 int8, sign-extend to int32, convert to float, multiply */
+            __m128i bytes = _mm_loadl_epi64((const __m128i*)(wq + i));  /* 8 int8 */
+            __m256i i32 = _mm256_cvtepi8_epi32(bytes);                   /* 8 int32 */
+            __m256 f32 = _mm256_cvtepi32_ps(i32);                        /* 8 float */
+            __m256 result = _mm256_mul_ps(f32, v_scale);
+            _mm256_storeu_ps(g_x + i, result);
+        }
+        for (; i < N_EMBD; i++) g_x[i] = wq[i] * scale;
+#else
         for (int i = 0; i < N_EMBD; i++) g_x[i] = wq[i] * scale;
+#endif
     }
 
     for (int l = 0; l < N_LAYER; l++) {
