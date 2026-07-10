@@ -2084,16 +2084,23 @@ static void lm_head_int8_parallel(float *logits, const float *x, int n_threads) 
                 }
             }
         }
-        /* Re-score the selected RERANK_N candidates in float. */
+        /* Re-score the selected RERANK_N candidates in float.
+         * In Q8 mode, g_wte was freed to save 154 MB; dequantize each row
+         * on-the-fly from g_wte_q + g_wte_scale. Cost: 768 mults per
+         * candidate × 512 candidates = 393K mults — negligible vs the
+         * 38 MB int8 dot products in Pass 1. */
+        static float w_row[N_EMBD];  /* reuse buffer across candidates */
         for (int k = 0; k < heap_n; k++) {
             int v = heap_idx[k];
-            const float *w = g_wte + (size_t)v * N_EMBD;
+            const int8_t *wq = g_wte_q + (size_t)v * N_EMBD;
+            float scale = g_wte_scale[v];
+            for (int i = 0; i < N_EMBD; i++) w_row[i] = wq[i] * scale;
             v8f acc = v8f_zero();
             int i = 0;
             for (; i + 8 <= N_EMBD; i += 8)
-                acc = v8f_fmadd(v8f_load(x + i), v8f_load(w + i), acc);
+                acc = v8f_fmadd(v8f_load(x + i), v8f_load(w_row + i), acc);
             float s = v8f_hsum(acc);
-            for (; i < N_EMBD; i++) s += x[i] * w[i];
+            for (; i < N_EMBD; i++) s += x[i] * w_row[i];
             logits[v] = s;
         }
     }
@@ -2600,8 +2607,19 @@ static int gpt2_forward_token(int token_id, int position) {
      * degenerate "the the the..." output regardless of attention. Restored. */
     if (token_id < 0 || token_id >= VOCAB_SIZE) token_id = 0;
     if (position < 0 || position >= 1024) position = 0;
-    for (int i = 0; i < N_EMBD; i++)
-        g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
+    if (g_wte) {
+        /* Float path (--no-q8 mode): direct lookup */
+        for (int i = 0; i < N_EMBD; i++)
+            g_x[i] = g_wte[token_id * N_EMBD + i] + g_wpe[position * N_EMBD + i];
+    } else {
+        /* Int8 dequantize path (Q8/Q4 default): g_wte was freed after
+         * LM head quantization; reconstruct row on-the-fly.
+         * Cost: 768 mults per token — negligible vs 12-layer transformer. */
+        const int8_t *wq = g_wte_q + (size_t)token_id * N_EMBD;
+        float scale = g_wte_scale[token_id];
+        for (int i = 0; i < N_EMBD; i++)
+            g_x[i] = wq[i] * scale + g_wpe[position * N_EMBD + i];
+    }
 
     /* Layers */
     g_early_exit_total++;
@@ -3534,6 +3552,65 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[!] missing tensors for layer %d\n", l); return 1;
             }
         }
+
+        /* === Memory optimization: free float weights after Q8/Q4 quantization ===
+         *
+         * In Q8 mode, the 4 weight matrices per layer (c_attn_w, c_proj_w,
+         * mlp_fc_w, mlp_proj_w) are quantized to int8 at startup. The float
+         * copies are never read again during inference — the forward pass
+         * uses q8_c_attn/q8_c_proj/q8_mlp_fc/q8_mlp_proj exclusively.
+         *
+         * Freeing them recovers ~324 MB of RSS:
+         *   12 layers × (6.75 + 2.25 + 9.00 + 9.00) MB = 324 MB
+         *
+         * We keep: ln1/ln2 weights+biases, c_attn/c_proj/mlp_fc/mlp_proj biases
+         * (still needed by matmul_q8 to add bias after the int8 dot product),
+         * wte (embedding lookup at inference), wpe, ln_f.
+         *
+         * Implementation: walk g_tensors, find tensors matching the keys we
+         * want to free, free their data buffers, set pointers to NULL.
+         * g_tensors itself is kept (small overhead, ~148 × sizeof(Tensor)).
+         */
+        if (g_use_q8 || g_use_q4) {
+            const char *free_keys[] = {
+                /* 12 layers × 4 weight matrices = 48 keys */
+                /* Filled in dynamically below since keys have layer index */
+            };
+            int n_freed = 0;
+            size_t bytes_freed = 0;
+            for (int l = 0; l < N_LAYER; l++) {
+                char k[128];
+                const char *layer_keys[4];
+                sprintf(k, "h.%d.attn.c_attn.weight", l); layer_keys[0] = strdup(k);
+                sprintf(k, "h.%d.attn.c_proj.weight", l); layer_keys[1] = strdup(k);
+                sprintf(k, "h.%d.mlp.c_fc.weight",   l); layer_keys[2] = strdup(k);
+                sprintf(k, "h.%d.mlp.c_proj.weight", l); layer_keys[3] = strdup(k);
+                for (int ki = 0; ki < 4; ki++) {
+                    for (int ti = 0; ti < g_n_tensors; ti++) {
+                        if (g_tensors[ti].data && strcmp(g_tensors[ti].key, layer_keys[ki]) == 0) {
+                            {   size_t sz = sizeof(float);
+                for (int d = 0; d < g_tensors[ti].ndim; d++) sz *= g_tensors[ti].shape[d];
+                bytes_freed += sz; }
+                            free(g_tensors[ti].data);
+                            g_tensors[ti].data = NULL;
+                            n_freed++;
+                            break;
+                        }
+                    }
+                }
+                for (int ki = 0; ki < 4; ki++) free((void*)layer_keys[ki]);
+            }
+            /* Also NULL out the layer struct pointers to catch any accidental use */
+            for (int l = 0; l < N_LAYER; l++) {
+                g_layers[l].c_attn_w = NULL;
+                g_layers[l].c_proj_w = NULL;
+                g_layers[l].mlp_fc_w = NULL;
+                g_layers[l].mlp_proj_w = NULL;
+            }
+            printf("[*] freed %d float weight tensors after Q8 quantization (%.1f MB recovered)\n",
+                   n_freed, bytes_freed / (1024.0 * 1024.0));
+            fflush(stdout);
+        }
     }  /* end else (float mode) */
 
     /* Quantize wte to int8 + per-row scale for the int8 LM head.
@@ -3573,6 +3650,20 @@ int main(int argc, char **argv) {
                    (double)VOCAB_SIZE * N_EMBD / (1024.0 * 1024.0),
                    (double)VOCAB_SIZE * sizeof(float) / 1024.0,
                    qt * 1000.0);
+
+            /* Free float wte — embedding lookup will dequantize on-the-fly
+             * from g_wte_q + g_wte_scale (recovers ~154 MB RSS).
+             * Only safe when g_wte_q is populated (Q8/Q4 modes). */
+            for (int ti = 0; ti < g_n_tensors; ti++) {
+                if (g_tensors[ti].data && strcmp(g_tensors[ti].key, "wte.weight") == 0) {
+                    free(g_tensors[ti].data);
+                    g_tensors[ti].data = NULL;
+                    printf("[*] freed float wte (154 MB) — embedding lookup dequantizes from int8\n");
+                    fflush(stdout);
+                    break;
+                }
+            }
+            g_wte = NULL;
         }
     }
 
