@@ -7,13 +7,7 @@ CC ?= gcc
 # intrinsics per platform (see top of that file).
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
-  # Detect AVX512_BW support for 512-bit maddubs in Q4_K kernel
-  AVX512_BW := $(shell grep -q avx512bw /proc/cpuinfo && echo yes)
-  ifeq ($(AVX512_BW),yes)
-    SIMD_FLAGS ?= -mavx512f -mavx512bw -mavx2 -mfma -mf16c
-  else
-    SIMD_FLAGS ?= -mavx2 -mfma -mf16c
-  endif
+  SIMD_FLAGS ?= -mavx2 -mfma -mf16c
 else ifeq ($(UNAME_M),i386)
   SIMD_FLAGS ?= -msse4.1
 else ifneq (,$(filter $(UNAME_M),arm armv7l armv7-a))
