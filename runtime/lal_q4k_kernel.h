@@ -228,10 +228,27 @@ static inline void lal_matmul_q4_k(float *y,
                 float dot_f = (float)dot * combined;
                 acc = _mm256_add_ps(acc, _mm256_castps128_ps256(_mm_set_ss(dot_f)));
 
-                /* Min correction: acc_min -= sb_min * x_scale * sum(xq) */
-                /* sum(xq) = sum of 32 int8 values for this sub-block */
-                int32_t xq_sum = 0;
-                for (int i = 0; i < 32; i++) xq_sum += (int)xq[xoff + i];
+                /* Min correction: acc_min -= sb_min * x_scale * sum(xq)
+                 * SIMD: sum 32 int8 values. _mm_cvtepi8_epi16 only takes 8 bytes,
+                 * so split each 16-byte vector into two 8-byte halves. */
+                __m128i ones128 = _mm_set1_epi16(1);
+                /* xv_lo: 16 int8 → 2 × 8 int16 → 2 × 4 int32 */
+                __m128i xq_s16_lo_a = _mm_cvtepi8_epi16(xv_lo);           /* lower 8 → 8 int16 */
+                __m128i xq_s16_lo_b = _mm_cvtepi8_epi16(_mm_srli_si128(xv_lo, 8)); /* upper 8 */
+                __m128i xq_sum_lo = _mm_add_epi32(
+                    _mm_madd_epi16(xq_s16_lo_a, ones128),
+                    _mm_madd_epi16(xq_s16_lo_b, ones128));  /* 4 int32 */
+                /* xv_hi: 16 int8 → 2 × 8 int16 → 2 × 4 int32 */
+                __m128i xq_s16_hi_a = _mm_cvtepi8_epi16(xv_hi);
+                __m128i xq_s16_hi_b = _mm_cvtepi8_epi16(_mm_srli_si128(xv_hi, 8));
+                __m128i xq_sum_hi = _mm_add_epi32(
+                    _mm_madd_epi16(xq_s16_hi_a, ones128),
+                    _mm_madd_epi16(xq_s16_hi_b, ones128));  /* 4 int32 */
+                /* Combine + hsum */
+                __m128i xq_sum128 = _mm_add_epi32(xq_sum_lo, xq_sum_hi);
+                xq_sum128 = _mm_hadd_epi32(xq_sum128, xq_sum128);
+                xq_sum128 = _mm_hadd_epi32(xq_sum128, xq_sum128);
+                int32_t xq_sum = _mm_cvtsi128_si32(xq_sum128);
                 acc_min -= sb_min * x_scale * (float)xq_sum;
             }
         }
