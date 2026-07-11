@@ -2,7 +2,8 @@
  * Build: gcc -O3 -mavx512f -mavx512bw -mfma -mf16c -I. -o q4k_avx512_test scripts/q4k_avx512_unit_test.c -lm
  */
 #define XQ_MAX 18944
-#include "runtime/lal_q4k_kernel_avx512.h"
+#include "runtime/lal_q4k_kernel.h"
+/* When AVX512_BW is available, lal_matmul_q4_k is #defined to lal_matmul_q4_k_avx512 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -85,7 +86,7 @@ int main() {
     }
     for (int j=0;j<out_dim;j++)
         quantize_q4_k_adjacent(w+j*in_dim, q4k+(size_t)j*(in_dim/256)*144, in_dim);
-    lal_matmul_q4_k_avx512(y_k, q4k, x, NULL, in_dim, out_dim);
+    lal_matmul_q4_k(y_k, q4k, x, NULL, in_dim, out_dim);
 
     printf("=== AVX512 Q4_K test (in_dim=%d, out_dim=%d) ===\n", in_dim, out_dim);
     float max_rel=0, max_abs=0;

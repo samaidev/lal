@@ -38,6 +38,13 @@ static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
     for (int i = 0; i < 5; i++) out16[11 + i] = (hi >> (2 + i * 6)) & 0x3F;
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* Use AVX-512 kernel (512-bit maddubs) when available */
+#include "lal_q4k_kernel_avx512.h"
+/* lal_matmul_q4_k is defined as lal_matmul_q4_k_avx512 in the avx512 header */
+#define lal_matmul_q4_k lal_matmul_q4_k_avx512
+
+#else
 static inline void lal_matmul_q4_k(float * __restrict__ y,
                                      const uint8_t * __restrict__ q4k_W,
                                      const float * __restrict__ x,
@@ -330,4 +337,5 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
 #endif
 }
 
+#endif /* AVX512 else branch */
 #endif /* LAL_Q4K_KERNEL_H */

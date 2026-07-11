@@ -44,13 +44,7 @@
 #error "Define XQ_MAX before including lal_q4k_kernel_avx512.h"
 #endif
 
-static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
-    uint64_t lo = *(const uint64_t*)src;
-    uint32_t hi = *(const uint32_t*)(src + 8);
-    for (int i = 0; i < 10; i++) out16[i] = (lo >> (i * 6)) & 0x3F;
-    out16[10] = ((lo >> 60) | (hi << 4)) & 0x3F;
-    for (int i = 0; i < 5; i++) out16[11 + i] = (hi >> (2 + i * 6)) & 0x3F;
-}
+/* unpack_scales_6bit is provided by lal_q4k_kernel.h */
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
