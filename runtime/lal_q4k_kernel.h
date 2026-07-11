@@ -1,19 +1,28 @@
-/* lal_q4k_kernel.h — Q4_K matmul kernel (FULL llama.cpp match)
+/* lal_q4k_kernel.h — Q4_K matmul kernel (256-bit maddubs + vperm2i128)
  *
- * Matches llama.cpp exactly:
- * 1. Adjacent packing: byte[i] = q[2i] | (q[2i+1] << 4) (llama.cpp style)
- * 2. Split low/high nibbles: q4l = and(packed, 0xF), q4h = and(packed>>4, 0xF)
- * 3. 256-bit maddubs: maddubs(q4l_256, xq_256) → 16 int16
- * 4. Scale via madd: madd(scale_shuffled, p16) → 8 int32
- * 5. shuffle_epi8 to broadcast per-sub-block scales to correct lanes
- * 6. 1 cvtepi32_ps + fmadd per superblock
- * 7. Pre-computed bsums + SIMD madd for min correction
- * 8. 8-row parallel
+ * INTERLEAVED packing (matches Python converter):
+ *   byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4)
  *
- * KEY: shuffle_epi8 broadcasts scale to 16 int16 lanes.
- * For 2 sub-blocks in one 256-bit maddubs:
- *   sub0 scale → lanes 0-7, sub1 scale → lanes 8-15
- * This is what llama.cpp's get_scale_shuffle_k4 does.
+ * For each pair of sub-blocks (sub_a, sub_b) in a 32-byte q4 load:
+ *   q4_0 = q4 & 0xF              → low nibbles (first 16 of each sub)
+ *   q4_1 = (q4 >> 4) & 0xF       → high nibbles (last 16 of each sub)
+ *   xv0 = xq[sub_a] (32 int8)    → [sub_a first 16 | sub_a last 16]
+ *   xv1 = xq[sub_b] (32 int8)    → [sub_b first 16 | sub_b last 16]
+ *   q8_lo = vperm2i128(xv0, xv1, 0x20) = [sub_a first 16 | sub_b first 16]
+ *   q8_hi = vperm2i128(xv0, xv1, 0x31) = [sub_a last 16  | sub_b last 16 ]
+ *
+ *   p_lo = maddubs(q4_0, q8_lo)  → 16 int16 (8 sub_a + 8 sub_b partial dots)
+ *   p_hi = maddubs(q4_1, q8_hi)  → 16 int16 (8 sub_a + 8 sub_b partial dots)
+ *   p16  = p_lo + p_hi
+ *
+ *   scale_v = [sc_a×8, sc_b×8]  (16 int16)
+ *   s32 = madd_epi16(scale_v, p16) → 8 int32
+ *
+ *   sumi += s32  (sum across 8 lanes = sc_a*sub_a_total + sc_b*sub_b_total)
+ *
+ * Each superblock: 4 iterations (8 sub-blocks processed in pairs)
+ * Plus bsums for min correction.
+ * 8-row parallel for outer loop.
  */
 #ifndef LAL_Q4K_KERNEL_H
 #define LAL_Q4K_KERNEL_H
@@ -27,7 +36,8 @@
 #error "Define XQ_MAX before including lal_q4k_kernel.h"
 #endif
 
-#if defined(__AVX2__) && defined(__F16C__)
+/* Unpack 16 × 6-bit values from 12 bytes (packed low-to-high) into 16 uint8.
+ * Used by both SIMD and scalar paths. */
 static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
     uint64_t lo = *(const uint64_t*)src;
     uint32_t hi = *(const uint32_t*)(src + 8);
@@ -35,34 +45,6 @@ static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
     out16[10] = ((lo >> 60) | (hi << 4)) & 0x3F;
     for (int i = 0; i < 5; i++) out16[11 + i] = (hi >> (2 + i * 6)) & 0x3F;
 }
-
-/* Build a 128-bit scale vector for 2 sub-blocks:
- * lanes 0-7 = scale[0], lanes 8-15 = scale[1]
- * madd(scale_v, p16) then applies correct scale to each sub-block's 8 int16. */
-static inline __m128i make_scale_pair(int16_t sc0, int16_t sc1) {
-    return _mm_set_epi16(sc1,sc1,sc1,sc1,sc1,sc1,sc1,sc1); /* wrong, need sc0 in low */
-}
-/* Actually: _mm_set_epi16 packs from high to low:
- * lane 15(hi)..0(lo) = sc1,sc1,sc1,sc1,sc1,sc1,sc1,sc1 — all same!
- * Need: low 8 = sc0, high 8 = sc1.
- * _mm_set_epi16(a7,a6,a5,a4,a3,a2,a1,a0) = lanes 7..0
- * So: _mm_set_epi16(sc1,sc1,sc1,sc1,sc0,sc0,sc0,sc0) gives lanes 0-3=sc0, 4-7=sc1.
- * But we have 8 int16 per sub-block (from maddubs of 16 pairs → 8 int16).
- * maddubs(16_pairs) → 8 int16 in __m128i.
- * Wait, maddubs of 32 bytes → 16 int16 in __m256i. Low 128 = first 16 pairs,
- * high 128 = next 16 pairs. Each 128-bit half has 8 int16.
- * For 256-bit: q4l = and(32_byte_packed, 0xF) → 32 uint8.
- * xq = 32 int8. maddubs(q4l, xq) → 16 int16 in YMM.
- * Low 8 int16 = sub0's dot products, high 8 int16 = sub1's.
- * So scale_v needs: low 8 = sc0, high 8 = sc1.
- * As __m256i: _mm256_set_epi16(sc1,sc1,sc1,sc1,sc1,sc1,sc1,sc1,
- *                               sc0,sc0,sc0,sc0,sc0,sc0,sc0,sc0)
- */
-static inline __m256i make_scale_256(int16_t sc0, int16_t sc1) {
-    return _mm256_set_epi16(sc1,sc1,sc1,sc1,sc1,sc1,sc1,sc1,
-                            sc0,sc0,sc0,sc0,sc0,sc0,sc0,sc0);
-}
-#endif
 
 static inline void lal_matmul_q4_k(float * __restrict__ y,
                                      const uint8_t * __restrict__ q4k_W,
@@ -72,7 +54,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
     int n_super = in_dim / 256;
     int n_sub = in_dim / 32;
 
-    /* Single-scale x quantization */
+    /* Single-scale x quantization to int8 */
     int8_t xq[XQ_MAX] __attribute__((aligned(32)));
     float x_max = 0;
     for (int i = 0; i < in_dim; i++) { float a = fabsf(x[i]); if (a > x_max) x_max = a; }
@@ -84,7 +66,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
         xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
     }
 
-    /* Pre-compute bsums */
+    /* Pre-compute bsums (sum of int8 xq per sub-block) for min correction */
     int16_t bsums[XQ_MAX / 32] __attribute__((aligned(32)));
     for (int sb = 0; sb < n_sub; sb++) {
         int32_t sum = 0;
@@ -95,9 +77,9 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
 #if defined(__AVX2__) && defined(__F16C__)
     int row_stride = n_super * 144;
     const __m256i m4 = _mm256_set1_epi8(0x0F);
-    float inv_63 = 1.0f / 63.0f;
+    const float inv_63 = 1.0f / 63.0f;
 
-    /* 8-row parallel with 256-bit maddubs + madd scale */
+    /* 8-row parallel main loop */
     int j = 0;
     for (; j + 8 <= out_dim; j += 8) {
         const uint8_t * __restrict__ rows[8];
@@ -110,101 +92,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
         float am0=0,am1=0,am2=0,am3=0,am4=0,am5=0,am6=0,am7=0;
 
         for (int s = 0; s < n_super; s++) {
-            /* Pre-load xq: 256 bytes = 8 × 32 bytes = 8 YMM loads.
-             * Each sub-block = 32 bytes xq. 2 sub-blocks = 64 bytes = 1 YMM pair.
-             * We process 2 sub-blocks per iteration: 32 bytes q4 + 64 bytes xq.
-             * But q4 is packed 4-bit: 32 values = 16 bytes. 2 sub-blocks = 32 bytes q4.
-             * So: load 32 bytes q4 (YMM), split low/high → 2×32 uint8.
-             * Load 64 bytes xq (2 YMM). maddubs(q4l, xq_lo) + maddubs(q4h, xq_hi).
-             * Wait: 32 bytes q4 packed = 64 q4 values = 2 sub-blocks.
-             * q4l = 32 uint8 (0-15), q4h = 32 uint8 (0-15).
-             * xq for 2 sub-blocks = 64 bytes = 2 YMM.
-             * maddubs(q4l, xq_64bytes) — but q4l is 32 bytes, xq is 64 bytes!
-             * Mismatch! maddubs needs equal-sized operands.
-             *
-             * CORRECT approach (matching llama.cpp):
-             * Load 32 bytes q4 → split → q4l(32 uint8), q4h(32 uint8).
-             * Load 64 bytes xq → xv0(32 int8), xv1(32 int8).
-             * maddubs(q4l, xv0) → 16 int16 (sub0+sub1 low nibbles × xq[0..31])
-             * maddubs(q4h, xv1) → 16 int16 (sub0+sub1 high nibbles × xq[32..63])
-             * Wait: q4l has sub0 low[0..15] and sub1 low[16..31].
-             * xv0 has xq[0..31] = sub0's xq.
-             * maddubs(q4l_low16, xv0_low16) = sub0 low × xq[0..15]
-             * maddubs(q4l_high16, xv0_high16) = sub1 low × xq[16..31] ← WRONG!
-                             * sub1 low should pair with xq[32..47]!
-             *
-             * The issue: 32 bytes of packed q4 contains 2 sub-blocks,
-             * but their corresponding xq is in different locations.
-             * sub0: q4 bytes[0..15], xq[0..31]
-             * sub1: q4 bytes[16..31], xq[32..63]
-             *
-             * For 256-bit maddubs, we need q4 and xq to be the SAME 32 bytes.
-             * With adjacent packing: q4 bytes[0..15] = sub0 (32 values),
-             * q4 bytes[16..31] = sub1 (32 values).
-             * xq[0..31] = sub0's xq, xq[32..63] = sub1's xq.
-             *
-             * We CAN'T do maddubs(q4_32bytes, xq_32bytes) because:
-             * - q4 is 4-bit packed (16 bytes per sub-block, not 32)
-             * - After splitting: q4l = 32 uint8, but xq for sub0 is only 32 bytes
-             *
-             * llama.cpp's actual approach:
-             * For each sub-block (32 elements):
-             *   q4bits = load 16 bytes (128-bit) — NOT 32 bytes!
-             *   q4l = and(q4bits, m4) → 16 uint8
-             *   q4h = and(srli(q4bits,4), m4) → 16 uint8
-             *   q8 = load 32 bytes (256-bit) — the xq for this sub-block
-             *   But maddubs needs equal sizes!
-             *   q4l is 16 bytes, q8 is 32 bytes. Mismatch!
-             *
-             * Wait — llama.cpp loads q4bits as 256-bit (32 bytes = 2 sub-blocks):
-             *   q4bits = _mm256_loadu_si256(q4) — 32 bytes, 64 q4 values
-             *   q4l = and(q4bits, m4) → 32 uint8
-             *   q4h = and(srli(q4bits,4), m4) → 32 uint8
-             *   q8l = _mm256_loadu_si256(q8) — 32 bytes = 32 int8
-             *   q8h = _mm256_loadu_si256(q8+32) — next 32 bytes
-             *   p16l = maddubs(q4l, q8l) — 16 int16
-             *   p16h = maddubs(q4h, q8h) — 16 int16
-             *
-             * So q4l (32 uint8) pairs with q8l (32 int8).
-             * q4l[0..15] = sub0 low nibbles, q4l[16..31] = sub1 low nibbles
-             * q8l[0..31] = xq[0..31] = sub0's xq
-             * maddubs pair 0-7: sub0_low × xq[0..15] ← CORRECT
-             * maddubs pair 8-15: sub1_low × xq[16..31] ← WRONG! sub1 should use xq[32..47]
-             *
-             * NO! llama.cpp's packing is adjacent: byte[i]=q[2i]|(q[2i+1]<<4)
-             * So q4l = [q0,q2,q4,...,q62 | q64,q66,...,q126]
-             * q8l = [x0,x1,...,x31]
-             * pair 0 = q0*x0+q2*x1 ← these are ADJACENT pairs in sub0!
-             * This IS correct because q0 and q2 are both in sub0,
-             * and x0, x1 are both in sub0's xq!
-             *
-             * For pair 8: q64*x16+q66*x17 — q64 is sub2's element 0, x16 is sub0's!
-             * WRONG!
-             *
-             * OK I think I finally understand: llama.cpp processes QK_K/64 = 4
-             * iterations (j=0..3). Each iteration loads 32 bytes q4 and 64 bytes q8.
-             * q4 covers 64 values = 2 sub-blocks of 32.
-             * q8 covers 64 values = 2 sub-blocks of 32.
-             * q4l[0..15] = sub(2j) low nibbles, q4l[16..31] = sub(2j+1) low nibbles
-             * q8l[0..31] = sub(2j) xq (32 int8)
-             * q8h[0..31] = sub(2j+1) xq (32 int8)
-             * maddubs(q4l, q8l): pairs 0-7 = sub(2j) low × sub(2j) xq[0..15] ← CORRECT
-             *                      pairs 8-15 = sub(2j+1) low × sub(2j) xq[16..31] ← WRONG!
-             *
-             * NO! q8l is 32 bytes = 32 int8. q4l is 32 uint8. maddubs gives 16 int16.
-             * Each int16 = q4l[2i]*q8l[2i] + q4l[2i+1]*q8l[2i+1].
-             * q4l[0..15] = sub(2j) low nibbles of 32 values
-             * q4l[16..31] = sub(2j+1) low nibbles of 32 values
-             * q8l[0..31] = sub(2j) xq of 32 values
-             * pair 0: q4l[0]*q8l[0]+q4l[1]*q8l[1] = sub(2j)_low[0]*xq[0]+sub(2j)_low[1]*xq[1]
-             * pair 8: q4l[16]*q8l[16]+q4l[17]*q8l[17] = sub(2j+1)_low[0]*xq[16]+sub(2j+1)_low[1]*xq[17]
-             * This is WRONG because sub(2j+1)_low should pair with xq[32..63], not xq[16..31]!
-             *
-             * I'm going in circles. Let me just read the llama.cpp source one more time
-             * and implement EXACTLY what it does.
-             */
-
-            /* Pre-load xq for this superblock: 8 sub-blocks × 32 bytes */
+            /* Pre-load xq for this superblock: 8 sub-blocks × 32 bytes = 8 YMM */
             const __m256i xv0=_mm256_loadu_si256((__m256i*)(xq+s*256+0));
             const __m256i xv1=_mm256_loadu_si256((__m256i*)(xq+s*256+32));
             const __m256i xv2=_mm256_loadu_si256((__m256i*)(xq+s*256+64));
@@ -214,91 +102,82 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
             const __m256i xv6=_mm256_loadu_si256((__m256i*)(xq+s*256+192));
             const __m256i xv7=_mm256_loadu_si256((__m256i*)(xq+s*256+224));
 
+            /* bsums for this superblock: 8 int16 → 1 __m128i */
             __m128i bs_v=_mm_set_epi16(bsums[s*8+7],bsums[s*8+6],bsums[s*8+5],bsums[s*8+4],
                 bsums[s*8+3],bsums[s*8+2],bsums[s*8+1],bsums[s*8+0]);
 
+            /* Process all 8 rows; macro expands to inline SIMD per row */
             #define PROC8(r) do { \
                 const uint8_t *sb=rows[r]+s*144; \
+                /* Super-block fp16 scales */ \
                 float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
                 float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
-                uint8_t sm[16];unpack_scales_6bit(sb+4,sm); \
+                /* Unpack 16 × 6-bit scales+mins */ \
+                uint8_t sm[16]; unpack_scales_6bit(sb+4,sm); \
+                /* Min correction: sum(m[k] * bsums[k]) for k=0..7, then * dmin * x_scale / 63 */ \
                 __m128i mn_v=_mm_set_epi16(sm[15],sm[14],sm[13],sm[12],sm[11],sm[10],sm[9],sm[8]); \
-                __m128i mp=_mm_madd_epi16(mn_v,bs_v);mp=_mm_hadd_epi32(mp,mp);mp=_mm_hadd_epi32(mp,mp); \
+                __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
+                mp=_mm_hadd_epi32(mp,mp); mp=_mm_hadd_epi32(mp,mp); \
                 float r_am=dmin*x_scale*(float)_mm_cvtsi128_si32(mp)*inv_63; \
                 if(r==0)am0-=r_am;else if(r==1)am1-=r_am;else if(r==2)am2-=r_am; \
                 else if(r==3)am3-=r_am;else if(r==4)am4-=r_am;else if(r==5)am5-=r_am; \
                 else if(r==6)am6-=r_am;else am7-=r_am; \
-                /* Process 4 iterations of 2 sub-blocks each (QK_K/64=4) */ \
-                __m256i sumi=_mm256_setzero_si256();const uint8_t*qs=sb+16; \
-                /* Each iter: 32 bytes q4 (64 values) + 2×32 bytes xq */ \
-                /* q4bits=32 bytes: sub(2j) bytes[0..15] + sub(2j+1) bytes[16..31] */ \
-                /* q4l=32 uint8: sub(2j) low[0..15] + sub(2j+1) low[0..15] */ \
-                /* q4h=32 uint8: sub(2j) high[0..15] + sub(2j+1) high[0..15] */ \
-                /* xq for sub(2j)=32 bytes, xq for sub(2j+1)=32 bytes */ \
-                /* maddubs(q4l_low16, xq_sub2j_low16) + maddubs(q4l_high16, xq_sub2j1_low16) */ \
-                /* Use 128-bit extracts for correct pairing: */ \
-                /* iter 0: sub0+sub1. qs[0..15]=sub0, qs[16..31]=sub1 */ \
-                __m256i q4b=_mm256_loadu_si256((__m256i*)qs); \
-                __m256i q4l=_mm256_and_si256(q4b,m4); \
-                __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                __m128i q4l_lo=_mm256_castsi256_si128(q4l); /* sub0 low 16 uint8 */ \
-                __m128i q4l_hi=_mm256_extracti128_si256(q4l,1); /* sub1 low 16 uint8 */ \
-                __m128i q4h_lo=_mm256_castsi256_si128(q4h); /* sub0 high 16 uint8 */ \
-                __m128i q4h_hi=_mm256_extracti128_si256(q4h,1); /* sub1 high 16 uint8 */ \
-                __m128i xl0=_mm256_castsi256_si128(xv0); /* xq[0..15] */ \
-                __m128i xh0=_mm256_extracti128_si256(xv0,1); /* xq[16..31] */ \
-                __m128i xl1=_mm256_castsi256_si128(xv1); /* xq[32..47] */ \
-                __m128i xh1=_mm256_extracti128_si256(xv1,1); /* xq[48..63] */ \
-                __m128i p0l=_mm_maddubs_epi16(q4l_lo,xl0); /* sub0 low × xq[0..15] */ \
-                __m128i p0h=_mm_maddubs_epi16(q4h_lo,xh0); /* sub0 high × xq[16..31] */ \
-                __m128i p1l=_mm_maddubs_epi16(q4l_hi,xl1); /* sub1 low × xq[32..47] */ \
-                __m128i p1h=_mm_maddubs_epi16(q4h_hi,xh1); /* sub1 high × xq[48..63] */ \
-                __m128i sc0=_mm_set1_epi16((int16_t)sm[0]); \
-                __m128i sc1=_mm_set1_epi16((int16_t)sm[1]); \
-                __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,p0l),_mm_madd_epi16(sc0,p0h)); \
-                __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,p1l),_mm_madd_epi16(sc1,p1h)); \
-                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
-                /* iter 1: sub2+sub3. qs[32..47]=sub2, qs[48..63]=sub3 */ \
-                q4b=_mm256_loadu_si256((__m256i*)(qs+32)); \
-                q4l=_mm256_and_si256(q4b,m4); \
-                q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                q4l_lo=_mm256_castsi256_si128(q4l); q4l_hi=_mm256_extracti128_si256(q4l,1); \
-                q4h_lo=_mm256_castsi256_si128(q4h); q4h_hi=_mm256_extracti128_si256(q4h,1); \
-                __m128i xl2=_mm256_castsi256_si128(xv2); __m128i xh2=_mm256_extracti128_si256(xv2,1); \
-                __m128i xl3=_mm256_castsi256_si128(xv3); __m128i xh3=_mm256_extracti128_si256(xv3,1); \
-                p0l=_mm_maddubs_epi16(q4l_lo,xl2); p0h=_mm_maddubs_epi16(q4h_lo,xh2); \
-                p1l=_mm_maddubs_epi16(q4l_hi,xl3); p1h=_mm_maddubs_epi16(q4h_hi,xh3); \
-                sc0=_mm_set1_epi16((int16_t)sm[2]); sc1=_mm_set1_epi16((int16_t)sm[3]); \
-                s0=_mm_add_epi32(_mm_madd_epi16(sc0,p0l),_mm_madd_epi16(sc0,p0h)); \
-                s1=_mm_add_epi32(_mm_madd_epi16(sc1,p1l),_mm_madd_epi16(sc1,p1h)); \
-                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
-                /* iter 2: sub4+sub5 */ \
-                q4b=_mm256_loadu_si256((__m256i*)(qs+64)); \
-                q4l=_mm256_and_si256(q4b,m4); q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                q4l_lo=_mm256_castsi256_si128(q4l); q4l_hi=_mm256_extracti128_si256(q4l,1); \
-                q4h_lo=_mm256_castsi256_si128(q4h); q4h_hi=_mm256_extracti128_si256(q4h,1); \
-                __m128i xl4=_mm256_castsi256_si128(xv4); __m128i xh4=_mm256_extracti128_si256(xv4,1); \
-                __m128i xl5=_mm256_castsi256_si128(xv5); __m128i xh5=_mm256_extracti128_si256(xv5,1); \
-                p0l=_mm_maddubs_epi16(q4l_lo,xl4); p0h=_mm_maddubs_epi16(q4h_lo,xh4); \
-                p1l=_mm_maddubs_epi16(q4l_hi,xl5); p1h=_mm_maddubs_epi16(q4h_hi,xh5); \
-                sc0=_mm_set1_epi16((int16_t)sm[4]); sc1=_mm_set1_epi16((int16_t)sm[5]); \
-                s0=_mm_add_epi32(_mm_madd_epi16(sc0,p0l),_mm_madd_epi16(sc0,p0h)); \
-                s1=_mm_add_epi32(_mm_madd_epi16(sc1,p1l),_mm_madd_epi16(sc1,p1h)); \
-                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
-                /* iter 3: sub6+sub7 */ \
-                q4b=_mm256_loadu_si256((__m256i*)(qs+96)); \
-                q4l=_mm256_and_si256(q4b,m4); q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                q4l_lo=_mm256_castsi256_si128(q4l); q4l_hi=_mm256_extracti128_si256(q4l,1); \
-                q4h_lo=_mm256_castsi256_si128(q4h); q4h_hi=_mm256_extracti128_si256(q4h,1); \
-                __m128i xl6=_mm256_castsi256_si128(xv6); __m128i xh6=_mm256_extracti128_si256(xv6,1); \
-                __m128i xl7=_mm256_castsi256_si128(xv7); __m128i xh7=_mm256_extracti128_si256(xv7,1); \
-                p0l=_mm_maddubs_epi16(q4l_lo,xl6); p0h=_mm_maddubs_epi16(q4h_lo,xh6); \
-                p1l=_mm_maddubs_epi16(q4l_hi,xl7); p1h=_mm_maddubs_epi16(q4h_hi,xh7); \
-                sc0=_mm_set1_epi16((int16_t)sm[6]); sc1=_mm_set1_epi16((int16_t)sm[7]); \
-                s0=_mm_add_epi32(_mm_madd_epi16(sc0,p0l),_mm_madd_epi16(sc0,p0h)); \
-                s1=_mm_add_epi32(_mm_madd_epi16(sc1,p1l),_mm_madd_epi16(sc1,p1h)); \
-                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
-                /* 1 cvtepi32_ps + fmadd */ \
+                /* 4 iterations: pair (sub_2i, sub_2i+1) per iter */ \
+                __m256i sumi=_mm256_setzero_si256(); \
+                const uint8_t*qs=sb+16; \
+                /* iter 0: sub0 + sub1 */ \
+                { \
+                    __m256i q4b=_mm256_loadu_si256((__m256i*)qs); \
+                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
+                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m256i q8_lo=_mm256_permute2x128_si256(xv0,xv1,0x20); \
+                    __m256i q8_hi=_mm256_permute2x128_si256(xv0,xv1,0x31); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
+                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
+                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[1]), \
+                                                   _mm_set1_epi16((short)sm[0])); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                } \
+                /* iter 1: sub2 + sub3 */ \
+                { \
+                    __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+32)); \
+                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
+                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m256i q8_lo=_mm256_permute2x128_si256(xv2,xv3,0x20); \
+                    __m256i q8_hi=_mm256_permute2x128_si256(xv2,xv3,0x31); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
+                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
+                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[3]), \
+                                                   _mm_set1_epi16((short)sm[2])); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                } \
+                /* iter 2: sub4 + sub5 */ \
+                { \
+                    __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+64)); \
+                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
+                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m256i q8_lo=_mm256_permute2x128_si256(xv4,xv5,0x20); \
+                    __m256i q8_hi=_mm256_permute2x128_si256(xv4,xv5,0x31); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
+                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
+                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[5]), \
+                                                   _mm_set1_epi16((short)sm[4])); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                } \
+                /* iter 3: sub6 + sub7 */ \
+                { \
+                    __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+96)); \
+                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
+                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m256i q8_lo=_mm256_permute2x128_si256(xv6,xv7,0x20); \
+                    __m256i q8_hi=_mm256_permute2x128_si256(xv6,xv7,0x31); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
+                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
+                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[7]), \
+                                                   _mm_set1_epi16((short)sm[6])); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                } \
+                /* 1 cvtepi32_ps + fmadd per superblock */ \
                 float mult=d*x_scale*inv_63; \
                 __m256 *ap=(r==0)?&acc0:(r==1)?&acc1:(r==2)?&acc2:(r==3)?&acc3: \
                             (r==4)?&acc4:(r==5)?&acc5:(r==6)?&acc6:&acc7; \
@@ -310,6 +189,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
             #undef PROC8
         }
 
+        /* Horizontal sum each acc + min correction + bias */
         #define HS8(r,a,m) do{__m128 lo=_mm256_castps256_ps128(a),hi=_mm256_extractf128_ps(a,1);\
             __m128 s2=_mm_add_ps(lo,hi);s2=_mm_hadd_ps(s2,s2);s2=_mm_hadd_ps(s2,s2);\
             y[j+r]=_mm_cvtss_f32(s2)+m+(b?b[j+r]:0);}while(0)
@@ -333,7 +213,9 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 bsums[s*8+3],bsums[s*8+2],bsums[s*8+1],bsums[s*8+0]);
             __m128i mp=_mm_madd_epi16(mn_v,bs_v);mp=_mm_hadd_epi32(mp,mp);mp=_mm_hadd_epi32(mp,mp);
             acc_min -= dmin*x_scale*(float)_mm_cvtsi128_si32(mp)*inv_63;
-            __m256i sumi=_mm256_setzero_si256();const uint8_t*qs=sb+16;
+
+            __m256i sumi=_mm256_setzero_si256();
+            const uint8_t*qs=sb+16;
             const __m256i xv0=_mm256_loadu_si256((__m256i*)(xq+s*256+0));
             const __m256i xv1=_mm256_loadu_si256((__m256i*)(xq+s*256+32));
             const __m256i xv2=_mm256_loadu_si256((__m256i*)(xq+s*256+64));
@@ -342,24 +224,23 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
             const __m256i xv5=_mm256_loadu_si256((__m256i*)(xq+s*256+160));
             const __m256i xv6=_mm256_loadu_si256((__m256i*)(xq+s*256+192));
             const __m256i xv7=_mm256_loadu_si256((__m256i*)(xq+s*256+224));
+
             #define SR(qoff,xva,xvb,sa,sb_) do{\
                 __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+qoff));\
-                __m256i q4l=_mm256_and_si256(q4b,m4);\
-                __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4);\
-                __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1);\
-                __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1);\
-                __m128i xll=_mm256_castsi256_si128(xva),xlh=_mm256_extracti128_si256(xva,1);\
-                __m128i xhl=_mm256_castsi256_si128(xvb),xhh=_mm256_extracti128_si256(xvb,1);\
-                __m128i pl=_mm_maddubs_epi16(q4ll,xll),ph=_mm_maddubs_epi16(q4hl,xlh);\
-                __m128i pl2=_mm_maddubs_epi16(q4lh,xhl),ph2=_mm_maddubs_epi16(q4hh,xhh);\
-                __m128i sc0=_mm_set1_epi16((int16_t)sa),sc1=_mm_set1_epi16((int16_t)sb_);\
-                __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph));\
-                __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2));\
-                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0));\
+                __m256i q4_0=_mm256_and_si256(q4b,m4);\
+                __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4);\
+                __m256i q8_lo=_mm256_permute2x128_si256(xva,xvb,0x20);\
+                __m256i q8_hi=_mm256_permute2x128_si256(xva,xvb,0x31);\
+                __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo),\
+                                              _mm256_maddubs_epi16(q4_1,q8_hi));\
+                __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sb_),\
+                                               _mm_set1_epi16((short)sa));\
+                sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16));\
             }while(0)
             SR(0,xv0,xv1,sm[0],sm[1]);SR(32,xv2,xv3,sm[2],sm[3]);
             SR(64,xv4,xv5,sm[4],sm[5]);SR(96,xv6,xv7,sm[6],sm[7]);
             #undef SR
+
             float mult=d*x_scale*inv_63;
             acc=_mm256_fmadd_ps(_mm256_set1_ps(mult),_mm256_cvtepi32_ps(sumi),acc);
         }

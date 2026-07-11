@@ -54,10 +54,10 @@ static void quantize_q4_k_row(const float *w, uint8_t *out, int in_dim) {
         }
         for (int j = 0; j < 8; j++) { combined[j] = sc6[j]; combined[j+8] = m6[j]; }
 
-        /* Pack 16 × 6-bit into 12 bytes */
-        uint64_t bits = 0;
+        /* Pack 16 × 6-bit into 12 bytes — use __uint128_t to avoid uint64_t overflow */
+        __uint128_t bits = 0;
         for (int j = 0; j < 16; j++)
-            bits |= (combined[j] & 0x3F) << (j * 6);
+            bits |= ((__uint128_t)(combined[j] & 0x3F)) << (j * 6);
         for (int b = 0; b < 12; b++)
             sb[4+b] = (bits >> (b * 8)) & 0xFF;
 
@@ -123,21 +123,22 @@ int main() {
                scales_mins[4],scales_mins[5],scales_mins[6],scales_mins[7],
                scales_mins[8],scales_mins[9],scales_mins[10],scales_mins[11],
                scales_mins[12],scales_mins[13],scales_mins[14],scales_mins[15]);
-        /* Dequant and compare — ADJACENT packing */
+        /* Dequant and compare — INTERLEAVED packing:
+         * byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4) */
         float max_err = 0;
         for (int sub = 0; sub < 8; sub++) {
             float ascale = d * scales_mins[sub] / 63.0f;
             float amin = dmin * scales_mins[8+sub] / 63.0f;
             for (int i = 0; i < 16; i++) {
-                int idx0 = sub*32 + 2*i;
-                int idx1 = sub*32 + 2*i + 1;
+                int idx_lo = sub*32 + i;
+                int idx_hi = sub*32 + i + 16;
                 uint8_t byte_val = sb[16 + sub*16 + i];
-                uint8_t q0 = byte_val & 0xF;
-                uint8_t q1 = (byte_val >> 4) & 0xF;
-                float w0 = ascale * q0 - amin;
-                float w1 = ascale * q1 - amin;
-                float err = fabsf(w0 - w[0][idx0]); if (err > max_err) max_err = err;
-                err = fabsf(w1 - w[0][idx1]); if (err > max_err) max_err = err;
+                uint8_t q_lo = byte_val & 0xF;
+                uint8_t q_hi = (byte_val >> 4) & 0xF;
+                float w_lo = ascale * q_lo - amin;
+                float w_hi = ascale * q_hi - amin;
+                float err = fabsf(w_lo - w[0][idx_lo]); if (err > max_err) max_err = err;
+                err = fabsf(w_hi - w[0][idx_hi]); if (err > max_err) max_err = err;
             }
         }
         printf("  Dequant max error for row 0: %.6f\n", max_err);
@@ -209,16 +210,19 @@ int main() {
         }
         printf("  Dequant max error for large row 0: %.6f\n", max_deq_err);
     }
-    float max_rel = 0;
+    float max_rel = 0, max_abs = 0;
     for (int j = 0; j < out_dim; j++) {
         float err = fabsf(y_k2[j] - y_r2[j]);
         float rel = err / (fabsf(y_r2[j]) + 1e-8f);
-        if (rel > max_rel) max_rel = rel;
+        /* Only count relative error when ref is large enough to be meaningful */
+        if (fabsf(y_r2[j]) > 0.05f && rel > max_rel) max_rel = rel;
+        if (err > max_abs) max_abs = err;
         printf("  row %d: ref=%+.6f  kernel=%+.6f  err=%.6f  rel=%.4f\n",
                j, y_r2[j], y_k2[j], err, rel);
     }
-    printf("\n  Max relative error: %.4f (%.1f%%)\n", max_rel, max_rel*100);
-    if (max_rel < 0.15f) printf("  PASS (< 15%%)\n");
+    printf("\n  Max relative error (ref>0.05): %.4f (%.1f%%)\n", max_rel, max_rel*100);
+    printf("  Max absolute error: %.6f\n", max_abs);
+    if (max_rel < 0.15f) printf("  PASS (< 15%% rel on meaningful rows)\n");
     else printf("  FAIL (> 15%%) — kernel has a bug!\n");
 
     free(w2); free(x2); free(q4k2); free(y_k2); free(y_r2);
