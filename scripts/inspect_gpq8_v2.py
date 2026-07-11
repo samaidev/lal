@@ -14,11 +14,12 @@ def main(path):
         ndim = struct.unpack("<i", f.read(4))[0]
         shape = [struct.unpack("<i", f.read(4))[0] for _ in range(ndim)]
         qtype = f.read(1)[0]
+        qtype_str = "F32" if qtype == 0 else ("Q8" if qtype == 1 else "Q4_0")
         dl = struct.unpack("<Q", f.read(8))[0]
         f.seek(f.tell() + dl)
         ns = struct.unpack("<i", f.read(4))[0]
         f.seek(f.tell() + ns * 4)
-        tensors.append((key, shape, "F32" if qtype == 0 else "Q8", dl, ns))
+        tensors.append((key, shape, qtype_str, dl, ns))
 
     print("\nNon-layer tensors:")
     for k, s, q, d, ns in tensors:
