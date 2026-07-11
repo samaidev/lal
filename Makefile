@@ -7,7 +7,7 @@ CC ?= gcc
 # intrinsics per platform (see top of that file).
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
-  SIMD_FLAGS ?= -mavx2 -mfma
+  SIMD_FLAGS ?= -mavx2 -mfma -mf16c
 else ifeq ($(UNAME_M),i386)
   SIMD_FLAGS ?= -msse4.1
 else ifneq (,$(filter $(UNAME_M),arm armv7l armv7-a))
