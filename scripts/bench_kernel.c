@@ -21,6 +21,7 @@
 #define XQ_MAX 18944
 #include "runtime/lal_runtime.h"
 #include "runtime/lal_q8_kernel.h"
+#include "runtime/lal_q4_kernel.h"
 
 static double now_s(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -65,13 +66,11 @@ static void bench_q8_0(const char *name, int in_dim, int out_dim, int n_iter) {
     float   *x = memalign(32, in_dim * sizeof(float));
     float   *y = memalign(32, out_dim * sizeof(float));
 
-    /* Fill with random data: scale=0.01 (fp16), weights=random int8 */
     for (int j = 0; j < out_dim; j++) {
         uint8_t *row = q8_0_W + (size_t)j * row_stride;
         for (int b = 0; b < blocks_per_row; b++) {
             uint8_t *block = row + b * 34;
-            /* fp16 scale = 0.01 → bytes 0x14, 0x2C (little-endian) */
-            uint16_t scale_u16 = 0x2C14;  /* fp16(0.01) */
+            uint16_t scale_u16 = 0x2C14;
             block[0] = scale_u16 & 0xFF;
             block[1] = (scale_u16 >> 8) & 0xFF;
             for (int i = 0; i < 32; i++) block[2 + i] = (uint8_t)(rand() & 0x7F);
@@ -87,7 +86,6 @@ static void bench_q8_0(const char *name, int in_dim, int out_dim, int n_iter) {
     double t1 = now_s();
     double dt = (t1 - t0) / n_iter;
 
-    /* Q8_0: 34 bytes per 32 elements = 1.0625 bytes/elem */
     double bytes = (double)out_dim * blocks_per_row * 34 + in_dim * 4 + out_dim * 4;
     double gb_s = bytes / dt / 1e9;
     double flops = 2.0 * out_dim * in_dim;
@@ -97,6 +95,46 @@ static void bench_q8_0(const char *name, int in_dim, int out_dim, int n_iter) {
            name, out_dim, in_dim, in_dim, dt*1000, gb_s, gflops);
 
     free(q8_0_W); free(x); free(y);
+}
+
+/* Test Q4_0 block-format matmul */
+static void bench_q4_0(const char *name, int in_dim, int out_dim, int n_iter) {
+    int blocks_per_row = in_dim / 32;
+    int row_stride = blocks_per_row * 18;
+    uint8_t *q4_W = memalign(32, (size_t)out_dim * row_stride);
+    float   *x = memalign(32, in_dim * sizeof(float));
+    float   *y = memalign(32, out_dim * sizeof(float));
+
+    for (int j = 0; j < out_dim; j++) {
+        uint8_t *row = q4_W + (size_t)j * row_stride;
+        for (int b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = row + b * 18;
+            uint16_t scale_u16 = 0x2C14;
+            block[0] = scale_u16 & 0xFF;
+            block[1] = (scale_u16 >> 8) & 0xFF;
+            for (int i = 0; i < 16; i++) block[2 + i] = (uint8_t)(rand() & 0xFF);
+        }
+    }
+    for (int i = 0; i < in_dim; i++) x[i] = (float)(rand() % 100) / 100.0f;
+
+    lal_matmul_q4_0(y, q4_W, x, NULL, in_dim, out_dim);
+
+    double t0 = now_s();
+    for (int i = 0; i < n_iter; i++)
+        lal_matmul_q4_0(y, q4_W, x, NULL, in_dim, out_dim);
+    double t1 = now_s();
+    double dt = (t1 - t0) / n_iter;
+
+    /* Q4_0: 18 bytes per 32 elements = 0.5625 bytes/elem */
+    double bytes = (double)out_dim * blocks_per_row * 18 + in_dim * 4 + out_dim * 4;
+    double gb_s = bytes / dt / 1e9;
+    double flops = 2.0 * out_dim * in_dim;
+    double gflops = flops / dt / 1e9;
+
+    printf("  %-28s [%d, %d] @ [in=%d]: %7.3f ms  %6.1f GB/s  %6.1f GFLOPS\n",
+           name, out_dim, in_dim, in_dim, dt*1000, gb_s, gflops);
+
+    free(q4_W); free(x); free(y);
 }
 
 int main(void) {
@@ -111,13 +149,21 @@ int main(void) {
     bench_q8_legacy("down_proj",18944,3584, 10);
     bench_q8_legacy("lm_head",  3584, 152064, 5);
 
-    printf("\n--- NEW Q8_0 (block scale, 4-row parallel + prefetch) ---\n");
+    printf("\n--- Q8_0 (block scale, 8-row parallel, cvtepi32_ps) ---\n");
     bench_q8_0("q_proj",   3584, 3584, 20);
     bench_q8_0("k_proj",   3584,  512, 50);
     bench_q8_0("o_proj",   3584, 3584, 20);
     bench_q8_0("gate_proj",3584,18944, 10);
     bench_q8_0("down_proj",18944,3584, 10);
     bench_q8_0("lm_head",  3584, 152064, 5);
+
+    printf("\n--- Q4_0 (block scale, 8-row parallel, cvtepi32_ps) ---\n");
+    bench_q4_0("q_proj",   3584, 3584, 20);
+    bench_q4_0("k_proj",   3584,  512, 50);
+    bench_q4_0("o_proj",   3584, 3584, 20);
+    bench_q4_0("gate_proj",3584,18944, 10);
+    bench_q4_0("down_proj",18944,3584, 10);
+    bench_q4_0("lm_head",  3584, 152064, 5);
 
     return 0;
 }
