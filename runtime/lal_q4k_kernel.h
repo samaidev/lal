@@ -60,15 +60,12 @@ static inline void lal_matmul_q4_k(float *y,
                                      const float *x,
                                      const float *b,
                                      int in_dim, int out_dim) {
-#if defined(__AVX2__) && defined(__F16C__)
-    /* Quantize x to Q8 per 32-element block (matching Q4_K sub-blocks) */
-    int n_super = in_dim / 256;   /* superblocks per row */
-    int row_stride = n_super * 144;
-
-    /* Pre-quantize x to int8, one scale per 32-element sub-block */
-    int8_t xq[XQ_MAX] __attribute__((aligned(32)));
-    float x_scales[XQ_MAX / 32];  /* per 32-elem scale */
+    /* Pre-quantize x to int8 (shared by AVX2 and scalar paths) */
+    int n_super = in_dim / 256;
     int n_sub = in_dim / 32;
+    int8_t xq[XQ_MAX] __attribute__((aligned(32)));
+    float x_scales[XQ_MAX / 32];
+
     for (int sb = 0; sb < n_sub; sb++) {
         const float *xb = x + sb * 32;
         float x_max = 0;
@@ -82,6 +79,9 @@ static inline void lal_matmul_q4_k(float *y,
             xq[sb * 32 + i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
         }
     }
+
+#if defined(__AVX2__) && defined(__F16C__)
+    int row_stride = n_super * 144;
 
     __m256i ones = _mm256_set1_epi16(1);
     __m256i m4 = _mm256_set1_epi8(0x0F);
@@ -114,43 +114,54 @@ static inline void lal_matmul_q4_k(float *y,
                 int xoff = (s * 8 + sub) * 32;
                 float x_scale = x_scales[s * 8 + sub];
 
-                /* Sub-block scale and min */
-                float sb_scale = d * scales_mins[sub] / 63.0f;
-                float sb_min = -dmin * scales_mins[8 + sub] / 63.0f;
+                /* Sub-block scale and min.
+                 * Converter: q = round((x + actual_min) / actual_scale)
+                 * Dequant:   w = actual_scale * q - actual_min
+                 * So: dot(w, x) = actual_scale * dot(q, x) - actual_min * sum(x)
+                 * For the dot product with quantized xq:
+                 *   result = combined_scale * dot(q4, xq) - combined_min * sum(xq)
+                 * where combined_scale = sb_scale * x_scale
+                 *       combined_min = sb_min * x_scale (sb_min = dmin * m / 63, positive)
+                 */
+                float sb_scale = d * scales_mins[sub] / 63.0f;      /* positive */
+                float sb_min = dmin * scales_mins[8 + sub] / 63.0f;  /* positive */
 
                 /* Combined scale for dot product */
                 float combined = sb_scale * x_scale;
                 __m256 d_v = _mm256_set1_ps(combined);
 
-                /* Load 16 bytes of q4 → 32 values (low nibbles + high nibbles) */
+                /* Load 16 bytes of q4 → 32 values (low nibbles = first 16, high nibbles = next 16)
+                 * q4[0..15] = low nibbles of bytes[0..15]
+                 * q4[16..31] = high nibbles of bytes[0..15] */
                 __m128i q4bits = _mm_loadu_si128((__m128i*)(qs + qoff));
-                __m256i q4l = _mm256_cvtepu8_epi16(_mm_and_si128(q4bits, _mm_set1_epi8(0x0F)));
-                __m256i q4h = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(q4bits, 4), _mm_set1_epi8(0x0F)));
+                /* Low nibbles: 16 uint8 values (0-15) */
+                __m128i q4l_128 = _mm_and_si128(q4bits, _mm_set1_epi8(0x0F));
+                /* High nibbles: 16 uint8 values (0-15) */
+                __m128i q4h_128 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), _mm_set1_epi8(0x0F));
 
-                /* Load 32 int8 x values (split into 2 × 16 → 2 × 16 int16) */
-                __m256i xv_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128((__m128i*)(xq + xoff)));
-                __m256i xv_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128((__m128i*)(xq + xoff + 16)));
+                /* Load 32 int8 x values: first 16 and next 16 */
+                __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));      /* xq[0..15] */
+                __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));  /* xq[16..31] */
 
-                /* Dot products: q4 (uint8) × xq (int8) → int16 → int32 → float
-                 * q4 values are 0..15 (unsigned), xq is -127..127 (signed)
-                 * maddubs: uint8 × int8 → int16 (correct for unsigned×signed) */
-                __m256i p16_lo = _mm256_maddubs_epi16(q4l, xv_lo);
-                __m256i p16_hi = _mm256_maddubs_epi16(q4h, xv_hi);
-                __m256i sum32_lo = _mm256_madd_epi16(p16_lo, ones);
-                __m256i sum32_hi = _mm256_madd_epi16(p16_hi, ones);
+                /* maddubs: uint8 × int8 → int16 (8 pairs → 8 int16 per 128-bit)
+                 * q4l (16 uint8) dot xv_lo (16 int8) → 8 int16 */
+                __m128i p16_lo = _mm_maddubs_epi16(q4l_128, xv_lo);
+                __m128i p16_hi = _mm_maddubs_epi16(q4h_128, xv_hi);
+
+                /* Combine 2 × 8 int16 → 16 int16 → madd to 8 int32 */
+                __m256i p16 = _mm256_set_m128i(p16_hi, p16_lo);  /* 16 int16 */
+                __m256i sum32 = _mm256_madd_epi16(p16, ones);     /* 8 int32 */
 
                 /* Convert to float and accumulate (NO hsum per block!) */
-                __m256 f_lo = _mm256_cvtepi32_ps(sum32_lo);
-                __m256 f_hi = _mm256_cvtepi32_ps(sum32_hi);
-                acc = _mm256_fmadd_ps(d_v, f_lo, acc);
-                acc = _mm256_fmadd_ps(d_v, f_hi, acc);
+                __m256 f = _mm256_cvtepi32_ps(sum32);
+                acc = _mm256_fmadd_ps(d_v, f, acc);
 
-                /* Min correction: acc_min += sb_min * sum(xq) * x_scale
+                /* Min correction: acc_min -= sb_min * sum(xq) * x_scale
+                 * (subtract because w = scale*q - min, so dot(w,x) includes -min*sum(x))
                  * sum(xq) = hsum of the 32 int8 values */
-                /* Compute sum of xq for this sub-block */
                 int32_t xq_sum = 0;
                 for (int i = 0; i < 32; i++) xq_sum += xq[xoff + i];
-                acc_min += sb_min * x_scale * (float)xq_sum;
+                acc_min -= sb_min * x_scale * (float)xq_sum;
             }
         }
 
@@ -163,7 +174,6 @@ static inline void lal_matmul_q4_k(float *y,
     }
 #else
     /* Scalar fallback */
-    int n_super = in_dim / 256;
     int row_stride = n_super * 144;
     for (int j = 0; j < out_dim; j++) {
         const uint8_t *row = q4k_W + (size_t)j * row_stride;
@@ -187,17 +197,18 @@ static inline void lal_matmul_q4_k(float *y,
             const uint8_t *qs = sb + 16;
             for (int sub = 0; sub < 8; sub++) {
                 float sb_scale = d * scales_mins[sub] / 63.0f;
-                float sb_min = -dmin * scales_mins[8 + sub] / 63.0f;
+                float sb_min = dmin * scales_mins[8 + sub] / 63.0f;
                 int xoff = (s * 8 + sub) * 32;
                 int qoff = sub * 16;
+                float xs = x_scales[s * 8 + sub];
                 int32_t dot = 0, xq_sum = 0;
                 for (int i = 0; i < 32; i++) {
                     uint8_t q4 = (qs[qoff + i/2] >> ((i%2)*4)) & 0xF;
                     dot += q4 * (int)xq[xoff + i];
                     xq_sum += (int)xq[xoff + i];
                 }
-                acc += sb_scale * (float)dot;
-                acc_min += sb_min * (float)xq_sum;
+                acc += sb_scale * xs * (float)dot;
+                acc_min -= sb_min * xs * (float)xq_sum;
             }
         }
         y[j] = acc + acc_min + (b ? b[j] : 0);

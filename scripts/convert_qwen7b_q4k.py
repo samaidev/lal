@@ -25,63 +25,54 @@ def bf16_to_f32(u16_bytes):
 
 def quantize_q4_k_per_row(f32_data, in_dim, out_dim):
     """Quantize [out_dim, in_dim] to Q4_K format.
-    256-element superblocks, 8 sub-blocks of 32 elements each.
-    Each sub-block has its own 6-bit scale and 6-bit min.
+    Simplified: per-sub-block (32 elem) scale + min, matching llama.cpp's formula:
+      q = round((x + min) / scale), dequant: w = scale * q - min
+    where scale = d * sc / 63, min = dmin * m / 63
     """
     w = np.asarray(f32_data, dtype=np.float32).reshape(out_dim, in_dim)
     assert in_dim % 256 == 0, f"in_dim {in_dim} not multiple of 256"
-    n_super = in_dim // 256  # superblocks per row
-    # Reshape to [out_dim, n_super, 8, 32] (8 sub-blocks of 32 elements)
+    n_super = in_dim // 256
     w_blocks = w.reshape(out_dim, n_super, 8, 32)
 
-    # Per sub-block: scale and min (6-bit each, 0-63)
-    sub_max = np.max(w_blocks, axis=3)  # [out_dim, n_super, 8]
+    # Per sub-block: find min and scale
     sub_min = np.min(w_blocks, axis=3)  # [out_dim, n_super, 8]
+    sub_max = np.max(w_blocks, axis=3)
+    sub_scale = (sub_max - sub_min) / 15.0  # range / 15 for 4-bit 0-15
+    sub_scale = np.where(sub_scale < 1e-8, 1e-8, sub_scale)
 
-    # Super-block scale d = max(|sub_max|, |sub_min|) across all 8 sub-blocks
-    # But we need per-sub-block scales relative to d
-    # Scale: 6-bit (0-63), actual_scale = d * scale_6bit / 63
-    # Min: 6-bit (0-63), actual_min = dmin * min_6bit / 63
+    # Super-block d = max scale, dmin = max |min|
+    max_scale = np.max(sub_scale, axis=2)  # [out_dim, n_super]
+    max_min = np.max(np.abs(sub_min), axis=2)
+    max_scale = np.where(max_scale < 1e-8, 1e-8, max_scale)
+    max_min = np.where(max_min < 1e-8, 1e-8, max_min)
 
-    # Super-block d and dmin
-    all_max = np.max(sub_max, axis=2)  # [out_dim, n_super]
-    all_min = np.min(sub_min, axis=2)
-    d = np.maximum(np.abs(all_max), np.abs(all_min))
-    d = np.where(d < 1e-8, 1e-8, d).astype(np.float32)
-    dmin = np.maximum(np.abs(all_min), 1e-8).astype(np.float32)
+    d = max_scale.astype(np.float32)
+    dmin = max_min.astype(np.float32)
 
-    # Per-sub-block 6-bit scales: scale_6bit = round(actual_scale / d * 63)
-    # actual_scale = (sub_max - sub_min) / 15  (range / 15 for 4-bit 0-15)
-    sub_range = sub_max - sub_min  # [out_dim, n_super, 8]
-    sub_scale = sub_range / (d[:, :, None] * 15.0 + 1e-8)
-    scale_6bit = np.clip(np.round(sub_scale * 63), 0, 63).astype(np.uint8)
+    # 6-bit scales: sc = round(sub_scale / d * 63)
+    scale_6bit = np.clip(np.round(sub_scale / d[:, :, None] * 63), 0, 63).astype(np.uint8)
+    # 6-bit mins: m = round(|sub_min| / dmin * 63)
+    min_6bit = np.clip(np.round(np.abs(sub_min) / dmin[:, :, None] * 63), 0, 63).astype(np.uint8)
 
-    # Per-sub-block 6-bit mins: min_6bit = round(|sub_min| / dmin * 63)
-    sub_min_abs = np.abs(sub_min)
-    min_6bit = np.clip(np.round(sub_min_abs / (dmin[:, :, None] + 1e-8) * 63), 0, 63).astype(np.uint8)
+    # Quantize: q = round((x + dmin*m/63) / (d*sc/63))
+    actual_scale = d[:, :, None] * scale_6bit.astype(np.float32) / 63.0
+    actual_min = dmin[:, :, None] * min_6bit.astype(np.float32) / 63.0  # positive (it's |min|)
 
-    # Quantize: q = round((w - sub_min) / actual_scale) where actual_scale = d * scale_6bit / 63
-    actual_scale = d[:, :, None] * scale_6bit.astype(np.float32) / 63.0  # [out_dim, n_super, 8]
-    actual_min = -dmin[:, :, None] * min_6bit.astype(np.float32) / 63.0  # negative
+    # q = round((x + actual_min) / actual_scale), clip 0-15
+    # Dequant: w = actual_scale * q - actual_min
+    q = np.round((w_blocks + actual_min[:, :, :, None]) / (actual_scale[:, :, :, None] + 1e-8))
+    q = np.clip(q, 0, 15).astype(np.uint8)
 
-    # q = clip(round((w - actual_min) / actual_scale), 0, 15)
-    q = np.round((w_blocks - actual_min[:, :, :, None]) / (actual_scale[:, :, :, None] + 1e-8))
-    q = np.clip(q, 0, 15).astype(np.uint8)  # [out_dim, n_super, 8, 32]
-
-    # Pack 4-bit values: 256 elements → 128 bytes
+    # Pack 4-bit values: 256 elements -> 128 bytes
     q_flat = q.reshape(out_dim, n_super, 256)
     q_pairs = q_flat.reshape(out_dim, n_super, 128, 2)
-    qs_packed = q_pairs[:, :, :, 0] | (q_pairs[:, :, :, 1] << 4)  # [out_dim, n_super, 128]
+    qs_packed = q_pairs[:, :, :, 0] | (q_pairs[:, :, :, 1] << 4)
 
-    # Pack scales+mins: 8 × (scale_6bit, min_6bit) = 16 values, 6-bit each
-    # Pack into 12 bytes: use llama.cpp's packing scheme
-    # Simplified: store 8 scales (6-bit) + 8 mins (6-bit) = 16 × 6 = 96 bits = 12 bytes
+    # Pack scales+mins: 8 scales + 8 mins, 6-bit each, into 12 bytes
     scales_min = np.zeros((out_dim, n_super, 12), dtype=np.uint8)
-    # Pack 16 6-bit values into 12 bytes (96 bits)
     combined = np.zeros((out_dim, n_super, 16), dtype=np.uint32)
-    combined[:, :, :8] = scale_6bit  # scales first
-    combined[:, :, 8:] = min_6bit    # mins second
-    # Pack 16 × 6-bit into 12 bytes
+    combined[:, :, :8] = scale_6bit
+    combined[:, :, 8:] = min_6bit
     for i in range(out_dim):
         for s in range(n_super):
             bits = 0
