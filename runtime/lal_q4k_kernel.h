@@ -130,37 +130,78 @@ static inline void lal_matmul_q4_k(float *y,
                 float combined = sb_scale * x_scale;
                 __m256 d_v = _mm256_set1_ps(combined);
 
-                /* Load 16 bytes of q4 → 32 values (low nibbles = first 16, high nibbles = next 16)
-                 * q4[0..15] = low nibbles of bytes[0..15]
-                 * q4[16..31] = high nibbles of bytes[0..15] */
-                __m128i q4bits = _mm_loadu_si128((__m128i*)(qs + qoff));
-                /* Low nibbles: 16 uint8 values (0-15) */
-                __m128i q4l_128 = _mm_and_si128(q4bits, _mm_set1_epi8(0x0F));
-                /* High nibbles: 16 uint8 values (0-15) */
-                __m128i q4h_128 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), _mm_set1_epi8(0x0F));
+                /* Load 16 bytes of q4 (32 values, packed as q[2i] | q[2i+1]<<4)
+                 * maddubs directly: uint8 × int8 → int16, processing pairs.
+                 * byte[i] = q[2i] | (q[2i+1] << 4)
+                 * maddubs treats byte as [uint8_lo, int8_hi] pairs:
+                 *   result[i] = q[2i] * xq[2i] + q[2i+1] * xq[2i+1]  ← CORRECT!
+                 * But maddubs needs uint8 for first arg (q4 nibbles are 0-15 = uint8)
+                 * and int8 for second arg (xq is -127..127 = int8).
+                 * The 4-bit q values ARE uint8 (0-15), so maddubs works directly.
+                 * But the high nibble is 0-15 shifted to 0-240, not 0-15!
+                 * We need to split: low nibbles (uint8 0-15) and high nibbles (uint8 0-15).
+                 *
+                 * CORRECT approach: split into low and high, each 16 uint8 values.
+                 * low[i] = byte[i] & 0x0F = q[2i]     (indices 0,2,4,...,30)
+                 * high[i] = byte[i] >> 4 = q[2i+1]    (indices 1,3,5,...,31)
+                 * Then: dot = sum_i q[2i]*xq[2i] + sum_i q[2i+1]*xq[2i+1]
+                 *       = maddubs(low, xq_even) + maddubs(high, xq_odd)
+                 * But xq is contiguous! We need xq[0,2,4,...,30] and xq[1,3,5,...,31].
+                 *
+                 * SIMPLER: use maddubs directly on the packed bytes with full xq.
+                 * maddubs(packed, xq) where packed has uint8 in low nibble and
+                 * "sign-extended" high nibble... NO, that doesn't work because
+                 * high nibbles are 0-15 shifted to 0-240 in the upper 4 bits.
+                 *
+                 * ACTUALLY CORRECT: maddubs treats BOTH operands as bytes.
+                 * packed byte[i] = q[2i] | (q[2i+1] << 4).
+                 * As uint8: byte[i] = q[2i] + 16*q[2i+1]. This is NOT q[2i]!
+                 * We MUST split low/high nibbles first.
+                 *
+                 * The fix: use maddubs on (low_nibbles, xq_lo) + (high_nibbles, xq_hi)
+                 * where xq_lo and xq_hi are the CORRECT halves of xq.
+                 * low_nibbles[i] = q[2i], should pair with xq[2i]
+                 * high_nibbles[i] = q[2i+1], should pair with xq[2i+1]
+                 *
+                 * So we need to deinterleave xq: even indices and odd indices.
+                 * OR: just do 2 separate maddubs:
+                 *   maddubs(low, xq[0..15])  → pairs (q[0]*xq[0]+q[2]*xq[1], ...) ← WRONG
+                 *
+                 * The REAL fix: change packing to interleaved (llama.cpp style):
+                 *   byte[i] = q[i] | (q[i+16] << 4)  for i=0..15
+                 * Then low nibbles = q[0..15], high nibbles = q[16..31]. Correct!
+                 */
 
-                /* Load 32 int8 x values: first 16 and next 16 */
-                __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));      /* xq[0..15] */
-                __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));  /* xq[16..31] */
-
-                /* maddubs: uint8 × int8 → int16 (8 pairs → 8 int16 per 128-bit)
-                 * q4l (16 uint8) dot xv_lo (16 int8) → 8 int16 */
-                __m128i p16_lo = _mm_maddubs_epi16(q4l_128, xv_lo);
-                __m128i p16_hi = _mm_maddubs_epi16(q4h_128, xv_hi);
-
-                /* Combine 2 × 8 int16 → 16 int16 → madd to 8 int32 */
-                __m256i p16 = _mm256_set_m128i(p16_hi, p16_lo);  /* 16 int16 */
-                __m256i sum32 = _mm256_madd_epi16(p16, ones);     /* 8 int32 */
-
-                /* Convert to float and accumulate (NO hsum per block!) */
-                __m256 f = _mm256_cvtepi32_ps(sum32);
-                acc = _mm256_fmadd_ps(d_v, f, acc);
-
-                /* Min correction: acc_min -= sb_min * sum(xq) * x_scale
-                 * (subtract because w = scale*q - min, so dot(w,x) includes -min*sum(x))
-                 * sum(xq) = hsum of the 32 int8 values */
-                int32_t xq_sum = 0;
-                for (int i = 0; i < 32; i++) xq_sum += xq[xoff + i];
+                /* For now: use the DIRECT approach. The packed bytes are
+                 * byte[i] = q[2i] | (q[2i+1] << 4). maddubs processes pairs:
+                 * result = q[2i]*x[2i] + q[2i+1]*x[2i+1] for each pair.
+                 * But maddubs uses the FULL byte as uint8, not split nibbles!
+                 * byte[i] = q[2i] + 16*q[2i+1] which is NOT what we want.
+                 *
+                 * We need to SPLIT into low and high nibbles, then pair correctly.
+                 * low[i] = q[2i]   → should multiply with xq[2i]
+                 * high[i] = q[2i+1] → should multiply with xq[2i+1]
+                 *
+                 * To pair correctly with contiguous xq, we need to deinterleave:
+                 * xq_even = [xq[0], xq[2], xq[4], ..., xq[30]]
+                 * xq_odd  = [xq[1], xq[3], xq[5], ..., xq[31]]
+                 * Then: maddubs(low, xq_even) + maddubs(high, xq_odd)
+                 *
+                 * This is complex. SIMPLER FIX: change the converter packing to
+                 * interleaved style: byte[i] = q[i] | (q[i+16] << 4).
+                 * Then low = q[0..15], high = q[16..31], pairs with xq[0..15] and xq[16..31].
+                 */
+                /* Scalar dot product (correct but slow — for verification) */
+                int32_t dot = 0, xq_sum = 0;
+                for (int i = 0; i < 32; i++) {
+                    uint8_t q4 = (qs[qoff + i/2] >> ((i%2)*4)) & 0xF;
+                    dot += (int)q4 * (int)xq[xoff + i];
+                    xq_sum += (int)xq[xoff + i];
+                }
+                /* Add to acc's lane 0 only (not broadcast!) */
+                float dot_f = (float)dot * combined;
+                acc = _mm256_add_ps(acc, _mm256_castps128_ps256(_mm_set_ss(dot_f)));
+                /* Min correction */
                 acc_min -= sb_min * x_scale * (float)xq_sum;
             }
         }
