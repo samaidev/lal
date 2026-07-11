@@ -1,28 +1,28 @@
-/* lal_q4k_kernel.h — Q4_K matmul kernel (256-bit maddubs + vperm2i128)
+/* lal_q4k_kernel.h — Q4_K matmul kernel (128-bit maddubs, clean version)
  *
  * INTERLEAVED packing (matches Python converter):
  *   byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4)
  *
- * For each pair of sub-blocks (sub_a, sub_b) in a 32-byte q4 load:
- *   q4_0 = q4 & 0xF              → low nibbles (first 16 of each sub)
- *   q4_1 = (q4 >> 4) & 0xF       → high nibbles (last 16 of each sub)
- *   xv0 = xq[sub_a] (32 int8)    → [sub_a first 16 | sub_a last 16]
- *   xv1 = xq[sub_b] (32 int8)    → [sub_b first 16 | sub_b last 16]
- *   q8_lo = vperm2i128(xv0, xv1, 0x20) = [sub_a first 16 | sub_b first 16]
- *   q8_hi = vperm2i128(xv0, xv1, 0x31) = [sub_a last 16  | sub_b last 16 ]
+ * Per pair of sub-blocks (sub_a, sub_b) in a 32-byte q4 load:
+ *   q4b = load 32 bytes (2 sub-blocks)
+ *   q4l = q4b & 0xF              → low nibbles (first 16 of each sub)
+ *   q4h = (q4b >> 4) & 0xF       → high nibbles (last 16 of each sub)
+ *   Extract 128-bit halves:
+ *     q4ll = sub_a low,  q4lh = sub_b low
+ *     q4hl = sub_a high, q4hh = sub_b high
+ *   xv0 = sub_a xq (32 int8), xv1 = sub_b xq (32 int8)
+ *   Extract:
+ *     xl0 = sub_a first 16, xh0 = sub_a last 16
+ *     xl1 = sub_b first 16, xh1 = sub_b last 16
+ *   pl  = maddubs(q4ll, xl0)  → 8 int16 (sub_a low × sub_a first 16)
+ *   ph  = maddubs(q4hl, xh0)  → 8 int16 (sub_a high × sub_a last 16)
+ *   pl2 = maddubs(q4lh, xl1)  → 8 int16 (sub_b low × sub_b first 16)
+ *   ph2 = maddubs(q4hh, xh1)  → 8 int16 (sub_b high × sub_b last 16)
+ *   s0 = sc_a * (pl + ph) → 4 int32 (sub_a)
+ *   s1 = sc_b * (pl2 + ph2) → 4 int32 (sub_b)
+ *   sumi += [s0, s1]
  *
- *   p_lo = maddubs(q4_0, q8_lo)  → 16 int16 (8 sub_a + 8 sub_b partial dots)
- *   p_hi = maddubs(q4_1, q8_hi)  → 16 int16 (8 sub_a + 8 sub_b partial dots)
- *   p16  = p_lo + p_hi
- *
- *   scale_v = [sc_a×8, sc_b×8]  (16 int16)
- *   s32 = madd_epi16(scale_v, p16) → 8 int32
- *
- *   sumi += s32  (sum across 8 lanes = sc_a*sub_a_total + sc_b*sub_b_total)
- *
- * Each superblock: 4 iterations (8 sub-blocks processed in pairs)
- * Plus bsums for min correction.
- * 8-row parallel for outer loop.
+ * 8-row parallel, bsums for min correction, 1 cvtepi32_ps per superblock.
  */
 #ifndef LAL_Q4K_KERNEL_H
 #define LAL_Q4K_KERNEL_H
@@ -106,15 +106,12 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
             __m128i bs_v=_mm_set_epi16(bsums[s*8+7],bsums[s*8+6],bsums[s*8+5],bsums[s*8+4],
                 bsums[s*8+3],bsums[s*8+2],bsums[s*8+1],bsums[s*8+0]);
 
-            /* Process all 8 rows; macro expands to inline SIMD per row */
             #define PROC8(r) do { \
                 const uint8_t *sb=rows[r]+s*144; \
-                /* Super-block fp16 scales */ \
                 float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
                 float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
-                /* Unpack 16 × 6-bit scales+mins */ \
                 uint8_t sm[16]; unpack_scales_6bit(sb+4,sm); \
-                /* Min correction: sum(m[k] * bsums[k]) for k=0..7, then * dmin * x_scale / 63 */ \
+                /* Min correction */ \
                 __m128i mn_v=_mm_set_epi16(sm[15],sm[14],sm[13],sm[12],sm[11],sm[10],sm[9],sm[8]); \
                 __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
                 mp=_mm_hadd_epi32(mp,mp); mp=_mm_hadd_epi32(mp,mp); \
@@ -125,59 +122,70 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 /* 4 iterations: pair (sub_2i, sub_2i+1) per iter */ \
                 __m256i sumi=_mm256_setzero_si256(); \
                 const uint8_t*qs=sb+16; \
-                /* iter 0: sub0 + sub1 */ \
+                /* iter 0: sub0+sub1. qs[0..15]=sub0, qs[16..31]=sub1 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)qs); \
-                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
-                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i q8_lo=_mm256_permute2x128_si256(xv0,xv1,0x20); \
-                    __m256i q8_hi=_mm256_permute2x128_si256(xv0,xv1,0x31); \
-                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
-                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
-                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[1]), \
-                                                   _mm_set1_epi16((short)sm[0])); \
-                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                    __m256i q4l=_mm256_and_si256(q4b,m4); \
+                    __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1); \
+                    __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1); \
+                    __m128i xl0=_mm256_castsi256_si128(xv0),xh0=_mm256_extracti128_si256(xv0,1); \
+                    __m128i xl1=_mm256_castsi256_si128(xv1),xh1=_mm256_extracti128_si256(xv1,1); \
+                    __m128i pl=_mm_maddubs_epi16(q4ll,xl0),ph=_mm_maddubs_epi16(q4hl,xh0); \
+                    __m128i pl2=_mm_maddubs_epi16(q4lh,xl1),ph2=_mm_maddubs_epi16(q4hh,xh1); \
+                    __m128i sc0=_mm_set1_epi16((short)sm[0]),sc1=_mm_set1_epi16((short)sm[1]); \
+                    __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph)); \
+                    __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2)); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
                 } \
-                /* iter 1: sub2 + sub3 */ \
+                /* iter 1: sub2+sub3 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+32)); \
-                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
-                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i q8_lo=_mm256_permute2x128_si256(xv2,xv3,0x20); \
-                    __m256i q8_hi=_mm256_permute2x128_si256(xv2,xv3,0x31); \
-                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
-                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
-                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[3]), \
-                                                   _mm_set1_epi16((short)sm[2])); \
-                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                    __m256i q4l=_mm256_and_si256(q4b,m4); \
+                    __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1); \
+                    __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1); \
+                    __m128i xl2=_mm256_castsi256_si128(xv2),xh2=_mm256_extracti128_si256(xv2,1); \
+                    __m128i xl3=_mm256_castsi256_si128(xv3),xh3=_mm256_extracti128_si256(xv3,1); \
+                    __m128i pl=_mm_maddubs_epi16(q4ll,xl2),ph=_mm_maddubs_epi16(q4hl,xh2); \
+                    __m128i pl2=_mm_maddubs_epi16(q4lh,xl3),ph2=_mm_maddubs_epi16(q4hh,xh3); \
+                    __m128i sc0=_mm_set1_epi16((short)sm[2]),sc1=_mm_set1_epi16((short)sm[3]); \
+                    __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph)); \
+                    __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2)); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
                 } \
-                /* iter 2: sub4 + sub5 */ \
+                /* iter 2: sub4+sub5 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+64)); \
-                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
-                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i q8_lo=_mm256_permute2x128_si256(xv4,xv5,0x20); \
-                    __m256i q8_hi=_mm256_permute2x128_si256(xv4,xv5,0x31); \
-                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
-                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
-                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[5]), \
-                                                   _mm_set1_epi16((short)sm[4])); \
-                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                    __m256i q4l=_mm256_and_si256(q4b,m4); \
+                    __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1); \
+                    __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1); \
+                    __m128i xl4=_mm256_castsi256_si128(xv4),xh4=_mm256_extracti128_si256(xv4,1); \
+                    __m128i xl5=_mm256_castsi256_si128(xv5),xh5=_mm256_extracti128_si256(xv5,1); \
+                    __m128i pl=_mm_maddubs_epi16(q4ll,xl4),ph=_mm_maddubs_epi16(q4hl,xh4); \
+                    __m128i pl2=_mm_maddubs_epi16(q4lh,xl5),ph2=_mm_maddubs_epi16(q4hh,xh5); \
+                    __m128i sc0=_mm_set1_epi16((short)sm[4]),sc1=_mm_set1_epi16((short)sm[5]); \
+                    __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph)); \
+                    __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2)); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
                 } \
-                /* iter 3: sub6 + sub7 */ \
+                /* iter 3: sub6+sub7 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+96)); \
-                    __m256i q4_0=_mm256_and_si256(q4b,m4); \
-                    __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i q8_lo=_mm256_permute2x128_si256(xv6,xv7,0x20); \
-                    __m256i q8_hi=_mm256_permute2x128_si256(xv6,xv7,0x31); \
-                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo), \
-                                                  _mm256_maddubs_epi16(q4_1,q8_hi)); \
-                    __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[7]), \
-                                                   _mm_set1_epi16((short)sm[6])); \
-                    sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
+                    __m256i q4l=_mm256_and_si256(q4b,m4); \
+                    __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
+                    __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1); \
+                    __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1); \
+                    __m128i xl6=_mm256_castsi256_si128(xv6),xh6=_mm256_extracti128_si256(xv6,1); \
+                    __m128i xl7=_mm256_castsi256_si128(xv7),xh7=_mm256_extracti128_si256(xv7,1); \
+                    __m128i pl=_mm_maddubs_epi16(q4ll,xl6),ph=_mm_maddubs_epi16(q4hl,xh6); \
+                    __m128i pl2=_mm_maddubs_epi16(q4lh,xl7),ph2=_mm_maddubs_epi16(q4hh,xh7); \
+                    __m128i sc0=_mm_set1_epi16((short)sm[6]),sc1=_mm_set1_epi16((short)sm[7]); \
+                    __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph)); \
+                    __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2)); \
+                    sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0)); \
                 } \
-                /* 1 cvtepi32_ps + fmadd per superblock */ \
                 float mult=d*x_scale*inv_63; \
                 __m256 *ap=(r==0)?&acc0:(r==1)?&acc1:(r==2)?&acc2:(r==3)?&acc3: \
                             (r==4)?&acc4:(r==5)?&acc5:(r==6)?&acc6:&acc7; \
@@ -227,15 +235,18 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
 
             #define SR(qoff,xva,xvb,sa,sb_) do{\
                 __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+qoff));\
-                __m256i q4_0=_mm256_and_si256(q4b,m4);\
-                __m256i q4_1=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4);\
-                __m256i q8_lo=_mm256_permute2x128_si256(xva,xvb,0x20);\
-                __m256i q8_hi=_mm256_permute2x128_si256(xva,xvb,0x31);\
-                __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4_0,q8_lo),\
-                                              _mm256_maddubs_epi16(q4_1,q8_hi));\
-                __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sb_),\
-                                               _mm_set1_epi16((short)sa));\
-                sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16));\
+                __m256i q4l=_mm256_and_si256(q4b,m4);\
+                __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4);\
+                __m128i q4ll=_mm256_castsi256_si128(q4l),q4lh=_mm256_extracti128_si256(q4l,1);\
+                __m128i q4hl=_mm256_castsi256_si128(q4h),q4hh=_mm256_extracti128_si256(q4h,1);\
+                __m128i xll=_mm256_castsi256_si128(xva),xlh=_mm256_extracti128_si256(xva,1);\
+                __m128i xhl=_mm256_castsi256_si128(xvb),xhh=_mm256_extracti128_si256(xvb,1);\
+                __m128i pl=_mm_maddubs_epi16(q4ll,xll),ph=_mm_maddubs_epi16(q4hl,xlh);\
+                __m128i pl2=_mm_maddubs_epi16(q4lh,xhl),ph2=_mm_maddubs_epi16(q4hh,xhh);\
+                __m128i sc0=_mm_set1_epi16((short)sa),sc1=_mm_set1_epi16((short)sb_);\
+                __m128i s0=_mm_add_epi32(_mm_madd_epi16(sc0,pl),_mm_madd_epi16(sc0,ph));\
+                __m128i s1=_mm_add_epi32(_mm_madd_epi16(sc1,pl2),_mm_madd_epi16(sc1,ph2));\
+                sumi=_mm256_add_epi32(sumi,_mm256_set_m128i(s1,s0));\
             }while(0)
             SR(0,xv0,xv1,sm[0],sm[1]);SR(32,xv2,xv3,sm[2],sm[3]);
             SR(64,xv4,xv5,sm[4],sm[5]);SR(96,xv6,xv7,sm[6],sm[7]);
