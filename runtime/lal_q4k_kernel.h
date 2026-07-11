@@ -83,18 +83,113 @@ static inline void lal_matmul_q4_k(float *y,
 #if defined(__AVX2__) && defined(__F16C__)
     int row_stride = n_super * 144;
 
-    __m256i ones = _mm256_set1_epi16(1);
-    __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m128i mask_0f = _mm_set1_epi8(0x0F);
+    __m128i ones128 = _mm_set1_epi16(1);
+    float inv_63 = 1.0f / 63.0f;
 
-    /* Process 1 row at a time (streaming, 1 memory stream) */
-    for (int j = 0; j < out_dim; j++) {
+    /* 8-row parallel: share xq loads across 8 output rows */
+    int j = 0;
+    for (; j + 8 <= out_dim; j += 8) {
+        const uint8_t *rows[8];
+        for (int r = 0; r < 8; r++) rows[r] = q4k_W + (size_t)(j+r) * row_stride;
+
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+        __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+        __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+        float am0 = 0, am1 = 0, am2 = 0, am3 = 0, am4 = 0, am5 = 0, am6 = 0, am7 = 0;
+
+        for (int s = 0; s < n_super; s++) {
+            /* Load d, dmin for all 8 rows */
+            float d_arr[8], dmin_arr[8];
+            for (int r = 0; r < 8; r++) {
+                uint16_t d_u16 = *(const uint16_t*)(rows[r] + s*144);
+                uint16_t dmin_u16 = *(const uint16_t*)(rows[r] + s*144 + 2);
+                __m128i d_raw = _mm_set1_epi16((short)d_u16);
+                __m128i dmin_raw = _mm_set1_epi16((short)dmin_u16);
+                d_arr[r] = _mm_cvtss_f32(_mm_cvtph_ps(d_raw));
+                dmin_arr[r] = _mm_cvtss_f32(_mm_cvtph_ps(dmin_raw));
+            }
+
+            /* Unpack scales+mins for all 8 rows */
+            uint8_t sm[8][16];
+            float sb_sc[8][8], sb_mn[8][8];
+            for (int r = 0; r < 8; r++) {
+                unpack_scales_6bit(rows[r] + s*144 + 4, sm[r]);
+                for (int k = 0; k < 8; k++) {
+                    sb_sc[r][k] = d_arr[r] * (float)sm[r][k] * inv_63;
+                    sb_mn[r][k] = dmin_arr[r] * (float)sm[r][8+k] * inv_63;
+                }
+            }
+
+            for (int sub = 0; sub < 8; sub++) {
+                int xoff = (s*8+sub)*32;
+                float x_scale = x_scales[s*8+sub];
+
+                /* Load xq ONCE — shared by all 8 rows */
+                __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));
+                __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));
+
+                /* xq_sum ONCE — shared by all 8 rows */
+                __m128i xq_s16_la = _mm_cvtepi8_epi16(xv_lo);
+                __m128i xq_s16_lb = _mm_cvtepi8_epi16(_mm_srli_si128(xv_lo, 8));
+                __m128i xs_lo = _mm_add_epi32(_mm_madd_epi16(xq_s16_la, ones128), _mm_madd_epi16(xq_s16_lb, ones128));
+                __m128i xq_s16_ha = _mm_cvtepi8_epi16(xv_hi);
+                __m128i xq_s16_hb = _mm_cvtepi8_epi16(_mm_srli_si128(xv_hi, 8));
+                __m128i xs_hi = _mm_add_epi32(_mm_madd_epi16(xq_s16_ha, ones128), _mm_madd_epi16(xq_s16_hb, ones128));
+                __m128i xs128 = _mm_add_epi32(xs_lo, xs_hi);
+                xs128 = _mm_hadd_epi32(xs128, xs128);
+                xs128 = _mm_hadd_epi32(xs128, xs128);
+                int32_t xq_sum = _mm_cvtsi128_si32(xs128);
+
+                /* Process each of 8 rows */
+                #define PROC_ROW_K(r, acc_v, am_v) do { \
+                    int qoff = sub * 16; \
+                    __m128i q4bits = _mm_loadu_si128((__m128i*)(rows[r] + s*144 + 16 + qoff)); \
+                    __m128i q4l = _mm_and_si128(q4bits, mask_0f); \
+                    __m128i q4h = _mm_and_si128(_mm_srli_epi16(q4bits, 4), mask_0f); \
+                    __m128i p16l = _mm_maddubs_epi16(q4l, xv_lo); \
+                    __m128i p16h = _mm_maddubs_epi16(q4h, xv_hi); \
+                    __m128i s32l = _mm_madd_epi16(p16l, ones128); \
+                    __m128i s32h = _mm_madd_epi16(p16h, ones128); \
+                    float combined = sb_sc[r][sub] * x_scale; \
+                    __m256 dv = _mm256_set1_ps(combined); \
+                    __m256 s32a = _mm256_cvtepi32_ps(_mm256_set_m128i(s32h, s32l)); \
+                    acc_v = _mm256_fmadd_ps(dv, s32a, acc_v); \
+                    am_v -= sb_mn[r][sub] * x_scale * (float)xq_sum; \
+                } while(0)
+
+                PROC_ROW_K(0, acc0, am0); PROC_ROW_K(1, acc1, am1);
+                PROC_ROW_K(2, acc2, am2); PROC_ROW_K(3, acc3, am3);
+                PROC_ROW_K(4, acc4, am4); PROC_ROW_K(5, acc5, am5);
+                PROC_ROW_K(6, acc6, am6); PROC_ROW_K(7, acc7, am7);
+                #undef PROC_ROW_K
+            }
+        }
+
+        /* Final hsum + min correction */
+        #define HSUM_ROW(r, acc_v, am_v) do { \
+            __m128 lo = _mm256_castps256_ps128(acc_v); \
+            __m128 hi = _mm256_extractf128_ps(acc_v, 1); \
+            __m128 s = _mm_add_ps(lo, hi); \
+            s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s); \
+            y[j+r] = _mm_cvtss_f32(s) + am_v + (b ? b[j+r] : 0); \
+        } while(0)
+        HSUM_ROW(0, acc0, am0); HSUM_ROW(1, acc1, am1);
+        HSUM_ROW(2, acc2, am2); HSUM_ROW(3, acc3, am3);
+        HSUM_ROW(4, acc4, am4); HSUM_ROW(5, acc5, am5);
+        HSUM_ROW(6, acc6, am6); HSUM_ROW(7, acc7, am7);
+        #undef HSUM_ROW
+    }
+
+    /* Tail: single-row for remaining outputs */
+    for (; j < out_dim; j++) {
         const uint8_t *row = q4k_W + (size_t)j * row_stride;
         __m256 acc = _mm256_setzero_ps();
         float acc_min = 0.0f;
 
         for (int s = 0; s < n_super; s++) {
             const uint8_t *sb = row + s * 144;
-            /* Load d and dmin (fp16) — once per superblock */
             uint16_t d_u16 = *(const uint16_t*)(sb);
             uint16_t dmin_u16 = *(const uint16_t*)(sb + 2);
             __m128i d_raw = _mm_set1_epi16((short)d_u16);
@@ -102,70 +197,46 @@ static inline void lal_matmul_q4_k(float *y,
             float d = _mm_cvtss_f32(_mm_cvtph_ps(d_raw));
             float dmin = _mm_cvtss_f32(_mm_cvtph_ps(dmin_raw));
 
-            /* Unpack 8 scales + 8 mins from 12 bytes — once per superblock */
-            uint8_t scales_mins[16];
-            unpack_scales_6bit(sb + 4, scales_mins);
-
-            /* Pre-compute per-sub-block scales and mins as float arrays */
-            float sb_scales[8], sb_mins[8];
-            float inv_63 = 1.0f / 63.0f;
+            uint8_t sm[16]; unpack_scales_6bit(sb + 4, sm);
+            float sb_sc[8], sb_mn[8];
             for (int k = 0; k < 8; k++) {
-                sb_scales[k] = d * (float)scales_mins[k] * inv_63;
-                sb_mins[k] = dmin * (float)scales_mins[8 + k] * inv_63;
+                sb_sc[k] = d * (float)sm[k] * inv_63;
+                sb_mn[k] = dmin * (float)sm[8+k] * inv_63;
             }
 
             const uint8_t *qs = sb + 16;
-            __m128i mask_0f = _mm_set1_epi8(0x0F);
-            __m128i ones128 = _mm_set1_epi16(1);
-
             for (int sub = 0; sub < 8; sub++) {
                 int qoff = sub * 16;
-                int xoff = (s * 8 + sub) * 32;
-                float x_scale = x_scales[s * 8 + sub];
-
-                float combined = sb_scales[sub] * x_scale;
+                int xoff = (s*8+sub)*32;
+                float x_scale = x_scales[s*8+sub];
+                float combined = sb_sc[sub] * x_scale;
                 __m256 d_v = _mm256_set1_ps(combined);
 
-                /* Load and split q4 nibbles */
                 __m128i q4bits = _mm_loadu_si128((__m128i*)(qs + qoff));
                 __m128i q4l = _mm_and_si128(q4bits, mask_0f);
                 __m128i q4h = _mm_and_si128(_mm_srli_epi16(q4bits, 4), mask_0f);
-
-                /* Load xq */
                 __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));
                 __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));
+                __m128i p16l = _mm_maddubs_epi16(q4l, xv_lo);
+                __m128i p16h = _mm_maddubs_epi16(q4h, xv_hi);
+                __m128i s32l = _mm_madd_epi16(p16l, ones128);
+                __m128i s32h = _mm_madd_epi16(p16h, ones128);
+                __m256 s32a = _mm256_cvtepi32_ps(_mm256_set_m128i(s32h, s32l));
+                acc = _mm256_fmadd_ps(d_v, s32a, acc);
 
-                /* maddubs + madd → int32 */
-                __m128i p16_lo = _mm_maddubs_epi16(q4l, xv_lo);
-                __m128i p16_hi = _mm_maddubs_epi16(q4h, xv_hi);
-                __m128i sum32_lo = _mm_madd_epi16(p16_lo, ones128);
-                __m128i sum32_hi = _mm_madd_epi16(p16_hi, ones128);
-
-                /* cvtepi32_ps + fmadd (no per-sub-block hsum!) */
-                __m256 sum32_all = _mm256_cvtepi32_ps(
-                    _mm256_set_m128i(sum32_hi, sum32_lo));
-                acc = _mm256_fmadd_ps(d_v, sum32_all, acc);
-
-                /* Min correction: sum(xq) via SIMD */
-                __m128i xq_s16_lo_a = _mm_cvtepi8_epi16(xv_lo);
-                __m128i xq_s16_lo_b = _mm_cvtepi8_epi16(_mm_srli_si128(xv_lo, 8));
-                __m128i xq_sum_lo = _mm_add_epi32(
-                    _mm_madd_epi16(xq_s16_lo_a, ones128),
-                    _mm_madd_epi16(xq_s16_lo_b, ones128));
-                __m128i xq_s16_hi_a = _mm_cvtepi8_epi16(xv_hi);
-                __m128i xq_s16_hi_b = _mm_cvtepi8_epi16(_mm_srli_si128(xv_hi, 8));
-                __m128i xq_sum_hi = _mm_add_epi32(
-                    _mm_madd_epi16(xq_s16_hi_a, ones128),
-                    _mm_madd_epi16(xq_s16_hi_b, ones128));
-                __m128i xq_sum128 = _mm_add_epi32(xq_sum_lo, xq_sum_hi);
-                xq_sum128 = _mm_hadd_epi32(xq_sum128, xq_sum128);
-                xq_sum128 = _mm_hadd_epi32(xq_sum128, xq_sum128);
-                int32_t xq_sum = _mm_cvtsi128_si32(xq_sum128);
-                acc_min -= sb_mins[sub] * x_scale * (float)xq_sum;
+                __m128i xq_s16_la = _mm_cvtepi8_epi16(xv_lo);
+                __m128i xq_s16_lb = _mm_cvtepi8_epi16(_mm_srli_si128(xv_lo, 8));
+                __m128i xs_lo = _mm_add_epi32(_mm_madd_epi16(xq_s16_la, ones128), _mm_madd_epi16(xq_s16_lb, ones128));
+                __m128i xq_s16_ha = _mm_cvtepi8_epi16(xv_hi);
+                __m128i xq_s16_hb = _mm_cvtepi8_epi16(_mm_srli_si128(xv_hi, 8));
+                __m128i xs_hi = _mm_add_epi32(_mm_madd_epi16(xq_s16_ha, ones128), _mm_madd_epi16(xq_s16_hb, ones128));
+                __m128i xs128 = _mm_add_epi32(xs_lo, xs_hi);
+                xs128 = _mm_hadd_epi32(xs128, xs128);
+                xs128 = _mm_hadd_epi32(xs128, xs128);
+                int32_t xq_sum = _mm_cvtsi128_si32(xs128);
+                acc_min -= sb_mn[sub] * x_scale * (float)xq_sum;
             }
         }
-
-        /* Final hsum of acc (8 lanes → 1) */
         __m128 lo = _mm256_castps256_ps128(acc);
         __m128 hi = _mm256_extractf128_ps(acc, 1);
         __m128 s = _mm_add_ps(lo, hi);
