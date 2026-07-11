@@ -87,38 +87,32 @@ static inline void lal_matmul_q4_k(float *y,
     __m128i ones128 = _mm_set1_epi16(1);
     float inv_63 = 1.0f / 63.0f;
 
-    /* 8-row parallel: share xq loads across 8 output rows */
+    /* 4-row parallel: balance between xq sharing and register pressure.
+     * 8-row caused 137 stack spills. 4-row uses 4 YMM acc + 4 float am = much less. */
     int j = 0;
-    for (; j + 8 <= out_dim; j += 8) {
-        const uint8_t *rows[8];
-        for (int r = 0; r < 8; r++) rows[r] = q4k_W + (size_t)(j+r) * row_stride;
+    for (; j + 4 <= out_dim; j += 4) {
+        const uint8_t *rows[4];
+        for (int r = 0; r < 4; r++) rows[r] = q4k_W + (size_t)(j+r) * row_stride;
 
         __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
         __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-        __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
-        __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
-        float am0 = 0, am1 = 0, am2 = 0, am3 = 0, am4 = 0, am5 = 0, am6 = 0, am7 = 0;
+        float am0 = 0, am1 = 0, am2 = 0, am3 = 0;
 
         for (int s = 0; s < n_super; s++) {
-            /* Load d, dmin for all 8 rows */
-            float d_arr[8], dmin_arr[8];
-            for (int r = 0; r < 8; r++) {
-                uint16_t d_u16 = *(const uint16_t*)(rows[r] + s*144);
-                uint16_t dmin_u16 = *(const uint16_t*)(rows[r] + s*144 + 2);
+            /* Load d, dmin + unpack scales for all 4 rows */
+            float sb_sc[4][8], sb_mn[4][8];
+            for (int r = 0; r < 4; r++) {
+                const uint8_t *sb = rows[r] + s*144;
+                uint16_t d_u16 = *(const uint16_t*)(sb);
+                uint16_t dmin_u16 = *(const uint16_t*)(sb+2);
                 __m128i d_raw = _mm_set1_epi16((short)d_u16);
                 __m128i dmin_raw = _mm_set1_epi16((short)dmin_u16);
-                d_arr[r] = _mm_cvtss_f32(_mm_cvtph_ps(d_raw));
-                dmin_arr[r] = _mm_cvtss_f32(_mm_cvtph_ps(dmin_raw));
-            }
-
-            /* Unpack scales+mins for all 8 rows */
-            uint8_t sm[8][16];
-            float sb_sc[8][8], sb_mn[8][8];
-            for (int r = 0; r < 8; r++) {
-                unpack_scales_6bit(rows[r] + s*144 + 4, sm[r]);
+                float d = _mm_cvtss_f32(_mm_cvtph_ps(d_raw));
+                float dmin = _mm_cvtss_f32(_mm_cvtph_ps(dmin_raw));
+                uint8_t sm[16]; unpack_scales_6bit(sb+4, sm);
                 for (int k = 0; k < 8; k++) {
-                    sb_sc[r][k] = d_arr[r] * (float)sm[r][k] * inv_63;
-                    sb_mn[r][k] = dmin_arr[r] * (float)sm[r][8+k] * inv_63;
+                    sb_sc[r][k] = d * (float)sm[k] * inv_63;
+                    sb_mn[r][k] = dmin * (float)sm[8+k] * inv_63;
                 }
             }
 
@@ -126,11 +120,11 @@ static inline void lal_matmul_q4_k(float *y,
                 int xoff = (s*8+sub)*32;
                 float x_scale = x_scales[s*8+sub];
 
-                /* Load xq ONCE — shared by all 8 rows */
+                /* Load xq ONCE — shared by all 4 rows */
                 __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));
                 __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));
 
-                /* xq_sum ONCE — shared by all 8 rows */
+                /* xq_sum ONCE */
                 __m128i xq_s16_la = _mm_cvtepi8_epi16(xv_lo);
                 __m128i xq_s16_lb = _mm_cvtepi8_epi16(_mm_srli_si128(xv_lo, 8));
                 __m128i xs_lo = _mm_add_epi32(_mm_madd_epi16(xq_s16_la, ones128), _mm_madd_epi16(xq_s16_lb, ones128));
@@ -141,11 +135,11 @@ static inline void lal_matmul_q4_k(float *y,
                 xs128 = _mm_hadd_epi32(xs128, xs128);
                 xs128 = _mm_hadd_epi32(xs128, xs128);
                 int32_t xq_sum = _mm_cvtsi128_si32(xs128);
+                float xq_sum_f = (float)xq_sum * x_scale;
 
-                /* Process each of 8 rows */
-                #define PROC_ROW_K(r, acc_v, am_v) do { \
-                    int qoff = sub * 16; \
-                    __m128i q4bits = _mm_loadu_si128((__m128i*)(rows[r] + s*144 + 16 + qoff)); \
+                /* Process each of 4 rows */
+                #define PROC_ROW_K4(r, acc_v, am_v) do { \
+                    __m128i q4bits = _mm_loadu_si128((__m128i*)(rows[r] + s*144 + 16 + sub*16)); \
                     __m128i q4l = _mm_and_si128(q4bits, mask_0f); \
                     __m128i q4h = _mm_and_si128(_mm_srli_epi16(q4bits, 4), mask_0f); \
                     __m128i p16l = _mm_maddubs_epi16(q4l, xv_lo); \
@@ -156,30 +150,25 @@ static inline void lal_matmul_q4_k(float *y,
                     __m256 dv = _mm256_set1_ps(combined); \
                     __m256 s32a = _mm256_cvtepi32_ps(_mm256_set_m128i(s32h, s32l)); \
                     acc_v = _mm256_fmadd_ps(dv, s32a, acc_v); \
-                    am_v -= sb_mn[r][sub] * x_scale * (float)xq_sum; \
+                    am_v -= sb_mn[r][sub] * xq_sum_f; \
                 } while(0)
 
-                PROC_ROW_K(0, acc0, am0); PROC_ROW_K(1, acc1, am1);
-                PROC_ROW_K(2, acc2, am2); PROC_ROW_K(3, acc3, am3);
-                PROC_ROW_K(4, acc4, am4); PROC_ROW_K(5, acc5, am5);
-                PROC_ROW_K(6, acc6, am6); PROC_ROW_K(7, acc7, am7);
-                #undef PROC_ROW_K
+                PROC_ROW_K4(0, acc0, am0); PROC_ROW_K4(1, acc1, am1);
+                PROC_ROW_K4(2, acc2, am2); PROC_ROW_K4(3, acc3, am3);
+                #undef PROC_ROW_K4
             }
         }
 
-        /* Final hsum + min correction */
-        #define HSUM_ROW(r, acc_v, am_v) do { \
+        #define HSUM_ROW4(r, acc_v, am_v) do { \
             __m128 lo = _mm256_castps256_ps128(acc_v); \
             __m128 hi = _mm256_extractf128_ps(acc_v, 1); \
             __m128 s = _mm_add_ps(lo, hi); \
             s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s); \
             y[j+r] = _mm_cvtss_f32(s) + am_v + (b ? b[j+r] : 0); \
         } while(0)
-        HSUM_ROW(0, acc0, am0); HSUM_ROW(1, acc1, am1);
-        HSUM_ROW(2, acc2, am2); HSUM_ROW(3, acc3, am3);
-        HSUM_ROW(4, acc4, am4); HSUM_ROW(5, acc5, am5);
-        HSUM_ROW(6, acc6, am6); HSUM_ROW(7, acc7, am7);
-        #undef HSUM_ROW
+        HSUM_ROW4(0, acc0, am0); HSUM_ROW4(1, acc1, am1);
+        HSUM_ROW4(2, acc2, am2); HSUM_ROW4(3, acc3, am3);
+        #undef HSUM_ROW4
     }
 
     /* Tail: single-row for remaining outputs */
