@@ -57,6 +57,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -121,25 +122,47 @@ static int8_t *g_xq_cache;
 static float **kv_k, **kv_v;
 static int g_n_threads = 1;
 
-/* === Fused up_matmul + SiLU(gate) * up — 8-row parallel ===
- * Strategy: compute up[] with the EXACT same fast kernel as lal_matmul_q8_signtrick
- * (no per-row SiLU in the hot loop), then apply SiLU in a separate tight vectorized
- * loop. This keeps the matmul at full speed, and the SiLU pass is L1-resident (75KB).
- *
- * The "fusion" benefit: up[] and gate[] are both in L2 when SiLU runs — no DRAM
- * re-read. Without fusion: up_matmul writes up[] to DRAM, then SiLU reads it back.
- * With fusion: up_matmul writes to L2, SiLU reads from L2 (75KB fits in 1MB L2).
- */
+/* === Parallel matmul (OpenMP) — matches qwen7b_server.c === */
+static inline void parallel_matmul(float *y, const int8_t *q8_T, const float *scale,
+                                    const float *x, const float *b,
+                                    int in_dim, int out_dim) {
+    if (g_n_threads <= 1 || out_dim < 2048) {
+        lal_matmul_q8_signtrick(y, q8_T, scale, x, b, in_dim, out_dim);
+        return;
+    }
+    #pragma omp parallel num_threads(g_n_threads)
+    {
+        int tid = omp_get_thread_num();
+        int n   = omp_get_num_threads();
+        int chunk = (out_dim + n - 1) / n;
+        int start = tid * chunk;
+        int end = start + chunk;
+        if (end > out_dim) end = out_dim;
+        if (start < out_dim) {
+            lal_matmul_q8_signtrick(y + start,
+                                    q8_T + (size_t)start * in_dim,
+                                    scale + start,
+                                    x,
+                                    b ? b + start : NULL,
+                                    in_dim, end - start);
+        }
+    }
+}
+
+/* === Fused up_matmul + SiLU(gate) * up — parallel + L1 SiLU ===
+ * Step A: compute up[] with parallel_matmul (OpenMP, full speed)
+ * Step B: apply SiLU(gate)*up in tight L1 loop (75KB, both in L2) */
 static void fused_up_silu(const int8_t *q8_up, const float *s_up,
                            const float *x, const float *gate,
                            float *act, int in_dim, int out_dim) {
-    /* Step A: compute up[] using the standard fast Q8 kernel (8-row parallel) */
-    lal_matmul_q8_signtrick(act, q8_up, s_up, x, NULL, in_dim, out_dim);
-    /* Step B: apply SiLU(gate) * up in a tight loop (both in L2, no DRAM) */
+    /* Step A: parallel Q8 matmul for up[] */
+    parallel_matmul(act, q8_up, s_up, x, NULL, in_dim, out_dim);
+    /* Step B: SiLU fusion — tight loop, gate+act both in L2 */
+    #pragma omp parallel for num_threads(g_n_threads)
     for (int j = 0; j < out_dim; j++) {
         float g = gate[j];
         float silu_g = g / (1.0f + expf(-g));
-        act[j] = silu_g * act[j];  /* act[j] was up_score, now becomes SiLU*up */
+        act[j] = silu_g * act[j];
     }
 }
 
@@ -230,17 +253,16 @@ static void down_matmul_tiled(float *out, const int8_t *q8_down, const float *s_
 /* === Lossless Fused MLP ===
  * All Q8 weights (lossless). Fusion = SiLU merged into up_matmul output,
  * act computed right before down_matmul (temporal locality → L2 resident).
- * Uses the standard fast lal_matmul_q8_signtrick for all 3 matmuls. */
+ * Uses parallel_matmul (OpenMP) for all 3 matmuls. */
 static void fused_lossless_mlp(float *out, const float *x, const Layer *L) {
     static float gate[MLP_DIM] __attribute__((aligned(32)));
     static float act[MLP_DIM] __attribute__((aligned(32)));
-    /* Step 1: gate = Q8_matmul(gate_w, x) — full speed 8-row parallel */
-    lal_matmul_q8_signtrick(gate, L->q8_gate, L->s_gate, x, NULL, N_EMBD, MLP_DIM);
-    /* Step 2 FUSED: up_matmul + SiLU(gate)*up → act
-     * up[] computed by fast kernel, SiLU applied in tight L1 loop */
+    /* Step 1: gate = parallel Q8 matmul */
+    parallel_matmul(gate, L->q8_gate, L->s_gate, x, NULL, N_EMBD, MLP_DIM);
+    /* Step 2 FUSED: up_matmul + SiLU(gate)*up → act (parallel + L1 SiLU) */
     fused_up_silu(L->q8_up, L->s_up, x, gate, act, N_EMBD, MLP_DIM);
-    /* Step 3: down_matmul — same fast kernel, act from L2 */
-    lal_matmul_q8_signtrick(out, L->q8_down, L->s_down, act, NULL, MLP_DIM, N_EMBD);
+    /* Step 3: down_matmul — parallel, act from L2 */
+    parallel_matmul(out, L->q8_down, L->s_down, act, NULL, MLP_DIM, N_EMBD);
 }
 
 /* === RMSNorm / RoPE / Attention (same as before) === */
@@ -310,12 +332,12 @@ static int forward(int tok, int pos) {
     for (int l = 0; l < N_LAYER; l++) {
         Layer *L = &g_layers[l];
         my_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
-        lal_matmul_q8_signtrick(g_q, L->q8_q, L->s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
-        lal_matmul_q8_signtrick(g_k, L->q8_k, L->s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
-        lal_matmul_q8_signtrick(g_v, L->q8_v, L->s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
+        parallel_matmul(g_q, L->q8_q, L->s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
+        parallel_matmul(g_k, L->q8_k, L->s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
+        parallel_matmul(g_v, L->q8_v, L->s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
         rope_apply(g_q, g_k, pos);
         gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
-        lal_matmul_q8_signtrick(g_proj, L->q8_o, L->s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
+        parallel_matmul(g_proj, L->q8_o, L->s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
         for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
         my_rms_norm(g_ln, g_x, L->norm2_w, N_EMBD);
         /* Lossless fused MLP: Q8 weights, SiLU fused, act in L2 */
