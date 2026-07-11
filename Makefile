@@ -48,7 +48,7 @@ prebuilt/gpt2_train: models/gpt2.c runtime/lal_runtime.c runtime/lal_runtime.h
 BLAS_LIBS := $(shell pkg-config --libs openblas 2>/dev/null)
 ifeq ($(BLAS_LIBS),)
   # Fallback: detect -lopenblas by probing whether <cblas.h> preprocesses.
-        BLAS_LIBS := $(shell echo '#include <cblas.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo -lopenblas)
+	BLAS_LIBS := $(shell echo '#include <cblas.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo -lopenblas)
 endif
 
 # === GPT-2 web server (float mode, auto OpenBLAS, with browser frontend) ===
@@ -58,14 +58,14 @@ endif
 server: prebuilt/gpt2_server
 
 prebuilt/gpt2_server: tools/server/gpt2_server.c tools/server/frontend.html \
-        runtime/lal_runtime.c runtime/lal_runtime.h
+	runtime/lal_runtime.c runtime/lal_runtime.h
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
-        -o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread $(BLAS_LIBS)
-        @if [ -n "$(BLAS_LIBS)" ]; then \
-                echo "[*] built with OpenBLAS acceleration ($(BLAS_LIBS))"; \
-        else \
-                echo "[*] built with hand-written SIMD (install libopenblas-dev for ~2-3x speedup)"; \
-        fi
+	-o $@ tools/server/gpt2_server.c runtime/lal_runtime.c -lm -lpthread $(BLAS_LIBS)
+	@if [ -n "$(BLAS_LIBS)" ]; then \
+	        echo "[*] built with OpenBLAS acceleration ($(BLAS_LIBS))"; \
+	else \
+	        echo "[*] built with hand-written SIMD (install libopenblas-dev for ~2-3x speedup)"; \
+	fi
 
 # server-blas: legacy alias. OpenBLAS is now auto-detected by `make server`.
 # Kept for backward compatibility with existing docs and scripts.
@@ -82,35 +82,35 @@ scripts/extract_float_subset: scripts/extract_float_subset.c
 	$(CC) -O2 -o $@ $<
 
 prebuilt/gpt2_float_subset.bin: scripts/extract_float_subset prebuilt/gpt2_weights.bin
-        ./scripts/extract_float_subset prebuilt/gpt2_weights.bin $@
+	./scripts/extract_float_subset prebuilt/gpt2_weights.bin $@
 
 # === Compile LAL demos ===
 demos: prebuilt/demos/demo
 
 prebuilt/demos/demo: demos/basic/demo.lal compiler/lal.py
-        @mkdir -p prebuilt/demos
-        $(LALC) demos/basic/demo.lal classify prebuilt/demos/demo.c
+	@mkdir -p prebuilt/demos
+	$(LALC) demos/basic/demo.lal classify prebuilt/demos/demo.c
 	$(CC) $(CFLAGS) -o $@ prebuilt/demos/demo.c -lm
 
 # === Verify ===
 verify:
-        $(PYTHON) tools/verify.py
+	$(PYTHON) tools/verify.py
 
 clean:
-        rm -rf build/ prebuilt/demos/*.c prebuilt/gpt2_server prebuilt/qwen_server
+	rm -rf build/ prebuilt/demos/*.c prebuilt/gpt2_server prebuilt/qwen_server
 
 # === Qwen2.5-0.5B inference server (Q8 quantization, GQA, RoPE, SwiGLU) ===
 qwen-server: prebuilt/qwen_server
 
 prebuilt/qwen_server: tools/server/qwen_server.c runtime/lal_runtime.c runtime/lal_runtime.h
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
-                -o $@ tools/server/qwen_server.c runtime/lal_runtime.c -lm -lpthread
-        @echo "[*] built qwen_server (Qwen2.5-0.5B, Q8 default)"
+	        -o $@ tools/server/qwen_server.c runtime/lal_runtime.c -lm -lpthread
+	@echo "[*] built qwen_server (Qwen2.5-0.5B, Q8 default)"
 
 # === Qwen2.5-7B inference server (Q8, GQA, GPQ8 pre-quantized) ===
 qwen7b-server: prebuilt/qwen7b_server
 
 prebuilt/qwen7b_server: tools/server/qwen7b_server.c runtime/lal_runtime.c runtime/lal_runtime.h runtime/lal_q8_kernel.h runtime/lal_sampling.h runtime/lal_dequant.h runtime/lal_tokenizer.h
 	$(CC) $(CFLAGS) -fopenmp -Wno-unused-function -Wno-unused-variable -I. \
-                -o $@ tools/server/qwen7b_server.c runtime/lal_runtime.c -lm -lpthread -lgomp
-        @echo "[*] built qwen7b_server (Qwen2.5-7B, Q8, GPQ8, OpenMP)"
+	        -o $@ tools/server/qwen7b_server.c runtime/lal_runtime.c -lm -lpthread -lgomp
+	@echo "[*] built qwen7b_server (Qwen2.5-7B, Q8, GPQ8, OpenMP)"
