@@ -64,9 +64,15 @@ def quantize_q4_k_per_row(f32_data, in_dim, out_dim):
     q = np.clip(q, 0, 15).astype(np.uint8)
 
     # Pack 4-bit values: 256 elements -> 128 bytes
+    # INTERLEAVED packing per sub-block (32 elements → 16 bytes):
+    #   byte[sub*16 + i] = q[sub*32 + i] | (q[sub*32 + i + 16] << 4) for i=0..15
+    # Low nibbles = q[sub*32..sub*32+15], high nibbles = q[sub*32+16..sub*32+31]
+    # Kernel: low nibbles pair with xq[sub*32..+15], high with xq[sub*32+16..+31]
     q_flat = q.reshape(out_dim, n_super, 256)
-    q_pairs = q_flat.reshape(out_dim, n_super, 128, 2)
-    qs_packed = q_pairs[:, :, :, 0] | (q_pairs[:, :, :, 1] << 4)
+    qs_packed = np.zeros((out_dim, n_super, 128), dtype=np.uint8)
+    for sub in range(8):
+        for i in range(16):
+            qs_packed[:, :, sub*16 + i] = q_flat[:, :, sub*32 + i] | (q_flat[:, :, sub*32 + i + 16] << 4)
 
     # Pack scales+mins: 8 scales + 8 mins, 6-bit each, into 12 bytes
     scales_min = np.zeros((out_dim, n_super, 12), dtype=np.uint8)

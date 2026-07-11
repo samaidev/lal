@@ -61,18 +61,20 @@ static void quantize_q4_k_row(const float *w, uint8_t *out, int in_dim) {
         for (int b = 0; b < 12; b++)
             sb[4+b] = (bits >> (b * 8)) & 0xFF;
 
-        /* Quantize values */
+        /* Quantize values — INTERLEAVED packing:
+         * byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4) */
         uint8_t *qs = sb + 16;
         for (int j = 0; j < 8; j++) {
             float ascale = d * sc6[j] / 63.0f;
             float amin = dmin * m6[j] / 63.0f;
-            for (int i = 0; i < 32; i++) {
-                float v = wb[j*32+i];
-                int q = lroundf((v + amin) / (ascale + 1e-8f));
-                if (q < 0) q = 0; if (q > 15) q = 15;
-                int idx = j*32+i;
-                if (idx % 2 == 0) qs[idx/2] = q;
-                else qs[idx/2] |= (q << 4);
+            for (int i = 0; i < 16; i++) {
+                int idx_lo = j*32 + i;
+                int idx_hi = j*32 + i + 16;
+                int q_lo = lroundf((wb[idx_lo] + amin) / (ascale + 1e-8f));
+                int q_hi = lroundf((wb[idx_hi] + amin) / (ascale + 1e-8f));
+                if (q_lo < 0) q_lo = 0; if (q_lo > 15) q_lo = 15;
+                if (q_hi < 0) q_hi = 0; if (q_hi > 15) q_hi = 15;
+                qs[j*16 + i] = (uint8_t)q_lo | ((uint8_t)q_hi << 4);
             }
         }
     }
@@ -121,17 +123,21 @@ int main() {
                scales_mins[4],scales_mins[5],scales_mins[6],scales_mins[7],
                scales_mins[8],scales_mins[9],scales_mins[10],scales_mins[11],
                scales_mins[12],scales_mins[13],scales_mins[14],scales_mins[15]);
-        /* Dequant and compare */
+        /* Dequant and compare — INTERLEAVED packing */
         float max_err = 0;
         for (int sub = 0; sub < 8; sub++) {
             float ascale = d * scales_mins[sub] / 63.0f;
             float amin = dmin * scales_mins[8+sub] / 63.0f;
-            for (int i = 0; i < 32; i++) {
-                int idx = sub*32+i;
-                uint8_t q4 = (sb[16 + idx/2] >> ((idx%2)*4)) & 0xF;
-                float w_d = ascale * q4 - amin;
-                float err = fabsf(w_d - w[0][idx]);
-                if (err > max_err) max_err = err;
+            for (int i = 0; i < 16; i++) {
+                int idx_lo = sub*32 + i;
+                int idx_hi = sub*32 + i + 16;
+                uint8_t byte_val = sb[16 + sub*16 + i];
+                uint8_t q_lo = byte_val & 0xF;
+                uint8_t q_hi = (byte_val >> 4) & 0xF;
+                float w_lo = ascale * q_lo - amin;
+                float w_hi = ascale * q_hi - amin;
+                float err = fabsf(w_lo - w[0][idx_lo]); if (err > max_err) max_err = err;
+                err = fabsf(w_hi - w[0][idx_hi]); if (err > max_err) max_err = err;
             }
         }
         printf("  Dequant max error for row 0: %.6f\n", max_err);
@@ -174,6 +180,35 @@ int main() {
     lal_matmul_q4_k(y_k2, q4k2, x2, NULL, in_dim, out_dim);
 
     printf("\n=== Larger test (in_dim=3584, out_dim=8) ===\n");
+    /* Verify dequant for row 0 */
+    {
+        int n_super_l = in_dim / 256;
+        float max_deq_err = 0;
+        for (int s = 0; s < n_super_l; s++) {
+            uint8_t *sb = q4k2 + (size_t)0 * n_super_l * 144 + s * 144;
+            uint16_t d_u16 = *(uint16_t*)(sb);
+            uint16_t dmin_u16 = *(uint16_t*)(sb+2);
+            __m128i d_raw = _mm_set1_epi16((short)d_u16);
+            __m128i dmin_raw = _mm_set1_epi16((short)dmin_u16);
+            float d = _mm_cvtss_f32(_mm_cvtph_ps(d_raw));
+            float dmin = _mm_cvtss_f32(_mm_cvtph_ps(dmin_raw));
+            uint8_t sm[16]; unpack_scales_6bit(sb+4, sm);
+            for (int sub = 0; sub < 8; sub++) {
+                float ascale = d * sm[sub] / 63.0f;
+                float amin = dmin * sm[8+sub] / 63.0f;
+                for (int i = 0; i < 16; i++) {
+                    int idx_lo = s*256 + sub*32 + i;
+                    int idx_hi = s*256 + sub*32 + i + 16;
+                    uint8_t bv = sb[16 + sub*16 + i];
+                    float w_lo = ascale * (bv & 0xF) - amin;
+                    float w_hi = ascale * ((bv>>4) & 0xF) - amin;
+                    float e = fabsf(w_lo - w2[idx_lo]); if (e>max_deq_err) max_deq_err=e;
+                    e = fabsf(w_hi - w2[idx_hi]); if (e>max_deq_err) max_deq_err=e;
+                }
+            }
+        }
+        printf("  Dequant max error for large row 0: %.6f\n", max_deq_err);
+    }
     float max_rel = 0;
     for (int j = 0; j < out_dim; j++) {
         float err = fabsf(y_k2[j] - y_r2[j]);

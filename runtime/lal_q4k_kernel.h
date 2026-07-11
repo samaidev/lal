@@ -191,17 +191,47 @@ static inline void lal_matmul_q4_k(float *y,
                  * interleaved style: byte[i] = q[i] | (q[i+16] << 4).
                  * Then low = q[0..15], high = q[16..31], pairs with xq[0..15] and xq[16..31].
                  */
-                /* Scalar dot product (correct but slow — for verification) */
-                int32_t dot = 0, xq_sum = 0;
-                for (int i = 0; i < 32; i++) {
-                    uint8_t q4 = (qs[qoff + i/2] >> ((i%2)*4)) & 0xF;
-                    dot += (int)q4 * (int)xq[xoff + i];
-                    xq_sum += (int)xq[xoff + i];
-                }
-                /* Add to acc's lane 0 only (not broadcast!) */
+                /* SIMD dot product with interleaved packing.
+                 * Packing: byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4)
+                 * Low nibbles = q[sub*32..+15], pair with xq[sub*32..+15]
+                 * High nibbles = q[sub*32+16..+31], pair with xq[sub*32+16..+31]
+                 * qoff = sub*16, xoff = (s*8+sub)*32 */
+                __m128i q4bits = _mm_loadu_si128((__m128i*)(qs + qoff));
+                /* Low nibbles: 16 uint8 (0-15) */
+                __m128i q4l = _mm_and_si128(q4bits, _mm_set1_epi8(0x0F));
+                /* High nibbles: 16 uint8 (0-15) */
+                __m128i q4h = _mm_and_si128(_mm_srli_epi16(q4bits, 4), _mm_set1_epi8(0x0F));
+
+                /* xq for this sub-block: first 16 and next 16 */
+                __m128i xv_lo = _mm_loadu_si128((__m128i*)(xq + xoff));      /* xq[0..15] */
+                __m128i xv_hi = _mm_loadu_si128((__m128i*)(xq + xoff + 16));  /* xq[16..31] */
+
+                /* maddubs: uint8 × int8 → int16 (8 pairs → 8 int16 per 128-bit) */
+                __m128i p16_lo = _mm_maddubs_epi16(q4l, xv_lo);  /* 8 int16 */
+                __m128i p16_hi = _mm_maddubs_epi16(q4h, xv_hi);  /* 8 int16 */
+
+                /* madd: 8 int16 pairs → 4 int32 per 128-bit.
+                 * But we need all 16 products summed. Use madd with ones:
+                 * madd(p16, ones) sums adjacent int16 pairs → 4 int32.
+                 * We need 4+4=8 int32 total. Combine into YMM. */
+                __m128i sum32_lo = _mm_madd_epi16(p16_lo, _mm_set1_epi16(1));
+                __m128i sum32_hi = _mm_madd_epi16(p16_hi, _mm_set1_epi16(1));
+
+                /* Horizontal sum: 4+4 int32 → 1 scalar.
+                 * Add the two 128-bit vectors, then hsum. */
+                __m128i sum128 = _mm_add_epi32(sum32_lo, sum32_hi);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                int32_t dot = _mm_cvtsi128_si32(sum128);
+
+                /* Accumulate into acc lane 0 */
                 float dot_f = (float)dot * combined;
                 acc = _mm256_add_ps(acc, _mm256_castps128_ps256(_mm_set_ss(dot_f)));
-                /* Min correction */
+
+                /* Min correction: acc_min -= sb_min * x_scale * sum(xq) */
+                /* sum(xq) = sum of 32 int8 values for this sub-block */
+                int32_t xq_sum = 0;
+                for (int i = 0; i < 32; i++) xq_sum += (int)xq[xoff + i];
                 acc_min -= sb_min * x_scale * (float)xq_sum;
             }
         }
