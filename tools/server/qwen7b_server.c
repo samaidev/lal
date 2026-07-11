@@ -67,6 +67,7 @@
 #include "runtime/lal_runtime.h"
 #include "runtime/lal_q8_kernel.h"
 #include "runtime/lal_q4_kernel.h"
+#include "runtime/lal_q4k_kernel.h"
 #include "runtime/lal_sampling.h"
 #include "runtime/lal_dequant.h"
 #include "runtime/lal_tokenizer.h"
@@ -106,7 +107,15 @@ typedef struct {
     const uint8_t *q4a_gate;
     const uint8_t *q4a_up;
     const uint8_t *q4a_down;
-    int qtype;  /* 1=Q8, 2=Q4_0, 3=Q8_0, 4=Q4_0A */
+    /* Q4_K path (qtype=5): 256-elem superblocks, 144 bytes each */
+    const uint8_t *q4k_q;     /* [Q_DIM, N_EMBD/256, 144] */
+    const uint8_t *q4k_k;
+    const uint8_t *q4k_v;
+    const uint8_t *q4k_o;
+    const uint8_t *q4k_gate;
+    const uint8_t *q4k_up;
+    const uint8_t *q4k_down;
+    int qtype;  /* 1=Q8, 2=Q4_0, 3=Q8_0, 4=Q4_0A, 5=Q4_K */
     float *q_bias, *k_bias, *v_bias;
 } Layer;
 
@@ -243,11 +252,41 @@ static inline void parallel_matmul_q4_0a(float *y, const uint8_t *q4a_W,
     }
 }
 
-/* Dispatch macro: picks Q4_0A/Q8_0/Q4_0/Q8 based on layer->qtype.
- * Args: q8_field, q4_field, q8_0_field, q4a_field, scale_field */
-#define LAYER_MATMUL(y, L, q8f, q4f, q8_0f, q4af, sf, x, b, in_dim, out_dim) \
+/* Parallel Q4_K matmul: row_stride = (in_dim/256) * 144 bytes per row */
+static inline void parallel_matmul_q4_k(float *y, const uint8_t *q4k_W,
+                                         const float *x, const float *b,
+                                         int in_dim, int out_dim) {
+    if (g_n_threads <= 1 || out_dim < 2048) {
+        lal_matmul_q4_k(y, q4k_W, x, b, in_dim, out_dim);
+        return;
+    }
+    int n_super = in_dim / 256;
+    int row_stride = n_super * 144;
+    #pragma omp parallel num_threads(g_n_threads)
+    {
+        int tid = omp_get_thread_num();
+        int n   = omp_get_num_threads();
+        int chunk = (out_dim + n - 1) / n;
+        int start = tid * chunk;
+        int end = start + chunk;
+        if (end > out_dim) end = out_dim;
+        if (start < out_dim) {
+            lal_matmul_q4_k(y + start,
+                            q4k_W + (size_t)start * row_stride,
+                            x,
+                            b ? b + start : NULL,
+                            in_dim, end - start);
+        }
+    }
+}
+
+/* Dispatch macro: picks Q4_K/Q4_0A/Q8_0/Q4_0/Q8 based on layer->qtype.
+ * Args: q8f, q4f, q8_0f, q4af, q4kf, sf */
+#define LAYER_MATMUL(y, L, q8f, q4f, q8_0f, q4af, q4kf, sf, x, b, in_dim, out_dim) \
     do { \
-        if ((L)->qtype == 4) { \
+        if ((L)->qtype == 5) { \
+            parallel_matmul_q4_k((y), (L)->q4k_##q4kf, (x), (b), (in_dim), (out_dim)); \
+        } else if ((L)->qtype == 4) { \
             parallel_matmul_q4_0a((y), (L)->q4a_##q4af, (x), (b), (in_dim), (out_dim)); \
         } else if ((L)->qtype == 3) { \
             parallel_matmul_q8_0((y), (L)->q8_0f, (x), (b), (in_dim), (out_dim)); \
@@ -342,6 +381,13 @@ static const uint8_t *get_q8_0(const char *key) {
 static const uint8_t *get_q4_0a(const char *key) {
     GPQ8Tensor *t = gp_find(key);
     if (!t || t->qtype != 4) { fprintf(stderr, "[!] %s not Q4_0A\n", key); exit(1); }
+    return (const uint8_t*)t->data;
+}
+
+/* Get Q4_K packed data pointer (144-byte superblocks) */
+static const uint8_t *get_q4_k(const char *key) {
+    GPQ8Tensor *t = gp_find(key);
+    if (!t || t->qtype != 5) { fprintf(stderr, "[!] %s not Q4_K\n", key); exit(1); }
     return (const uint8_t*)t->data;
 }
 
@@ -443,10 +489,15 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
                          const uint8_t *q8_0_gate, const uint8_t *q8_0_up,
                          const uint8_t *q8_0_down,
                          const uint8_t *q4a_gate, const uint8_t *q4a_up,
-                         const uint8_t *q4a_down, int qtype,
+                         const uint8_t *q4a_down,
+                         const uint8_t *q4k_gate, const uint8_t *q4k_up,
+                         const uint8_t *q4k_down, int qtype,
                          const float *x, float *out, int in_dim, int hid, int out_dim) {
     static float gate_buf[MLP_DIM], up_buf[MLP_DIM], act_buf[MLP_DIM];
-    if (qtype == 4) {
+    if (qtype == 5) {
+        parallel_matmul_q4_k(gate_buf, q4k_gate, x, NULL, in_dim, hid);
+        parallel_matmul_q4_k(up_buf,   q4k_up,   x, NULL, in_dim, hid);
+    } else if (qtype == 4) {
         parallel_matmul_q4_0a(gate_buf, q4a_gate, x, NULL, in_dim, hid);
         parallel_matmul_q4_0a(up_buf,   q4a_up,   x, NULL, in_dim, hid);
     } else if (qtype == 3) {
@@ -463,7 +514,9 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
     for (int i = 0; i < hid; i++)
         act_buf[i] = (gate_buf[i] / (1.0f + expf(-gate_buf[i]))) * up_buf[i];
     /* down = q_down @ act */
-    if (qtype == 4)
+    if (qtype == 5)
+        parallel_matmul_q4_k(out, q4k_down, act_buf, NULL, hid, out_dim);
+    else if (qtype == 4)
         parallel_matmul_q4_0a(out, q4a_down, act_buf, NULL, hid, out_dim);
     else if (qtype == 3)
         parallel_matmul_q8_0(out, q8_0_down, act_buf, NULL, hid, out_dim);
@@ -487,15 +540,15 @@ static int forward(int tok, int pos) {
         /* Pre-attn RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
         /* Q/K/V projections (Q8 or Q4 or Q8_0 from GPQ8 file) */
-        LAYER_MATMUL(g_q, L, q8_q, q4_q, q8_0_q, q, s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
-        LAYER_MATMUL(g_k, L, q8_k, q4_k, q8_0_k, k, s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
-        LAYER_MATMUL(g_v, L, q8_v, q4_v, q8_0_v, v, s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
+        LAYER_MATMUL(g_q, L, q8_q, q4_q, q8_0_q, q, q, s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
+        LAYER_MATMUL(g_k, L, q8_k, q4_k, q8_0_k, k, k, s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
+        LAYER_MATMUL(g_v, L, q8_v, q4_v, q8_0_v, v, v, s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
         /* RoPE */
         rope_apply(g_q, g_k, pos);
         /* GQA Attention */
         gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
         /* O proj + residual */
-        LAYER_MATMUL(g_proj, L, q8_o, q4_o, q8_0_o, o, s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
+        LAYER_MATMUL(g_proj, L, q8_o, q4_o, q8_0_o, o, o, s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
         for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
         /* Pre-MLP RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm2_w, N_EMBD);
@@ -504,7 +557,8 @@ static int forward(int tok, int pos) {
                      L->q8_down, L->s_down,
                      L->q4_gate, L->q4_up, L->q4_down,
                      L->q8_0_gate, L->q8_0_up, L->q8_0_down,
-                     L->q4a_gate, L->q4a_up, L->q4a_down, L->qtype,
+                     L->q4a_gate, L->q4a_up, L->q4a_down,
+                     L->q4k_gate, L->q4k_up, L->q4k_down, L->qtype,
                      g_ln, g_mlp_out, N_EMBD, MLP_DIM, N_EMBD);
         for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
     }
@@ -691,6 +745,7 @@ int main(int argc, char **argv) {
     sprintf(key, "model.layers.0.self_attn.q_proj.weight");
     int layer_qtype = get_qtype(key);
     printf("[*] layer weight qtype: %s\n",
+           layer_qtype == 5 ? "Q4_K (144 bytes/256 elems, superblock + sub-scales)" :
            layer_qtype == 4 ? "Q4_0A (32 bytes/32 elems, CACHE-LINE ALIGNED)" :
            layer_qtype == 3 ? "Q8_0 (34 bytes/32 elems, inline fp16 scale)" :
            layer_qtype == 2 ? "Q4_0 (18 bytes/32 elems)" :
@@ -700,7 +755,15 @@ int main(int argc, char **argv) {
         L->qtype = layer_qtype;
         sprintf(key, "model.layers.%d.input_layernorm.weight", l); L->norm1_w = get_f32(key);
         sprintf(key, "model.layers.%d.post_attention_layernorm.weight", l); L->norm2_w = get_f32(key);
-        if (layer_qtype == 4) {
+        if (layer_qtype == 5) {
+            sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l); L->q4k_q = get_q4_k(key);
+            sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l); L->q4k_k = get_q4_k(key);
+            sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l); L->q4k_v = get_q4_k(key);
+            sprintf(key, "model.layers.%d.self_attn.o_proj.weight", l); L->q4k_o = get_q4_k(key);
+            sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l); L->q4k_gate = get_q4_k(key);
+            sprintf(key, "model.layers.%d.mlp.up_proj.weight", l);   L->q4k_up = get_q4_k(key);
+            sprintf(key, "model.layers.%d.mlp.down_proj.weight", l); L->q4k_down = get_q4_k(key);
+        } else if (layer_qtype == 4) {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l); L->q4a_q = get_q4_0a(key);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l); L->q4a_k = get_q4_0a(key);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l); L->q4a_v = get_q4_0a(key);
