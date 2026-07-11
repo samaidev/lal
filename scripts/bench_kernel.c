@@ -137,6 +137,45 @@ static void bench_q4_0(const char *name, int in_dim, int out_dim, int n_iter) {
     free(q4_W); free(x); free(y);
 }
 
+/* Test Q4_0 single-row streaming matmul (llama.cpp approach) */
+static void bench_q4_0_streaming(const char *name, int in_dim, int out_dim, int n_iter) {
+    int blocks_per_row = in_dim / 32;
+    int row_stride = blocks_per_row * 18;
+    uint8_t *q4_W = memalign(32, (size_t)out_dim * row_stride);
+    float   *x = memalign(32, in_dim * sizeof(float));
+    float   *y = memalign(32, out_dim * sizeof(float));
+
+    for (int j = 0; j < out_dim; j++) {
+        uint8_t *row = q4_W + (size_t)j * row_stride;
+        for (int b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = row + b * 18;
+            uint16_t scale_u16 = 0x2C14;
+            block[0] = scale_u16 & 0xFF;
+            block[1] = (scale_u16 >> 8) & 0xFF;
+            for (int i = 0; i < 16; i++) block[2 + i] = (uint8_t)(rand() & 0xFF);
+        }
+    }
+    for (int i = 0; i < in_dim; i++) x[i] = (float)(rand() % 100) / 100.0f;
+
+    lal_matmul_q4_0_streaming(y, q4_W, x, NULL, in_dim, out_dim);
+
+    double t0 = now_s();
+    for (int i = 0; i < n_iter; i++)
+        lal_matmul_q4_0_streaming(y, q4_W, x, NULL, in_dim, out_dim);
+    double t1 = now_s();
+    double dt = (t1 - t0) / n_iter;
+
+    double bytes = (double)out_dim * blocks_per_row * 18 + in_dim * 4 + out_dim * 4;
+    double gb_s = bytes / dt / 1e9;
+    double flops = 2.0 * out_dim * in_dim;
+    double gflops = flops / dt / 1e9;
+
+    printf("  %-28s [%d, %d] @ [in=%d]: %7.3f ms  %6.1f GB/s  %6.1f GFLOPS\n",
+           name, out_dim, in_dim, in_dim, dt*1000, gb_s, gflops);
+
+    free(q4_W); free(x); free(y);
+}
+
 int main(void) {
     srand(42);
     printf("=== LAL matmul kernel micro-benchmark ===\n\n");
@@ -157,13 +196,21 @@ int main(void) {
     bench_q8_0("down_proj",18944,3584, 10);
     bench_q8_0("lm_head",  3584, 152064, 5);
 
-    printf("\n--- Q4_0 (block scale, 8-row parallel, cvtepi32_ps) ---\n");
+    printf("\n--- Q4_0 8-row parallel (cvtepi32_ps) ---\n");
     bench_q4_0("q_proj",   3584, 3584, 20);
     bench_q4_0("k_proj",   3584,  512, 50);
     bench_q4_0("o_proj",   3584, 3584, 20);
     bench_q4_0("gate_proj",3584,18944, 10);
     bench_q4_0("down_proj",18944,3584, 10);
     bench_q4_0("lm_head",  3584, 152064, 5);
+
+    printf("\n--- Q4_0 SINGLE-ROW STREAMING (llama.cpp approach) ---\n");
+    bench_q4_0_streaming("q_proj",   3584, 3584, 20);
+    bench_q4_0_streaming("k_proj",   3584,  512, 50);
+    bench_q4_0_streaming("o_proj",   3584, 3584, 20);
+    bench_q4_0_streaming("gate_proj",3584,18944, 10);
+    bench_q4_0_streaming("down_proj",18944,3584, 10);
+    bench_q4_0_streaming("lm_head",  3584, 152064, 5);
 
     return 0;
 }

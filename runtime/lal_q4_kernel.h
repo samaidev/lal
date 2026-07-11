@@ -288,4 +288,105 @@ static inline void lal_matmul_q4_0(float *y,
 #endif
 }
 
+/* === Single-row streaming Q4_0 matmul (llama.cpp approach) ===
+ *
+ * Processes ONE row at a time = 1 memory stream = perfect HW prefetching.
+ * Uses cvtepi32_ps to accumulate in YMM without per-block hsum.
+ * Only 1 hsum at the very end per row.
+ *
+ * This matches llama.cpp's ggml_vec_dot_q4_0_q8_0 exactly:
+ *   for each block:
+ *     d = w_scale * x_scale (broadcast)
+ *     qx = expand_nibbles(w_q4) - 8
+ *     qy = x_q8
+ *     q = mul_sum_i8_pairs_float(qx, qy)  ← cvtepi32_ps, no hsum!
+ *     acc = fmadd(d, q, acc)
+ *   hsum(acc) → y[j]
+ *
+ * The key: 1-row = 1 stream. HW prefetcher tracks this perfectly.
+ * 8-row parallel = 8 streams → prefetcher thrashing → 5 GB/s.
+ * 1-row streaming = 1 stream → near-peak bandwidth → should be ~10 GB/s.
+ */
+static inline void lal_matmul_q4_0_streaming(float *y,
+                                              const uint8_t *q4_W,
+                                              const float *x,
+                                              const float *b,
+                                              int in_dim, int out_dim) {
+#if defined(__AVX2__) && defined(__F16C__)
+    /* Quantize x to Q8_0 blocks (same as 8-row version) */
+    int blocks_per_row = in_dim / 32;
+    int row_stride = blocks_per_row * 18;
+
+    uint8_t xq8_0[XQ_MAX / 32 * 34] __attribute__((aligned(32)));
+    for (int blk = 0; blk < blocks_per_row; blk++) {
+        const float *xb = x + blk * 32;
+        float x_max = 0;
+        for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > x_max) x_max = a; }
+        float scale = x_max / 127.0f;
+        if (scale < 1e-8f) scale = 1e-8f;
+        float inv = 1.0f / scale;
+        __m128 scale_f32 = _mm_set1_ps(scale);
+        __m128i scale_fp16 = _mm_cvtps_ph(scale_f32, 0);
+        uint16_t s16 = _mm_extract_epi16(scale_fp16, 0);
+        xq8_0[blk * 34 + 0] = s16 & 0xFF;
+        xq8_0[blk * 34 + 1] = (s16 >> 8) & 0xFF;
+        int8_t *xb_q = (int8_t*)(xq8_0 + blk * 34 + 2);
+        for (int i = 0; i < 32; i++) {
+            int v = (int)lroundf(xb[i] * inv);
+            xb_q[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+        }
+    }
+
+    __m256i ones = _mm256_set1_epi16(1);
+    __m256i off8 = _mm256_set1_epi8(8);
+
+    /* Process 1 row at a time — 1 memory stream, perfect prefetching */
+    for (int j = 0; j < out_dim; j++) {
+        const uint8_t *row = q4_W + (size_t)j * row_stride;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int blk = 0; blk < blocks_per_row; blk++) {
+            int w_off = blk * 18;
+            int x_off = blk * 34;
+
+            /* Prefetch next block (1 stream = 1 prefetch) */
+            if (blk + 2 < blocks_per_row)
+                _mm_prefetch((const char*)(row + w_off + 2*18), _MM_HINT_T0);
+
+            /* Load w scale (fp16) and x scale (fp16), compute combined */
+            uint16_t w_s16 = *(const uint16_t*)(row + w_off);
+            uint16_t x_s16 = *(const uint16_t*)(xq8_0 + x_off);
+            __m128i w_sraw = _mm_set1_epi16((short)w_s16);
+            __m128i x_sraw = _mm_set1_epi16((short)x_s16);
+            float combined = _mm_cvtss_f32(_mm_cvtph_ps(w_sraw)) *
+                             _mm_cvtss_f32(_mm_cvtph_ps(x_sraw));
+            __m256 d = _mm256_set1_ps(combined);
+
+            /* Expand Q4 nibbles to 32 int8 (signed -8..7) */
+            __m256i wv = lal_bytes_from_nibbles_32(row + w_off + 2);
+            wv = _mm256_sub_epi8(wv, off8);
+
+            /* Load x Q8 values */
+            __m256i xv = _mm256_loadu_si256((__m256i*)(xq8_0 + x_off + 2));
+
+            /* Dot product → 8-lane fp32 (no hsum!) */
+            __m256 q = lal_dot32_i8_f32(wv, xv, ones);
+
+            /* Accumulate */
+            acc = _mm256_fmadd_ps(d, q, acc);
+        }
+
+        /* ONE hsum at the end */
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
+        y[j] = _mm_cvtss_f32(s) + (b ? b[j] : 0);
+    }
+#else
+    /* Fall back to the 8-row version (scalar fallback is inside it) */
+    lal_matmul_q4_0(y, q4_W, x, b, in_dim, out_dim);
+#endif
+}
+
 #endif /* LAL_Q4_KERNEL_H */
