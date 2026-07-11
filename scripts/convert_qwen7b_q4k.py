@@ -64,12 +64,13 @@ def quantize_q4_k_per_row(f32_data, in_dim, out_dim):
     q = np.clip(q, 0, 15).astype(np.uint8)
 
     # Pack 4-bit values: 256 elements -> 128 bytes
-    # INTERLEAVED packing per sub-block: byte[sub*16+i] = q[sub*32+i] | (q[sub*32+i+16] << 4)
+    # ADJACENT packing (llama.cpp style): byte[sub*16+i] = q[sub*32+2i] | (q[sub*32+2i+1] << 4)
+    # This packs adjacent pairs together, enabling 512-bit maddubs for AVX512_BW.
     q_flat = q.reshape(out_dim, n_super, 256)
     qs_packed = np.zeros((out_dim, n_super, 128), dtype=np.uint8)
     for sub in range(8):
         for i in range(16):
-            qs_packed[:, :, sub*16 + i] = q_flat[:, :, sub*32 + i] | (q_flat[:, :, sub*32 + i + 16] << 4)
+            qs_packed[:, :, sub*16 + i] = q_flat[:, :, sub*32 + 2*i] | (q_flat[:, :, sub*32 + 2*i + 1] << 4)
 
     # Pack scales+mins: 8 scales + 8 mins, 6-bit each, into 12 bytes
     scales_min = np.zeros((out_dim, n_super, 12), dtype=np.uint8)
