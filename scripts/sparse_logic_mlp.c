@@ -52,6 +52,8 @@
 
 /* Default: top-k = 2048 out of 18944 (10.8%) — keeps quality, 9x sparse speedup */
 #define DEFAULT_TOP_K 2048
+/* Max top-k — must be >= MLP_DIM to allow full computation */
+#define MAX_TOP_K 18944
 
 #define XQ_MAX 18944
 #include "runtime/lal_runtime.h"
@@ -66,10 +68,15 @@ typedef struct {
     float  *s_gate_full;   /* [MLP_DIM] per-row scale */
 } GateLayer;
 
-/* Sparse selector layer: stores full Q8 up/down, accessed by row/column index */
+/* Sparse selector layer: up is row-major (sparse row access),
+ * down is PRE-TRANSPOSED to column-major for contiguous sparse column access */
 typedef struct {
-    int8_t *q8_up;    float *s_up;    /* [MLP_DIM, N_EMBD] full Q8, sparse row access */
-    int8_t *q8_down;  float *s_down;  /* [N_EMBD, MLP_DIM] full Q8, sparse column access */
+    int8_t *q8_up;    float *s_up;    /* [MLP_DIM, N_EMBD] row-major, sparse row access */
+    /* down_proj original: [N_EMBD, MLP_DIM] row-major (down[i,j] at i*MLP_DIM+j)
+     * Transposed: [MLP_DIM, N_EMBD] row-major (down_T[j,i] at j*N_EMBD+i)
+     * This way, column j of down = row j of down_T = contiguous N_EMBD bytes */
+    int8_t *q8_down_T;  /* [MLP_DIM, N_EMBD] TRANSPOSED, column-major access */
+    float  *s_down;     /* [N_EMBD] per-row scale (same as original) */
 } SparseQ8;
 
 typedef struct {
@@ -94,49 +101,99 @@ static int8_t *g_xq_cache;
 static float **kv_k, **kv_v;
 static int g_n_threads = 1;
 static int g_top_k = DEFAULT_TOP_K;
+static int g_use_scalar_down = 0;  /* --scalar-down: use scalar reference for debug */
 
-/* === Sparse down_proj with SIMD column gather ===
+/* === Sparse down_proj with TRANSPOSED weights (contiguous column access) ===
  * y[N_EMBD] = sum_k down_proj[:, indices[k]] * act[k]
- * down_proj is [N_EMBD, MLP_DIM] row-major: down_proj[i, j] = q8_down[i*MLP_DIM + j]
  *
- * For each output row i: y[i] = scale_down[i] * sum_k q8_down[i*MLP_DIM + idx_k] * act_k
- * We process 8 output rows at a time with AVX2 gather.
+ * q8_down_T is [MLP_DIM, N_EMBD] TRANSPOSED: down_T[j, i] = down[i, j]
+ * So column j of original down = row j of down_T = contiguous N_EMBD bytes!
  *
- * Only reads N_EMBD × k int8 (k=2048 → 7.3MB vs full 67MB). */
-static void sparse_down_proj_simd(float *y, const int8_t *q8_down, const float *s_down,
+ * For each selected column k (index = indices[k]):
+ *   y[i] += down_T[idx_k, i] * s_down[i] * act[k]  for i=0..N_EMBD-1
+ *
+ * The down_T[idx_k] access is contiguous (stride=1), so SIMD loads work perfectly.
+ * Only reads k × N_EMBD int8 (k=2048 → 7.3MB vs full 67MB), all contiguous. */
+static void sparse_down_proj_simd(float *y, const int8_t *q8_down_T, const float *s_down,
                                    const float *act, const int *indices, int k) {
     /* Zero output */
     memset(y, 0, N_EMBD * sizeof(float));
-    /* For each selected column, accumulate into y (column-major iteration).
-     * q8_down[i*MLP_DIM + col_idx] for i=0..N_EMBD-1
-     * This reads k columns of the weight matrix. Each column is N_EMBD bytes
-     * but strided by MLP_DIM (18944). Cache-unfriendly, but only k reads.
+
+    /* For each selected column k:
+     *   y[i] += down_T[idx_k][i] * s_down[i] * act[k]
+     * = y[i] += (down_T[idx_k][i] * act[k]) * s_down[i]
      *
-     * SIMD: process 8 rows at a time, gather 8 int8 from column. */
+     * Process 32 output elements at a time with AVX2.
+     * For each k: load 32 int8 from down_T[idx_k][i..i+31], convert to float,
+     * multiply by act[k], accumulate into y[i..i+31]. Apply s_down at the end. */
     for (int ki = 0; ki < k; ki++) {
         int col_idx = indices[ki];
         float a = act[ki];
         if (a == 0.0f) continue;
-        /* Add down_proj[:, col_idx] * a to y[:]
-         * down_proj[i, col_idx] = q8_down[i * MLP_DIM + col_idx], stride = MLP_DIM */
-        const int8_t *col = q8_down + col_idx;  /* points to row 0, column col_idx */
-        for (int i = 0; i < N_EMBD; i++) {
-            y[i] += (float)col[(size_t)i * MLP_DIM] * s_down[i] * a;
+        const int8_t *col_row = q8_down_T + (size_t)col_idx * N_EMBD;  /* contiguous! */
+
+        /* SIMD: 32 int8 → 32 float, multiply by a, add to y.
+         * Process in 4 chunks of 8 floats (32 total). */
+        int i = 0;
+        for (; i + 32 <= N_EMBD; i += 32) {
+            __m256i wv = _mm256_loadu_si256((__m256i*)(col_row + i));  /* 32 int8 */
+            /* Split 32 int8 into 4 × 8 int8 → 4 × 8 int32 → 4 × 8 float */
+            __m128i w128_lo = _mm256_castsi256_si128(wv);   /* first 16 int8 */
+            __m128i w128_hi = _mm256_extracti128_si256(wv, 1); /* last 16 int8 */
+            /* int8 → int16: 16→16 needs 2 cvtepi8_epi16 (8 each) */
+            __m128i w16_0 = _mm_cvtepi8_epi16(w128_lo);       /* first 8 int16 */
+            __m128i w16_1 = _mm_cvtepi8_epi16(_mm_srli_si128(w128_lo, 8)); /* next 8 */
+            __m128i w16_2 = _mm_cvtepi8_epi16(w128_hi);       /* next 8 */
+            __m128i w16_3 = _mm_cvtepi8_epi16(_mm_srli_si128(w128_hi, 8)); /* last 8 */
+            /* int16 → int32 → float, 8 at a time */
+            __m256 wf0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(w16_0));
+            __m256 wf1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(w16_1));
+            __m256 wf2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(w16_2));
+            __m256 wf3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(w16_3));
+            /* Multiply by act[k] (broadcast) */
+            __m256 av = _mm256_set1_ps(a);
+            wf0 = _mm256_mul_ps(wf0, av);
+            wf1 = _mm256_mul_ps(wf1, av);
+            wf2 = _mm256_mul_ps(wf2, av);
+            wf3 = _mm256_mul_ps(wf3, av);
+            /* Accumulate into y (4 × 8 floats) */
+            _mm256_storeu_ps(y + i,      _mm256_add_ps(_mm256_loadu_ps(y + i),      wf0));
+            _mm256_storeu_ps(y + i + 8,  _mm256_add_ps(_mm256_loadu_ps(y + i + 8),  wf1));
+            _mm256_storeu_ps(y + i + 16, _mm256_add_ps(_mm256_loadu_ps(y + i + 16), wf2));
+            _mm256_storeu_ps(y + i + 24, _mm256_add_ps(_mm256_loadu_ps(y + i + 24), wf3));
         }
+        /* Tail: process remaining 8 at a time */
+        for (; i + 8 <= N_EMBD; i += 8) {
+            __m128i w16 = _mm_cvtepi8_epi16(_mm_loadl_epi64((__m128i*)(col_row + i)));
+            __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(w16));
+            __m256 av = _mm256_set1_ps(a);
+            wf = _mm256_mul_ps(wf, av);
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), wf));
+        }
+        /* Final tail */
+        for (; i < N_EMBD; i++) {
+            y[i] += (float)col_row[i] * a;
+        }
+    }
+
+    /* Apply s_down[i] to each output element */
+    for (int i = 0; i < N_EMBD; i++) {
+        y[i] *= s_down[i];
     }
 }
 
-/* === Top-k selection: find indices of top-k POSITIVE gate_score values ===
- * SiLU(gate) = 0 for gate << 0, so only positive gates contribute.
- * Select the top-k most-positive gates (largest SiLU activation).
+/* === Top-k selection: find indices of top-k |gate_score| values (abs) ===
+ * High-magnitude gates (both positive and negative) are the "active" selectors.
+ * Positive gates: SiLU(gate) ≈ gate (passes through)
+ * Negative gates: SiLU(gate) ≈ 0 but contributes small negative value
+ * Large |gate| = important selector regardless of sign.
  * Uses a min-heap of size k. O(MLP_DIM * log k). */
 static void topk_positive(const float *scores, int n, int k, int *indices) {
     float *heap_val = malloc(k * sizeof(float));
     int *heap_idx = malloc(k * sizeof(int));
     int heap_n = 0;
     for (int j = 0; j < n; j++) {
-        float val = scores[j];  /* use raw gate value, not abs */
-        if (val <= 0) continue;  /* skip negative gates (SiLU kills them) */
+        float val = fabsf(scores[j]);  /* use absolute value */
         if (heap_n < k) {
             int c = heap_n++;
             heap_val[c] = val; heap_idx[c] = j;
@@ -160,26 +217,6 @@ static void topk_positive(const float *scores, int n, int k, int *indices) {
                 p = s;
             }
         }
-    }
-    /* If fewer than k positive gates, fill with top abs-negative */
-    int filled = heap_n;
-    if (filled < k) {
-        /* Find top (k-filled) negative gates by |value| */
-        float *neg_val = malloc((k - filled) * sizeof(float));
-        int *neg_idx = malloc((k - filled) * sizeof(int));
-        int neg_n = 0;
-        for (int j = 0; j < n && neg_n < (k - filled); j++) {
-            if (scores[j] <= 0) {
-                neg_val[neg_n] = scores[j];
-                neg_idx[neg_n] = j;
-                neg_n++;
-            }
-        }
-        for (int i = 0; i < neg_n && filled < k; i++) {
-            heap_idx[filled] = neg_idx[i];
-            filled++;
-        }
-        free(neg_val); free(neg_idx);
     }
     for (int i = 0; i < k; i++) indices[i] = heap_idx[i];
     /* Sort by index for cache-friendly sparse access */
@@ -324,9 +361,9 @@ static void gqa_attn(float *out, const float *Q, const float *Kn, const float *V
  * 5. Sparse down: SIMD column gather for selected columns */
 static void sparse_logic_mlp(float *out, const float *x, const Layer *L) {
     static float gate_score[MLP_DIM];
-    static float up_sparse[DEFAULT_TOP_K * 2];
-    static float act_sparse[DEFAULT_TOP_K * 2];
-    static int topk_indices[DEFAULT_TOP_K * 2];
+    static float up_sparse[MAX_TOP_K];
+    static float act_sparse[MAX_TOP_K];
+    static int topk_indices[MAX_TOP_K];
 
     /* Step 1: Full Q8 gate — compute ALL 18944 selector scores with precision */
     lal_matmul_q8_signtrick(gate_score, L->gate.q8_gate_full, L->gate.s_gate_full,
@@ -347,9 +384,23 @@ static void sparse_logic_mlp(float *out, const float *x, const Layer *L) {
         act_sparse[ki] = silu_g * up_sparse[ki];
     }
 
-    /* Step 5: Sparse down_proj — SIMD column gather */
-    sparse_down_proj_simd(out, L->sparse_mlp.q8_down, L->sparse_mlp.s_down,
-                          act_sparse, topk_indices, g_top_k);
+    /* Step 5: Sparse down_proj — SIMD contiguous column access (transposed weights) */
+    if (g_use_scalar_down) {
+        /* Scalar reference for debugging */
+        memset(out, 0, N_EMBD * sizeof(float));
+        for (int ki = 0; ki < g_top_k; ki++) {
+            int col_idx = topk_indices[ki];
+            float a = act_sparse[ki];
+            if (a == 0.0f) continue;
+            const int8_t *col_row = L->sparse_mlp.q8_down_T + (size_t)col_idx * N_EMBD;
+            for (int i = 0; i < N_EMBD; i++) {
+                out[i] += (float)col_row[i] * a * L->sparse_mlp.s_down[i];
+            }
+        }
+    } else {
+        sparse_down_proj_simd(out, L->sparse_mlp.q8_down_T, L->sparse_mlp.s_down,
+                              act_sparse, topk_indices, g_top_k);
+    }
 }
 
 /* === Forward pass === */
@@ -490,8 +541,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--n") && i+1<argc) n_gen=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--top-k") && i+1<argc) g_top_k=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--threads") && i+1<argc) g_n_threads=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--scalar-down")) g_use_scalar_down=1;
     }
     printf("=== Qwen2.5-7B Sparse Logic Selector MLP ===\n");
+    if (g_top_k > MLP_DIM) g_top_k = MLP_DIM;
+    if (g_top_k < 1) g_top_k = 1;
     printf("[*] top_k = %d / %d (%.1f%% sparsity)\n", g_top_k, MLP_DIM, 100.0f*g_top_k/MLP_DIM);
     load_gpq8(weights);
     g_norm_f_w = get_f32("model.norm.weight");
@@ -508,11 +562,23 @@ int main(int argc, char **argv) {
         sprintf(key, "model.layers.%d.self_attn.q_proj.bias", l); L->q_bias = get_f32(key);
         sprintf(key, "model.layers.%d.self_attn.k_proj.bias", l); L->k_bias = get_f32(key);
         sprintf(key, "model.layers.%d.self_attn.v_proj.bias", l); L->v_bias = get_f32(key);
-        /* Q8 gate (full precision for routing), Q8 up/down (sparse access) */
+        /* Q8 gate (full precision for routing), Q8 up (sparse row access) */
         sprintf(key, "model.layers.%d.mlp.gate_proj.weight", l); get_q8(key, &L->gate.q8_gate_full, &L->gate.s_gate_full);
         sprintf(key, "model.layers.%d.mlp.up_proj.weight", l); get_q8(key, &L->sparse_mlp.q8_up, &L->sparse_mlp.s_up);
-        sprintf(key, "model.layers.%d.mlp.down_proj.weight", l); get_q8(key, &L->sparse_mlp.q8_down, &L->sparse_mlp.s_down);
-        if ((l+1) % 7 == 0) { printf("[*] prepared layer %d\n", l); fflush(stdout); }
+        /* down_proj: load original [N_EMBD, MLP_DIM] then TRANSPOSE to [MLP_DIM, N_EMBD]
+         * for contiguous sparse column access. This is the key fix! */
+        int8_t *q8_down_orig; float *s_down_orig;
+        sprintf(key, "model.layers.%d.mlp.down_proj.weight", l); get_q8(key, &q8_down_orig, &s_down_orig);
+        L->sparse_mlp.s_down = s_down_orig;  /* scale is [N_EMBD], same for both layouts */
+        L->sparse_mlp.q8_down_T = memalign(32, (size_t)MLP_DIM * N_EMBD);
+        /* Transpose: down_T[j][i] = down[i][j] = q8_down_orig[i*MLP_DIM + j] */
+        for (int j = 0; j < MLP_DIM; j++) {
+            int8_t *dst = L->sparse_mlp.q8_down_T + (size_t)j * N_EMBD;
+            for (int i = 0; i < N_EMBD; i++) {
+                dst[i] = q8_down_orig[(size_t)i * MLP_DIM + j];
+            }
+        }
+        if ((l+1) % 7 == 0) { printf("[*] prepared layer %d (down_proj transposed)\n", l); fflush(stdout); }
     }
     float *lm_head_f = get_f32("lm_head.weight");
     g_lm_head_q = memalign(32, (size_t)VOCAB_SIZE * N_EMBD);
