@@ -327,7 +327,6 @@ static inline void parallel_matmul_q4_k_prepared(float *y, const uint8_t *q4k_W,
                                       xq, bsums, xq_arr, x_scale);
         }
     }
-#undef Q4K_KERNEL
 }
 
 /* Dispatch macro: picks Q4_K/Q4_0A/Q8_0/Q4_0/Q8 based on layer->qtype.
