@@ -1,35 +1,36 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 
 # OS
 .DS_Store
 Thumbs.db
+*.swp
+*~
 
-# Build temp (prebuilt/ is tracked!)
+# Build temp
 build/
 
-# Large binary weight files (regenerate with tools/)
-prebuilt/gpt2_weights.bin
-prebuilt/gpt2_binary_finetuned.bin
-prebuilt/gpt2_float_subset.bin
-prebuilt/gpt2_binary_logic.bin
+# === Compiled binaries (regenerate via make) ===
+# Pre-built executables should NOT be in git — users build from source.
+prebuilt/gpt2_server
+prebuilt/gpt2_train
+prebuilt/gpt2
+prebuilt/qwen_server
+prebuilt/qwen_train
+prebuilt/qwen7b_server
+prebuilt/demos/
 
-# Built standalone tools (regenerate via make)
+# Compiled test/bench binaries
 scripts/extract_float_subset
 scripts/build_corpus
-
-# Not part of project
-skills/
-upload/
-.env
-prebuilt/gpt2_binary.bin
-prebuilt/gpt2_synthetic.bin
-prebuilt/qwen_tokenizer.json
-prebuilt/qwen_weights.bin
-prebuilt/qwen_tokenizer/
 scripts/bench_e2e_qwen
 scripts/bench_lm_head
+scripts/bench_kernel
+scripts/bench_q4k
+scripts/bench_q4k_prof
 scripts/bottleneck_analysis
 scripts/deep_q4_vs_q8
 scripts/deep_quality_test
@@ -39,11 +40,31 @@ tests/test_q4_simd
 tests/test_q8_mistral
 tests/test_q8_quality
 tests/test_q8_simd
-prebuilt/qwen_server
-prebuilt/gpt2_server
-prebuilt/gpt2_train
-prebuilt/gpt2
-prebuilt/qwen_train
-prebuilt/demos/
+tests/test_bwn_opt
+tests/test_bwn_patch
+
+# === Large weight files (regenerate via scripts/convert_*.py) ===
+prebuilt/gpt2_weights.bin
+prebuilt/gpt2_binary_finetuned.bin
 prebuilt/gpt2_float_subset.bin
-prebuilt/gpt2_tokenizer.bin
+prebuilt/gpt2_binary_logic.bin
+prebuilt/gpt2_binary.bin
+prebuilt/gpt2_synthetic.bin
+prebuilt/qwen_weights.bin
+prebuilt/qwen7b_weights.bin
+prebuilt/qwen7b_q4k_weights.bin
+prebuilt/qwen7b_q4_weights.bin
+prebuilt/qwen7b_q8_0_weights.bin
+prebuilt/qwen7b_q4_0a_weights.bin
+
+# Tokenizer files (download separately)
+prebuilt/qwen_tokenizer.json
+prebuilt/qwen_tokenizer/
+prebuilt/qwen7b_tokenizer/
+
+# === Not part of project ===
+skills/
+upload/
+.env
+.env.*
+download/
