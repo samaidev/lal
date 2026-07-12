@@ -390,7 +390,25 @@ static inline float lal_quantize_x_int8(const float *x, int8_t *xq, int n) {
     return scale;
 }
 
-/* === LM head int8 dot product over a vocab range (sign-trick, AVX2) === */
+/* === LM head int8 dot product over a vocab range (sign-trick, AVX2) ===
+ * 优化 v2:
+ *  1. abs_xq 预计算提到 OpenMP 外 (避免每个线程重复计算 + false sharing)
+ *  2. 软件 prefetch 下一个 vocab row (减少 L2 miss stall)
+ *  3. 新增 lal_compute_abs_xq() 供调用方预计算
+ */
+static inline void lal_compute_abs_xq(const int8_t *xq, uint8_t *ax, int n_embd) {
+#if defined(__AVX2__)
+    for (int i = 0; i < n_embd; i += 32) {
+        __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
+        __m256i abs_xq = _mm256_sign_epi8(xv, xv);
+        _mm256_storeu_si256((__m256i*)(ax + i), abs_xq);
+    }
+#else
+    for (int i = 0; i < n_embd; i++) ax[i] = (uint8_t)(xq[i] < 0 ? -xq[i] : xq[i]);
+#endif
+}
+
+/* 旧接口保留向后兼容: 内部调用 lal_compute_abs_xq + lal_lm_head_int8_range_abs */
 static inline void lal_lm_head_int8_range(float *logits,
                                           const int8_t *xq,
                                           float scale_x,
@@ -399,11 +417,46 @@ static inline void lal_lm_head_int8_range(float *logits,
                                           int v_start, int v_end, int n_embd) {
 #if defined(__AVX2__)
     static uint8_t ax[XQ_MAX] __attribute__((aligned(32)));
-    for (int i = 0; i < n_embd; i += 32) {
-        __m256i xv = _mm256_loadu_si256((__m256i*)(xq + i));
-        __m256i abs_xq = _mm256_sign_epi8(xv, xv);
-        _mm256_storeu_si256((__m256i*)(ax + i), abs_xq);
+    lal_compute_abs_xq(xq, ax, n_embd);
+    __m256i ones = _mm256_set1_epi16(1);
+    for (int v = v_start; v < v_end; v++) {
+        const int8_t *wv = wte_q + (size_t)v * n_embd;
+        __m256i acc = _mm256_setzero_si256();
+        int i = 0;
+        for (; i + 32 <= n_embd; i += 32) {
+            __m256i ax_v = _mm256_loadu_si256((__m256i*)(ax + i));
+            __m256i sw_v = _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(wv + i)),
+                                            _mm256_loadu_si256((__m256i*)(xq + i)));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, sw_v), ones));
+        }
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s = _mm_add_epi32(lo, hi);
+        s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s);
+        int32_t dot = _mm_cvtsi128_si32(s);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        logits[v] = scale_x * scale_w[v] * (float)dot;
     }
+#else
+    for (int v = v_start; v < v_end; v++) {
+        const int8_t *wv = wte_q + (size_t)v * n_embd;
+        int32_t dot = 0;
+        for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        logits[v] = scale_x * scale_w[v] * (float)dot;
+    }
+#endif
+}
+
+/* 新接口: 接受预计算的 abs_xq, 避免 OpenMP 线程内重复计算
+ * 注意: 不含 prefetch — 实测 Xeon Platinum 硬件预取器已足够, 软件 prefetch 反而干扰 */
+static inline void lal_lm_head_int8_range_abs(float *logits,
+                                               const int8_t *xq,
+                                               const uint8_t *ax,
+                                               float scale_x,
+                                               const int8_t *wte_q,
+                                               const float *scale_w,
+                                               int v_start, int v_end, int n_embd) {
+#if defined(__AVX2__)
     __m256i ones = _mm256_set1_epi16(1);
     for (int v = v_start; v < v_end; v++) {
         const int8_t *wv = wte_q + (size_t)v * n_embd;

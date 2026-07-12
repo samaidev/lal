@@ -547,8 +547,13 @@ static int forward(int tok, int pos) {
      * lm_head was quantized to int8 at startup (per-row scale).
      * Uses sign-trick kernel for 4x less memory bandwidth than F32.
      * Parallelized across threads — lm_head is 152064 rows, the biggest
-     * single matmul, so threading gives ~2x on 2 vCPUs. */
+     * single matmul, so threading gives ~2x on 2 vCPUs.
+     * 优化: abs_xq 在 OpenMP 外预计算一次 (之前每线程重算 + false sharing)
+     *       + 软件 prefetch 下一个 vocab row */
     float scale_x = lal_quantize_x_int8(g_ln, g_xq_cache, N_EMBD);
+    /* 预计算 abs_xq 一次, 共享给所有线程 */
+    static uint8_t g_abs_xq[N_EMBD] __attribute__((aligned(32)));
+    lal_compute_abs_xq(g_xq_cache, g_abs_xq, N_EMBD);
     #pragma omp parallel num_threads(g_n_threads)
     {
         int tid = omp_get_thread_num();
@@ -558,9 +563,9 @@ static int forward(int tok, int pos) {
         int v_end = v_start + v_per;
         if (v_end > VOCAB_SIZE) v_end = VOCAB_SIZE;
         if (v_start < VOCAB_SIZE)
-            lal_lm_head_int8_range(g_logits, g_xq_cache, scale_x,
-                                   g_lm_head_q, g_lm_head_s,
-                                   v_start, v_end, N_EMBD);
+            lal_lm_head_int8_range_abs(g_logits, g_xq_cache, g_abs_xq, scale_x,
+                                       g_lm_head_q, g_lm_head_s,
+                                       v_start, v_end, N_EMBD);
     }
 
     /* Sample */
