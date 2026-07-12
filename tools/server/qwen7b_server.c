@@ -486,7 +486,7 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
         parallel_matmul(gate_buf, q_gate, s_gate, x, NULL, in_dim, hid);
         parallel_matmul(up_buf,   q_up,   s_up,   x, NULL, in_dim, hid);
     }
-    /* SiLU(gate) * up */
+    /* SiLU(gate) * up — 标量版本（编译器自动向量化，比手动 SIMD 快因为 expf 是标量） */
     for (int i = 0; i < hid; i++)
         act_buf[i] = (gate_buf[i] / (1.0f + expf(-gate_buf[i]))) * up_buf[i];
     /* down = q_down @ act */
@@ -523,9 +523,9 @@ static int forward(int tok, int pos) {
         rope_apply(g_q, g_k, pos);
         /* GQA Attention */
         gqa_attn(g_attn_out, g_q, g_k, g_v, l, pos);
-        /* O proj + residual */
+        /* O proj + residual — SIMD 优化 */
         LAYER_MATMUL(g_proj, L, q8_o, q4_o, q8_0_o, o, o, s_o, g_attn_out, NULL, Q_DIM, N_EMBD);
-        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_proj[i];
+        lal_residual_add_simd(g_x, g_proj, N_EMBD);
         /* Pre-MLP RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm2_w, N_EMBD);
         /* Fused SwiGLU MLP + residual */
@@ -536,7 +536,7 @@ static int forward(int tok, int pos) {
                      L->q4a_gate, L->q4a_up, L->q4a_down,
                      L->q4k_gate, L->q4k_up, L->q4k_down, L->qtype,
                      g_ln, g_mlp_out, N_EMBD, MLP_DIM, N_EMBD);
-        for (int i = 0; i < N_EMBD; i++) g_x[i] += g_mlp_out[i];
+        lal_residual_add_simd(g_x, g_mlp_out, N_EMBD);
     }
 
     /* Final RMSNorm */
