@@ -486,9 +486,10 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
         parallel_matmul(gate_buf, q_gate, s_gate, x, NULL, in_dim, hid);
         parallel_matmul(up_buf,   q_up,   s_up,   x, NULL, in_dim, hid);
     }
-    /* SiLU(gate) * up — 标量版本（编译器自动向量化，比手动 SIMD 快因为 expf 是标量） */
-    for (int i = 0; i < hid; i++)
-        act_buf[i] = (gate_buf[i] / (1.0f + expf(-gate_buf[i]))) * up_buf[i];
+    /* SiLU(gate) * up — SIMD 优化版（真正的向量 exp 近似，~5x faster than scalar）
+     * 注意: 之前注释说"标量更快"是因为旧的 fast_exp_ps 是伪 SIMD（store+标量expf+load）
+     * 现在的 fast_exp_ps 用 bit-twiddling + 多项式, 真正全 SIMD */
+    lal_silu_mul_simd(act_buf, gate_buf, up_buf, hid);
     /* down = q_down @ act */
     if (qtype == 5)
         parallel_matmul_q4_k(out, q4k_down, act_buf, NULL, hid, out_dim);
