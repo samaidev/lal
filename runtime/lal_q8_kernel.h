@@ -540,4 +540,101 @@ static inline void lal_lm_head_int8_range_abs(float *logits,
 #endif
 }
 
+/* === 8-row parallel LM head (AVX2) ===
+ * 一次处理 8 个 vocab row, 利用 8 个 YMM 累加器
+ * 比 1-row 版快 ~1.5-2x (更好 ILP + 更少循环开销)
+ *
+ * 数据量不变: 545MB, 但计算效率更高
+ */
+static inline void lal_lm_head_int8_range_abs_8row(float *logits,
+                                                     const int8_t *xq,
+                                                     const uint8_t *ax,
+                                                     float scale_x,
+                                                     const int8_t *wte_q,
+                                                     const float *scale_w,
+                                                     int v_start, int v_end, int n_embd) {
+#if defined(__AVX2__)
+    __m256i ones = _mm256_set1_epi16(1);
+    int v = v_start;
+    /* 8-row parallel */
+    for (; v + 8 <= v_end; v += 8) {
+        const int8_t *w0 = wte_q + (size_t)(v+0) * n_embd;
+        const int8_t *w1 = wte_q + (size_t)(v+1) * n_embd;
+        const int8_t *w2 = wte_q + (size_t)(v+2) * n_embd;
+        const int8_t *w3 = wte_q + (size_t)(v+3) * n_embd;
+        const int8_t *w4 = wte_q + (size_t)(v+4) * n_embd;
+        const int8_t *w5 = wte_q + (size_t)(v+5) * n_embd;
+        const int8_t *w6 = wte_q + (size_t)(v+6) * n_embd;
+        const int8_t *w7 = wte_q + (size_t)(v+7) * n_embd;
+        __m256i acc0=_mm256_setzero_si256(),acc1=_mm256_setzero_si256();
+        __m256i acc2=_mm256_setzero_si256(),acc3=_mm256_setzero_si256();
+        __m256i acc4=_mm256_setzero_si256(),acc5=_mm256_setzero_si256();
+        __m256i acc6=_mm256_setzero_si256(),acc7=_mm256_setzero_si256();
+
+        int i = 0;
+        for (; i + 32 <= n_embd; i += 32) {
+            __m256i ax_v = _mm256_loadu_si256((__m256i*)(ax + i));
+            __m256i xq_v = _mm256_loadu_si256((__m256i*)(xq + i));
+            /* Prefetch next cache line for all 8 rows (2 ahead) */
+            if (i + 64 < n_embd) {
+                _mm_prefetch((const char*)(w0 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w1 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w2 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w3 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w4 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w5 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w6 + i + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w7 + i + 64), _MM_HINT_T0);
+            }
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w0+i)), xq_v)), ones));
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w1+i)), xq_v)), ones));
+            acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w2+i)), xq_v)), ones));
+            acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w3+i)), xq_v)), ones));
+            acc4 = _mm256_add_epi32(acc4, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w4+i)), xq_v)), ones));
+            acc5 = _mm256_add_epi32(acc5, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w5+i)), xq_v)), ones));
+            acc6 = _mm256_add_epi32(acc6, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w6+i)), xq_v)), ones));
+            acc7 = _mm256_add_epi32(acc7, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(w7+i)), xq_v)), ones));
+        }
+        /* Horizontal sum each accumulator.
+         * n_embd=3584 是 32 的倍数, 不会有 tail (i == n_embd) */
+        #define HS_LM(r, acc) do { \
+            __m128i lo = _mm256_castsi256_si128(acc); \
+            __m128i hi = _mm256_extracti128_si256(acc, 1); \
+            __m128i s = _mm_add_epi32(lo, hi); \
+            s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s); \
+            logits[v+r] = scale_x * scale_w[v+r] * (float)_mm_cvtsi128_si32(s); \
+        } while(0)
+        HS_LM(0, acc0); HS_LM(1, acc1); HS_LM(2, acc2); HS_LM(3, acc3);
+        HS_LM(4, acc4); HS_LM(5, acc5); HS_LM(6, acc6); HS_LM(7, acc7);
+        #undef HS_LM
+    }
+    /* Tail: 1-row for remaining */
+    for (; v < v_end; v++) {
+        const int8_t *wv = wte_q + (size_t)v * n_embd;
+        __m256i acc = _mm256_setzero_si256();
+        int i = 0;
+        for (; i + 32 <= n_embd; i += 32) {
+            __m256i ax_v = _mm256_loadu_si256((__m256i*)(ax + i));
+            __m256i sw_v = _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(wv + i)),
+                                            _mm256_loadu_si256((__m256i*)(xq + i)));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, sw_v), ones));
+        }
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s = _mm_add_epi32(lo, hi);
+        s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s);
+        int32_t dot = _mm_cvtsi128_si32(s);
+        for (; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        logits[v] = scale_x * scale_w[v] * (float)dot;
+    }
+#else
+    for (int v = v_start; v < v_end; v++) {
+        const int8_t *wv = wte_q + (size_t)v * n_embd;
+        int32_t dot = 0;
+        for (int i = 0; i < n_embd; i++) dot += (int)xq[i] * (int)wv[i];
+        logits[v] = scale_x * scale_w[v] * (float)dot;
+    }
+#endif
+}
+
 #endif /* LAL_Q8_KERNEL_H */
