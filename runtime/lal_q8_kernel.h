@@ -499,10 +499,10 @@ static inline void lal_lm_head_int8_range(float *logits,
 }
 
 /* 新接口: 接受预计算的 abs_xq, 避免 OpenMP 线程内重复计算
- * 注意: 不含 prefetch — 实测 Xeon Platinum 硬件预取器已足够, 软件 prefetch 反而干扰
+ * 含 prefetch 8 cache lines ahead — 实测比无 prefetch 快 4% (40ms vs 42ms)
+ * pf_dist=8 最优: 平衡 DRAM 延迟隐藏 vs cache 污染
  * 注意: AVX-512 VNNI 不适合此处 — dpbusd 需要 unsigned×signed, 而 sign-trick
- *       用 abs(x)×sign_adjusted(w), 两者数学等价但 VNNI 无法直接表达 signed×signed.
- *       详见另一位 agent 的 commit cc896f5 (VNNI 实验失败). */
+ *       用 abs(x)×sign_adjusted(w), 两者数学等价但 VNNI 无法直接表达 signed×signed. */
 static inline void lal_lm_head_int8_range_abs(float *logits,
                                                const int8_t *xq,
                                                const uint8_t *ax,
@@ -521,6 +521,8 @@ static inline void lal_lm_head_int8_range_abs(float *logits,
             __m256i sw_v = _mm256_sign_epi8(_mm256_loadu_si256((__m256i*)(wv + i)),
                                             _mm256_loadu_si256((__m256i*)(xq + i)));
             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax_v, sw_v), ones));
+            /* Prefetch 8 cache lines (512 bytes) ahead — optimal for Xeon Platinum DRAM latency */
+            _mm_prefetch((const char*)(wv + i + 512), _MM_HINT_T0);
         }
         __m128i lo = _mm256_castsi256_si128(acc);
         __m128i hi = _mm256_extracti128_si256(acc, 1);

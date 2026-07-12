@@ -677,7 +677,7 @@ static int forward(int tok, int pos) {
         int v_end = v_start + v_per;
         if (v_end > VOCAB_SIZE) v_end = VOCAB_SIZE;
         if (v_start < VOCAB_SIZE)
-            lal_lm_head_int8_range_abs_8row(g_logits, g_xq_cache, g_abs_xq, scale_x,
+            lal_lm_head_int8_range_abs(g_logits, g_xq_cache, g_abs_xq, scale_x,
                                        g_lm_head_q, g_lm_head_s,
                                        v_start, v_end, N_EMBD);
     }
