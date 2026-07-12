@@ -333,6 +333,12 @@ static void load_gpq8(const char *path) {
     g_mmap_size = st.st_size;
     g_mmap_base = mmap(NULL, g_mmap_size, PROT_READ, MAP_PRIVATE, g_mmap_fd, 0);
     if (g_mmap_base == MAP_FAILED) { fprintf(stderr, "[!] mmap failed\n"); exit(1); }
+    /* Hint kernel to use transparent huge pages (2MB) for fewer TLB misses.
+     * On a 8GB file this reduces TLB entries from 2M to 4K — huge win for
+     * sequential weight reads. */
+    madvise(g_mmap_base, g_mmap_size, MADV_HUGEPAGE);
+    /* Also hint sequential access pattern for better readahead. */
+    madvise(g_mmap_base, g_mmap_size, MADV_SEQUENTIAL);
     const unsigned char *p = (const unsigned char *)g_mmap_base;
     if (memcmp(p, "GPQ8", 4) != 0) { fprintf(stderr, "[!] bad magic\n"); exit(1); }
     p += 4;
@@ -568,11 +574,23 @@ static int forward(int tok, int pos) {
 
     /* LM head: int8 dot product (logits = lm_head_q @ x)
      * lm_head was quantized to int8 at startup (per-row scale).
-     * Uses sign-trick kernel for 4x less memory bandwidth than F32. */
+     * Uses sign-trick kernel for 4x less memory bandwidth than F32.
+     * Parallelized across threads — lm_head is 152064 rows, the biggest
+     * single matmul, so threading gives ~2x on 2 vCPUs. */
     float scale_x = lal_quantize_x_int8(g_ln, g_xq_cache, N_EMBD);
-    lal_lm_head_int8_range(g_logits, g_xq_cache, scale_x,
-                           g_lm_head_q, g_lm_head_s,
-                           0, VOCAB_SIZE, N_EMBD);
+    #pragma omp parallel num_threads(g_n_threads)
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        int v_per = (VOCAB_SIZE + nthreads - 1) / nthreads;
+        int v_start = tid * v_per;
+        int v_end = v_start + v_per;
+        if (v_end > VOCAB_SIZE) v_end = VOCAB_SIZE;
+        if (v_start < VOCAB_SIZE)
+            lal_lm_head_int8_range(g_logits, g_xq_cache, scale_x,
+                                   g_lm_head_q, g_lm_head_s,
+                                   v_start, v_end, N_EMBD);
+    }
 
     /* Sample */
     int next = lal_sample_token(g_logits, VOCAB_SIZE, g_temperature, g_top_k, g_rep_penalty, g_recent, g_n_recent);
