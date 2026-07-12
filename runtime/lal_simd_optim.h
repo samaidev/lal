@@ -280,6 +280,94 @@ static inline void lal_silu_mul_simd(float * __restrict__ act,
     }
 }
 
+/* === Fused SiLU + prepare_x for down matmul ===
+ * 计算 act[i] = SiLU(gate[i]) * up[i], 同时:
+ *   1. 求 act 的 abs max → x_scale
+ *   2. 量化 act → xq (int8)
+ *   3. 计算 bsums (每 32 个 int8 的和)
+ *   4. 排列 xq_arr (even/odd split for ADJACENT packing)
+ *
+ * 这样 down matmul 可以直接用 prepared 接口, 省去内部 prepare_x。
+ * 节省约 0.1ms/layer (prepare_x 占 matmul 的 ~2%)
+ */
+static inline float lal_silu_mul_prepare_simd(
+                                      float * __restrict__ act,
+                                      const float * __restrict__ gate,
+                                      const float * __restrict__ up,
+                                      int n,
+                                      int8_t * __restrict__ xq,
+                                      int16_t * __restrict__ bsums,
+                                      int8_t * __restrict__ xq_arr) {
+    int n_super = n / 256;
+    int n_sub = n / 32;
+
+    /* Phase 1: SiLU(gate) * up, 同时求 abs max */
+    __m256 vmax_abs = _mm256_setzero_ps();
+    __m256 vone = _mm256_set1_ps(1.0f);
+    int i = 0;
+    int n8 = n & ~7;
+    for (; i < n8; i += 8) {
+        __m256 vg = _mm256_loadu_ps(gate + i);
+        __m256 vu = _mm256_loadu_ps(up + i);
+        __m256 vneg_g = _mm256_xor_ps(vg, _mm256_set1_ps(-0.0f));
+        __m256 vexp_neg_g = fast_exp_ps(vneg_g);
+        __m256 vsigmoid = _mm256_div_ps(vone, _mm256_add_ps(vone, vexp_neg_g));
+        __m256 vsilu = _mm256_mul_ps(vg, vsigmoid);
+        __m256 vr = _mm256_mul_ps(vsilu, vu);
+        _mm256_storeu_ps(act + i, vr);
+        /* abs max: 用 andnot 翻转符号位得到 |vr| */
+        __m256 vabs = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), vr);
+        vmax_abs = _mm256_max_ps(vmax_abs, vabs);
+    }
+    /* Horizontal max */
+    __m128 hi = _mm256_extractf128_ps(vmax_abs, 1);
+    __m128 lo = _mm256_castps256_ps128(vmax_abs);
+    __m128 s = _mm_max_ps(lo, hi);
+    s = _mm_shuffle_ps(s, s, _MM_SHUFFLE(2,3,0,1));
+    s = _mm_max_ps(s, s);
+    s = _mm_shuffle_ps(s, s, _MM_SHUFFLE(1,0,3,2));
+    s = _mm_max_ps(s, s);
+    float x_max = _mm_cvtss_f32(s);
+    /* tail SiLU */
+    for (; i < n; i++) {
+        float g = gate[i];
+        act[i] = (g / (1.0f + expf(-g))) * up[i];
+        float a = fabsf(act[i]);
+        if (a > x_max) x_max = a;
+    }
+
+    /* Phase 2: 量化 act → xq */
+    float x_scale = x_max / 127.0f;
+    if (x_scale < 1e-8f) x_scale = 1e-8f;
+    float x_inv = 1.0f / x_scale;
+    for (int j = 0; j < n; j++) {
+        int v = (int)lroundf(act[j] * x_inv);
+        xq[j] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+    }
+
+    /* Phase 3: bsums (每 32 个 int8 的和) */
+    for (int sb = 0; sb < n_sub; sb++) {
+        int32_t sum = 0;
+        for (int k = 0; k < 32; k++) sum += (int)xq[sb * 32 + k];
+        bsums[sb] = (int16_t)sum;
+    }
+
+    /* Phase 4: xq_arr even/odd split */
+    for (int s2 = 0; s2 < n_super; s2++) {
+        int8_t *dst_even = xq_arr + s2*256;
+        int8_t *dst_odd  = xq_arr + s2*256 + 128;
+        for (int k = 0; k < 8; k++) {
+            const int8_t *src = xq + s2*256 + k*32;
+            for (int j = 0; j < 16; j++) {
+                dst_even[k*16 + j] = src[2*j];
+                dst_odd[k*16 + j]  = src[2*j + 1];
+            }
+        }
+    }
+
+    return x_scale;
+}
+
 /* === 新增: SIMD 优化版 Residual Add ===
  * x[i] += y[i], 向量化，3x faster
  */

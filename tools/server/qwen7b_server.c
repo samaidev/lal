@@ -532,6 +532,20 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
     /* SiLU(gate) * up — SIMD 优化版（真正的向量 exp 近似，~5x faster than scalar）
      * 注意: 之前注释说"标量更快"是因为旧的 fast_exp_ps 是伪 SIMD（store+标量expf+load）
      * 现在的 fast_exp_ps 用 bit-twiddling + 多项式, 真正全 SIMD */
+    if (qtype == 5) {
+        /* 优化: fused SiLU + prepare_x for down matmul
+         * 在计算 SiLU 的同时量化 act, 计算 bsums/xq_arr
+         * down matmul 直接用 prepared 接口, 省去内部 prepare_x */
+        static int8_t down_xq[XQ_MAX] __attribute__((aligned(32)));
+        static int16_t down_bsums[XQ_MAX / 32] __attribute__((aligned(32)));
+        static int8_t down_xq_arr[XQ_MAX] __attribute__((aligned(32)));
+        float down_scale = lal_silu_mul_prepare_simd(act_buf, gate_buf, up_buf, hid,
+                                                      down_xq, down_bsums, down_xq_arr);
+        /* down = q_down @ act (prepared, skip internal prepare_x) */
+        parallel_matmul_q4_k_prepared(out, q4k_down, act_buf, NULL, hid, out_dim,
+                                       down_xq, down_bsums, down_xq_arr, down_scale);
+        return;
+    }
     lal_silu_mul_simd(act_buf, gate_buf, up_buf, hid);
     /* down = q_down @ act */
     if (qtype == 5)
