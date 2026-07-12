@@ -226,10 +226,13 @@ static inline void lal_matmul_q4_k_prepared(float * __restrict__ y,
             #undef PROC8_PREPARED
         }
 
-        y[j+0]+=_mm256_cvtss_f32(acc0)+am0; y[j+1]+=_mm256_cvtss_f32(acc1)+am1;
-        y[j+2]+=_mm256_cvtss_f32(acc2)+am2; y[j+3]+=_mm256_cvtss_f32(acc3)+am3;
-        y[j+4]+=_mm256_cvtss_f32(acc4)+am4; y[j+5]+=_mm256_cvtss_f32(acc5)+am5;
-        y[j+6]+=_mm256_cvtss_f32(acc6)+am6; y[j+7]+=_mm256_cvtss_f32(acc7)+am7;
+        /* Bug fix: 需要 horizontal sum acc 的 8 个 lane (各 lane 值不同) */
+        #define HS8P(r,a,m) do{__m128 lo=_mm256_castps256_ps128(a),hi=_mm256_extractf128_ps(a,1);\
+            __m128 s2=_mm_add_ps(lo,hi);s2=_mm_hadd_ps(s2,s2);s2=_mm_hadd_ps(s2,s2);\
+            y[j+r]=_mm_cvtss_f32(s2)+m+(b?b[j+r]:0);}while(0)
+        HS8P(0,acc0,am0);HS8P(1,acc1,am1);HS8P(2,acc2,am2);HS8P(3,acc3,am3);
+        HS8P(4,acc4,am4);HS8P(5,acc5,am5);HS8P(6,acc6,am6);HS8P(7,acc7,am7);
+        #undef HS8P
     }
     for (; j < out_dim; j++) {
         const uint8_t *sb = q4k_W + (size_t)j * row_stride;
@@ -238,7 +241,8 @@ static inline void lal_matmul_q4_k_prepared(float * __restrict__ y,
             float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+s*144))));
             float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+s*144+2))));
             uint8_t sm[16]; unpack_scales_6bit(sb+s*144+4,sm);
-            int32_t mp_sum=0; for(int i=0;i<8;i++) mp_sum+=(int)sm[8+i]*bsums[s*8+i];
+            /* Bug fix: sm[8+i] 是 uint8 但代表 int8 (min 值), 需要 sign-extend */
+            int32_t mp_sum=0; for(int i=0;i<8;i++) mp_sum+=(int)(int8_t)sm[8+i]*bsums[s*8+i];
             float r_am=dmin*x_scale*(float)mp_sum*inv_63;
             int32_t isum=0;
             for (int k = 0; k < 8; k++) {
@@ -247,12 +251,14 @@ static inline void lal_matmul_q4_k_prepared(float * __restrict__ y,
                 for (int i = 0; i < 16; i++) {
                     int q4 = (qs[i] & 0x0F);
                     int q4h = (qs[i] >> 4) & 0x0F;
-                    isum += (q4 - sm[k]) * xqs[2*i] + (q4h - sm[k]) * xqs[2*i+1];
+                    /* Bug fix: Q4_K 数学是 w = q4 * scale - min, 点积是 sum(q4 * xq) * scale - min * sum(xq)
+                     * 不是 (q4 - scale) * xq. scale 是乘法因子不是减法. */
+                    isum += q4 * xqs[2*i] + q4h * xqs[2*i+1];
                 }
             }
             sumf += d * x_scale * inv_63 * isum - r_am;
         }
-        y[j] += sumf;
+        y[j] = sumf + (b?b[j]:0);
     }
 #else
     /* Fallback (no AVX2): reuse lal_matmul_q4_k */
