@@ -7,7 +7,14 @@ CC ?= gcc
 # intrinsics per platform (see top of that file).
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
-  SIMD_FLAGS ?= -mavx2 -mfma -mf16c
+  # Try -march=native first (enables all CPU-specific tuning), fall back to
+  # generic AVX2 if native is not supported (cross-compilation, old gcc)
+  NATIVE_OK := $(shell echo 'int main(){return 0;}' | $(CC) -march=native -x c - -o /dev/null 2>/dev/null && echo yes)
+  ifeq ($(NATIVE_OK),yes)
+    SIMD_FLAGS ?= -march=native
+  else
+    SIMD_FLAGS ?= -mavx2 -mfma -mf16c
+  endif
 else ifeq ($(UNAME_M),i386)
   SIMD_FLAGS ?= -msse4.1
 else ifneq (,$(filter $(UNAME_M),arm armv7l armv7-a))

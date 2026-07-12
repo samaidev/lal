@@ -162,22 +162,25 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 const uint8_t *sb=rows[r]+s*144; \
                 float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
                 float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
-                uint8_t sm[16]; unpack_scales_6bit(sb+4,sm); \
-                /* Min correction: madd gives 4 int32, extract all 4 (avoids hadd) */ \
-                __m128i mn_v=_mm_set_epi16(sm[15],sm[14],sm[13],sm[12],sm[11],sm[10],sm[9],sm[8]); \
+                uint8_t sm[16] __attribute__((aligned(16))); unpack_scales_6bit(sb+4,sm); \
+                /* Build mn_v from sm[8..15] using a single load + shuffle.
+                 * sm[8..15] are 8 bytes. Load 16 bytes starting at sm+8,
+                 * then zero-extend each byte to int16 via shuffle. */ \
+                __m128i mn_bytes = _mm_loadl_epi64((__m128i*)(sm+8)); /* 8 bytes, zero-extended */ \
+                __m128i mn_v = _mm_cvtepi8_epi16(mn_bytes); /* 8 int16 */ \
                 __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
-                int32_t mp_lo = _mm_cvtsi128_si32(mp); \
-                int32_t mp_hi1 = _mm_extract_epi32(mp, 1); \
-                int32_t mp_hi2 = _mm_extract_epi32(mp, 2); \
-                int32_t mp_hi3 = _mm_extract_epi32(mp, 3); \
-                float r_am=dmin*x_scale*(float)(mp_lo+mp_hi1+mp_hi2+mp_hi3)*inv_63; \
+                int32_t mp_sum = _mm_cvtsi128_si32(mp) \
+                    + _mm_extract_epi32(mp, 1) \
+                    + _mm_extract_epi32(mp, 2) \
+                    + _mm_extract_epi32(mp, 3); \
+                float r_am=dmin*x_scale*(float)mp_sum*inv_63; \
                 if(r==0)am0-=r_am;else if(r==1)am1-=r_am;else if(r==2)am2-=r_am; \
                 else if(r==3)am3-=r_am;else if(r==4)am4-=r_am;else if(r==5)am5-=r_am; \
                 else if(r==6)am6-=r_am;else am7-=r_am; \
                 /* 4 iterations: 2 sub-blocks per iter, 256-bit maddubs */ \
                 __m256i sumi=_mm256_setzero_si256(); \
                 const uint8_t*qs=sb+16; \
-                /* Prefetch next superblock's weight data while processing current */ \
+                /* Prefetch next superblock's weight (1 ahead, 2 cache lines). */ \
                 _mm_prefetch((const char*)(qs+144), _MM_HINT_T0); \
                 _mm_prefetch((const char*)(qs+144+64), _MM_HINT_T0); \
                 /* iter 0: sub0+sub1 */ \
