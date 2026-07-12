@@ -448,7 +448,10 @@ static inline void lal_lm_head_int8_range(float *logits,
 }
 
 /* 新接口: 接受预计算的 abs_xq, 避免 OpenMP 线程内重复计算
- * 注意: 不含 prefetch — 实测 Xeon Platinum 硬件预取器已足够, 软件 prefetch 反而干扰 */
+ * 注意: 不含 prefetch — 实测 Xeon Platinum 硬件预取器已足够, 软件 prefetch 反而干扰
+ * 注意: AVX-512 VNNI 不适合此处 — dpbusd 需要 unsigned×signed, 而 sign-trick
+ *       用 abs(x)×sign_adjusted(w), 两者数学等价但 VNNI 无法直接表达 signed×signed.
+ *       详见另一位 agent 的 commit cc896f5 (VNNI 实验失败). */
 static inline void lal_lm_head_int8_range_abs(float *logits,
                                                const int8_t *xq,
                                                const uint8_t *ax,
