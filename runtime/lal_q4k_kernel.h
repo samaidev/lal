@@ -132,7 +132,11 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
         }
     }
 
-    /* 8-row parallel main loop */
+    /* 8-row parallel main loop.
+     * Why 8 rows: AVX2 has 16 YMM registers. 8 accumulators (acc0-acc7) use
+     * 8 registers, leaving 8 for temporals (xq, q4, p16, sc_v, etc.).
+     * 4-row: not enough ILP. 16-row: register spill to stack (slower).
+     * See ARCHITECTURE.md §3. */
     int j = 0;
     for (; j + 8 <= out_dim; j += 8) {
         const uint8_t * __restrict__ rows[8];
@@ -160,15 +164,19 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
 
             #define PROC8(r) do { \
                 const uint8_t *sb=rows[r]+s*144; \
+                /* d/dmin are fp16 (2 bytes each). Convert to float for scaling. */ \
                 float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
                 float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
+                /* Unpack 16 × 6-bit scales+mins. This is the most expensive \
+                 * non-matmul operation (~15 instructions). See PITFALLS.md §1. */ \
                 uint8_t sm[16] __attribute__((aligned(16))); unpack_scales_6bit(sb+4,sm); \
-                /* Build mn_v from sm[8..15] using a single load + shuffle.
-                 * sm[8..15] are 8 bytes. Load 16 bytes starting at sm+8,
-                 * then zero-extend each byte to int16 via shuffle. */ \
+                /* Min correction: build mn_v from sm[8..15] using cvtepi8_epi16 \
+                 * (2 instructions) instead of set_epi16 (7+ instructions). \
+                 * See ARCHITECTURE.md §6 for why extract > hadd. */ \
                 __m128i mn_bytes = _mm_loadl_epi64((__m128i*)(sm+8)); /* 8 bytes, zero-extended */ \
                 __m128i mn_v = _mm_cvtepi8_epi16(mn_bytes); /* 8 int16 */ \
                 __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
+                /* Sum 4 int32 lanes via extract (parallel, 1 cycle) not hadd (serial, 4 cycles) */ \
                 int32_t mp_sum = _mm_cvtsi128_si32(mp) \
                     + _mm_extract_epi32(mp, 1) \
                     + _mm_extract_epi32(mp, 2) \
@@ -180,7 +188,10 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 /* 4 iterations: 2 sub-blocks per iter, 256-bit maddubs */ \
                 __m256i sumi=_mm256_setzero_si256(); \
                 const uint8_t*qs=sb+16; \
-                /* Prefetch next superblock's weight (1 ahead, 2 cache lines). */ \
+                /* Prefetch next superblock's weight (1 ahead, 2 cache lines).
+                 * Why 1 ahead: DRAM latency ~100ns, one superblock ~15µs to process,
+                 * so 1-ahead matches the latency window. 2+ ahead causes cache eviction.
+                 * See ARCHITECTURE.md §5 and PITFALLS.md §6. */ \
                 _mm_prefetch((const char*)(qs+144), _MM_HINT_T0); \
                 _mm_prefetch((const char*)(qs+144+64), _MM_HINT_T0); \
                 /* iter 0: sub0+sub1 */ \
