@@ -295,6 +295,41 @@ static inline void parallel_matmul_q4_k(float *y, const uint8_t *q4k_W,
 #undef Q4K_KERNEL
 }
 
+/* Parallel Q4_K matmul with pre-computed x preprocessing (gate/up 共享)
+ * 调用方需先用 lal_q4k_prepare_x() 预计算 xq/bsums/xq_arr/x_scale */
+static inline void parallel_matmul_q4_k_prepared(float *y, const uint8_t *q4k_W,
+                                                   const float *x, const float *b,
+                                                   int in_dim, int out_dim,
+                                                   const int8_t *xq,
+                                                   const int16_t *bsums,
+                                                   const int8_t *xq_arr,
+                                                   float x_scale) {
+    if (g_n_threads <= 1 || out_dim < 2048) {
+        lal_matmul_q4_k_prepared(y, q4k_W, x, b, in_dim, out_dim,
+                                  xq, bsums, xq_arr, x_scale);
+        return;
+    }
+    int n_super = in_dim / 256;
+    int row_stride = n_super * 144;
+    #pragma omp parallel num_threads(g_n_threads)
+    {
+        int tid = omp_get_thread_num();
+        int n   = omp_get_num_threads();
+        int chunk = (out_dim + n - 1) / n;
+        int start = tid * chunk;
+        int end = start + chunk;
+        if (end > out_dim) end = out_dim;
+        if (start < out_dim) {
+            lal_matmul_q4_k_prepared(y + start,
+                                      q4k_W + (size_t)start * row_stride,
+                                      x, b ? b + start : NULL,
+                                      in_dim, end - start,
+                                      xq, bsums, xq_arr, x_scale);
+        }
+    }
+#undef Q4K_KERNEL
+}
+
 /* Dispatch macro: picks Q4_K/Q4_0A/Q8_0/Q4_0/Q8 based on layer->qtype.
  * Args: q8f, q4f, q8_0f, q4af, q4kf, sf */
 #define LAYER_MATMUL(y, L, q8f, q4f, q8_0f, q4af, q4kf, sf, x, b, in_dim, out_dim) \
@@ -471,8 +506,16 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
                          const float *x, float *out, int in_dim, int hid, int out_dim) {
     static float gate_buf[MLP_DIM], up_buf[MLP_DIM], act_buf[MLP_DIM];
     if (qtype == 5) {
-        parallel_matmul_q4_k(gate_buf, q4k_gate, x, NULL, in_dim, hid);
-        parallel_matmul_q4_k(up_buf,   q4k_up,   x, NULL, in_dim, hid);
+        /* 优化: gate 和 up 共享 x 预处理 (量化 + bsums + xq_arr 排列)
+         * 预处理约占单次 matmul 的 5-10%, 共享后节省一半 */
+        static int8_t xq[XQ_MAX] __attribute__((aligned(32)));
+        static int16_t bsums[XQ_MAX / 32] __attribute__((aligned(32)));
+        static int8_t xq_arr[XQ_MAX] __attribute__((aligned(32)));
+        float x_scale = lal_q4k_prepare_x(x, in_dim, xq, bsums, xq_arr);
+        parallel_matmul_q4_k_prepared(gate_buf, q4k_gate, x, NULL, in_dim, hid,
+                                       xq, bsums, xq_arr, x_scale);
+        parallel_matmul_q4_k_prepared(up_buf, q4k_up, x, NULL, in_dim, hid,
+                                       xq, bsums, xq_arr, x_scale);
     } else if (qtype == 4) {
         parallel_matmul_q4_0a(gate_buf, q4a_gate, x, NULL, in_dim, hid);
         parallel_matmul_q4_0a(up_buf,   q4a_up,   x, NULL, in_dim, hid);
