@@ -245,5 +245,13 @@ int main(void) {
     bench_q4_0a("down_proj",18944,3584, 10);
     bench_q4_0a("lm_head",  3584, 152064, 5);
 
+    printf("\n--- Q8_0 block-format (34B blocks, inline fp16 scale) ---\n");
+    bench_q8_0("q_proj",   3584, 3584, 20);
+    bench_q8_0("k_proj",   3584,  512, 50);
+    bench_q8_0("o_proj",   3584, 3584, 20);
+    bench_q8_0("gate_proj",3584,18944, 10);
+    bench_q8_0("down_proj",18944,3584, 10);
+    bench_q8_0("lm_head",  3584, 152064, 5);
+
     return 0;
 }
