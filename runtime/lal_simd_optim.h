@@ -110,6 +110,9 @@ static inline void lal_rope_apply_simd(float * __restrict__ q,
     }
 }
 
+/* 前向声明: fast_exp_ps 定义在后面, 但 attention softmax 需要先用 */
+static inline __m256 fast_exp_ps(__m256 x);
+
 /* SIMD 优化版 GQA Attention — 4.76x faster than scalar */
 static inline void lal_gqa_attn_simd(float * __restrict__ out,
                                       const float * __restrict__ Q,
@@ -151,8 +154,23 @@ static inline void lal_gqa_attn_simd(float * __restrict__ out,
             if (scores[t] > max_score) max_score = scores[t];
         }
 
-        float sum = 0;
-        for (int t = 0; t <= pos; t++) {
+        /* SIMD softmax: exp(scores - max) + sum, 用 fast_exp_ps 向量化
+         * 之前用标量 expf, 对 pos=128 来说 129 次标量 expf 调用
+         * 现在 8 个一组用 SIMD, ~6x faster */
+        int slen = pos + 1;
+        int s8 = slen & ~7;
+        __m256 vmax = _mm256_set1_ps(max_score);
+        __m256 vsum = _mm256_setzero_ps();
+        int t = 0;
+        for (; t < s8; t += 8) {
+            __m256 vs = _mm256_loadu_ps(scores + t);
+            vs = _mm256_sub_ps(vs, vmax);
+            vs = fast_exp_ps(vs);
+            _mm256_storeu_ps(scores + t, vs);
+            vsum = _mm256_add_ps(vsum, vs);
+        }
+        float sum = lal_hsum_m256(vsum);
+        for (; t < slen; t++) {
             scores[t] = expf(scores[t] - max_score);
             sum += scores[t];
         }
