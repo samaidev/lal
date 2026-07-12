@@ -389,6 +389,18 @@ static void load_gpq8(const char *path) {
     madvise(g_mmap_base, g_mmap_size, MADV_HUGEPAGE);
     /* Also hint sequential access pattern for better readahead. */
     madvise(g_mmap_base, g_mmap_size, MADV_SEQUENTIAL);
+    /* 预热: 顺序读取触发 page fault + readahead, 避免推理时 stall.
+     * 每 4KB (1 page) 读一个 byte, 触发 page fault 但不读全页.
+     * 8GB 文件约 2M pages, 读 2MB 数据, ~100ms 一次性成本. */
+    {
+        volatile char sink = 0;
+        const char *base = (const char*)g_mmap_base;
+        size_t step = 4096;  /* 1 page */
+        for (size_t off = 0; off < g_mmap_size; off += step) {
+            sink += base[off];
+        }
+        printf("[*] mmap warmed (%zu MB touched)\n", g_mmap_size / (1024*1024));
+    }
     const unsigned char *p = (const unsigned char *)g_mmap_base;
     if (memcmp(p, "GPQ8", 4) != 0) { fprintf(stderr, "[!] bad magic\n"); exit(1); }
     p += 4;
