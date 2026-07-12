@@ -36,13 +36,43 @@
 #error "Define XQ_MAX before including lal_q4k_kernel.h"
 #endif
 
-/* Unpack 16 × 6-bit values from 12 bytes (packed low-to-high) into 16 uint8 */
+/* Unpack 16 × 6-bit values from 12 bytes (packed low-to-high) into 16 uint8.
+ *
+ * Vectorized approach: load 16 bytes, use multiply + shift to extract 6-bit fields.
+ * The 12-byte packed data holds 16 × 6 = 96 bits. We pad to 128 bits and use
+ * SIMD to extract all 16 values in a few operations.
+ *
+ * Technique: treat the 12 bytes as a 128-bit number (zero-padded).
+ * Multiply by a precomputed vector of shift amounts, then mask.
+ * Actually simpler: use the "bit extraction via multiply" trick.
+ *
+ * For 6-bit fields packed at positions 0, 6, 12, ..., 90:
+ *   val[i] = (packed >> (i*6)) & 0x3F
+ *
+ * Vectorized: load 16 bytes as __m128i, use pmaddubsw + psrlw + pand pattern.
+ * But the simplest correct approach is still scalar — compiler optimizes well.
+ * Keep scalar but mark as inline (already is).
+ */
 static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
     uint64_t lo = *(const uint64_t*)src;
     uint32_t hi = *(const uint32_t*)(src + 8);
-    for (int i = 0; i < 10; i++) out16[i] = (lo >> (i * 6)) & 0x3F;
+    /* Unrolled for better instruction-level parallelism */
+    out16[0]  = lo & 0x3F;
+    out16[1]  = (lo >> 6) & 0x3F;
+    out16[2]  = (lo >> 12) & 0x3F;
+    out16[3]  = (lo >> 18) & 0x3F;
+    out16[4]  = (lo >> 24) & 0x3F;
+    out16[5]  = (lo >> 30) & 0x3F;
+    out16[6]  = (lo >> 36) & 0x3F;
+    out16[7]  = (lo >> 42) & 0x3F;
+    out16[8]  = (lo >> 48) & 0x3F;
+    out16[9]  = (lo >> 54) & 0x3F;
     out16[10] = ((lo >> 60) | (hi << 4)) & 0x3F;
-    for (int i = 0; i < 5; i++) out16[11 + i] = (hi >> (2 + i * 6)) & 0x3F;
+    out16[11] = (hi >> 2) & 0x3F;
+    out16[12] = (hi >> 8) & 0x3F;
+    out16[13] = (hi >> 14) & 0x3F;
+    out16[14] = (hi >> 20) & 0x3F;
+    out16[15] = (hi >> 26) & 0x3F;
 }
 
 static inline void lal_matmul_q4_k(float * __restrict__ y,
@@ -133,11 +163,14 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
                 float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
                 uint8_t sm[16]; unpack_scales_6bit(sb+4,sm); \
-                /* Min correction: sum(m[k] * bsums[k]) for k=0..7 */ \
+                /* Min correction: madd gives 4 int32, extract all 4 (avoids hadd) */ \
                 __m128i mn_v=_mm_set_epi16(sm[15],sm[14],sm[13],sm[12],sm[11],sm[10],sm[9],sm[8]); \
                 __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
-                mp=_mm_hadd_epi32(mp,mp); mp=_mm_hadd_epi32(mp,mp); \
-                float r_am=dmin*x_scale*(float)_mm_cvtsi128_si32(mp)*inv_63; \
+                int32_t mp_lo = _mm_cvtsi128_si32(mp); \
+                int32_t mp_hi1 = _mm_extract_epi32(mp, 1); \
+                int32_t mp_hi2 = _mm_extract_epi32(mp, 2); \
+                int32_t mp_hi3 = _mm_extract_epi32(mp, 3); \
+                float r_am=dmin*x_scale*(float)(mp_lo+mp_hi1+mp_hi2+mp_hi3)*inv_63; \
                 if(r==0)am0-=r_am;else if(r==1)am1-=r_am;else if(r==2)am2-=r_am; \
                 else if(r==3)am3-=r_am;else if(r==4)am4-=r_am;else if(r==5)am5-=r_am; \
                 else if(r==6)am6-=r_am;else am7-=r_am; \
@@ -149,9 +182,8 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i q4b=_mm256_loadu_si256((__m256i*)qs); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
                     __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i pl=_mm256_maddubs_epi16(q4l,xve0); \
-                    __m256i ph=_mm256_maddubs_epi16(q4h,xvo0); \
-                    __m256i p16=_mm256_add_epi16(pl,ph); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4l,xve0), \
+                                                  _mm256_maddubs_epi16(q4h,xvo0)); \
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[1]),_mm_set1_epi16((short)sm[0])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
@@ -160,9 +192,8 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+32)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
                     __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i pl=_mm256_maddubs_epi16(q4l,xve1); \
-                    __m256i ph=_mm256_maddubs_epi16(q4h,xvo1); \
-                    __m256i p16=_mm256_add_epi16(pl,ph); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4l,xve1), \
+                                                  _mm256_maddubs_epi16(q4h,xvo1)); \
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[3]),_mm_set1_epi16((short)sm[2])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
@@ -171,9 +202,8 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+64)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
                     __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i pl=_mm256_maddubs_epi16(q4l,xve2); \
-                    __m256i ph=_mm256_maddubs_epi16(q4h,xvo2); \
-                    __m256i p16=_mm256_add_epi16(pl,ph); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4l,xve2), \
+                                                  _mm256_maddubs_epi16(q4h,xvo2)); \
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[5]),_mm_set1_epi16((short)sm[4])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
@@ -182,9 +212,8 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+96)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
                     __m256i q4h=_mm256_and_si256(_mm256_srli_epi16(q4b,4),m4); \
-                    __m256i pl=_mm256_maddubs_epi16(q4l,xve3); \
-                    __m256i ph=_mm256_maddubs_epi16(q4h,xvo3); \
-                    __m256i p16=_mm256_add_epi16(pl,ph); \
+                    __m256i p16=_mm256_add_epi16(_mm256_maddubs_epi16(q4l,xve3), \
+                                                  _mm256_maddubs_epi16(q4h,xvo3)); \
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[7]),_mm_set1_epi16((short)sm[6])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
