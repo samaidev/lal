@@ -559,10 +559,25 @@ static int forward(int tok, int pos) {
         Layer *L = &g_layers[l];
         /* Pre-attn RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
-        /* Q/K/V projections (Q8 or Q4 or Q8_0 from GPQ8 file) */
-        LAYER_MATMUL(g_q, L, q8_q, q4_q, q8_0_q, q, q, s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
-        LAYER_MATMUL(g_k, L, q8_k, q4_k, q8_0_k, k, k, s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
-        LAYER_MATMUL(g_v, L, q8_v, q4_v, q8_0_v, v, v, s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
+        /* Q/K/V projections (Q8 or Q4 or Q8_0 from GPQ8 file)
+         * 优化: Q/K/V 共享同一个 g_ln 输入, 用 prepared 接口共享预处理
+         * (仅 Q4_K qtype=5 受益, 其他 qtype 保持原样) */
+        if (L->qtype == 5) {
+            static int8_t qkv_xq[XQ_MAX] __attribute__((aligned(32)));
+            static int16_t qkv_bsums[XQ_MAX / 32] __attribute__((aligned(32)));
+            static int8_t qkv_xq_arr[XQ_MAX] __attribute__((aligned(32)));
+            float qkv_scale = lal_q4k_prepare_x(g_ln, N_EMBD, qkv_xq, qkv_bsums, qkv_xq_arr);
+            parallel_matmul_q4_k_prepared(g_q, L->q4k_q, g_ln, L->q_bias, N_EMBD, Q_DIM,
+                                           qkv_xq, qkv_bsums, qkv_xq_arr, qkv_scale);
+            parallel_matmul_q4_k_prepared(g_k, L->q4k_k, g_ln, L->k_bias, N_EMBD, KV_DIM,
+                                           qkv_xq, qkv_bsums, qkv_xq_arr, qkv_scale);
+            parallel_matmul_q4_k_prepared(g_v, L->q4k_v, g_ln, L->v_bias, N_EMBD, KV_DIM,
+                                           qkv_xq, qkv_bsums, qkv_xq_arr, qkv_scale);
+        } else {
+            LAYER_MATMUL(g_q, L, q8_q, q4_q, q8_0_q, q, q, s_q, g_ln, L->q_bias, N_EMBD, Q_DIM);
+            LAYER_MATMUL(g_k, L, q8_k, q4_k, q8_0_k, k, k, s_k, g_ln, L->k_bias, N_EMBD, KV_DIM);
+            LAYER_MATMUL(g_v, L, q8_v, q4_v, q8_0_v, v, v, s_v, g_ln, L->v_bias, N_EMBD, KV_DIM);
+        }
         /* RoPE */
         rope_apply(g_q, g_k, pos);
         /* GQA Attention */
