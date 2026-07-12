@@ -177,7 +177,10 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                 /* 4 iterations: 2 sub-blocks per iter, 256-bit maddubs */ \
                 __m256i sumi=_mm256_setzero_si256(); \
                 const uint8_t*qs=sb+16; \
-                /* iter 0: sub0+sub1. even=xve0, odd=xvo0 */ \
+                /* Prefetch next superblock's weight data while processing current */ \
+                _mm_prefetch((const char*)(qs+144), _MM_HINT_T0); \
+                _mm_prefetch((const char*)(qs+144+64), _MM_HINT_T0); \
+                /* iter 0: sub0+sub1 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)qs); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
@@ -187,7 +190,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[1]),_mm_set1_epi16((short)sm[0])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
-                /* iter 1: sub2+sub3. even=xve1, odd=xvo1 */ \
+                /* iter 1: sub2+sub3 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+32)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
@@ -197,7 +200,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[3]),_mm_set1_epi16((short)sm[2])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
-                /* iter 2: sub4+sub5. even=xve2, odd=xvo2 */ \
+                /* iter 2: sub4+sub5 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+64)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
@@ -207,7 +210,7 @@ static inline void lal_matmul_q4_k(float * __restrict__ y,
                     __m256i sc_v=_mm256_set_m128i(_mm_set1_epi16((short)sm[5]),_mm_set1_epi16((short)sm[4])); \
                     sumi=_mm256_add_epi32(sumi,_mm256_madd_epi16(sc_v,p16)); \
                 } \
-                /* iter 3: sub6+sub7. even=xve3, odd=xvo3 */ \
+                /* iter 3: sub6+sub7 */ \
                 { \
                     __m256i q4b=_mm256_loadu_si256((__m256i*)(qs+96)); \
                     __m256i q4l=_mm256_and_si256(q4b,m4); \
