@@ -68,6 +68,14 @@
 #include "runtime/lal_q8_kernel.h"
 #include "runtime/lal_q4_kernel.h"
 #include "runtime/lal_q4k_kernel.h"
+/* AVX-512 Q4_K kernel: 在某些 CPU (如桌面 Skylake-X) 上更快，但在云 Xeon 上会降频反而更慢。
+ * 如需启用: 定义 LAL_FORCE_AVX512 并确保 weights 用 ADJACENT packing 转换。
+ * 默认禁用，使用经过验证的 AVX2 路径。
+ */
+#if defined(LAL_FORCE_AVX512) && defined(__AVX512BW__) && defined(__AVX512F__)
+  #define LAL_HAVE_AVX512 1
+  #include "runtime/lal_q4k_kernel_avx512.h"
+#endif
 #include "runtime/lal_sampling.h"
 #include "runtime/lal_dequant.h"
 #include "runtime/lal_tokenizer.h"
@@ -257,8 +265,13 @@ static inline void parallel_matmul_q4_0a(float *y, const uint8_t *q4a_W,
 static inline void parallel_matmul_q4_k(float *y, const uint8_t *q4k_W,
                                          const float *x, const float *b,
                                          int in_dim, int out_dim) {
+#if defined(LAL_HAVE_AVX512)
+    #define Q4K_KERNEL lal_matmul_q4_k_avx512
+#else
+    #define Q4K_KERNEL lal_matmul_q4_k
+#endif
     if (g_n_threads <= 1 || out_dim < 2048) {
-        lal_matmul_q4_k(y, q4k_W, x, b, in_dim, out_dim);
+        Q4K_KERNEL(y, q4k_W, x, b, in_dim, out_dim);
         return;
     }
     int n_super = in_dim / 256;
@@ -272,13 +285,14 @@ static inline void parallel_matmul_q4_k(float *y, const uint8_t *q4k_W,
         int end = start + chunk;
         if (end > out_dim) end = out_dim;
         if (start < out_dim) {
-            lal_matmul_q4_k(y + start,
+            Q4K_KERNEL(y + start,
                             q4k_W + (size_t)start * row_stride,
                             x,
                             b ? b + start : NULL,
                             in_dim, end - start);
         }
     }
+#undef Q4K_KERNEL
 }
 
 /* Dispatch macro: picks Q4_K/Q4_0A/Q8_0/Q4_0/Q8 based on layer->qtype.
