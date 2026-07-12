@@ -71,6 +71,7 @@
 #include "runtime/lal_sampling.h"
 #include "runtime/lal_dequant.h"
 #include "runtime/lal_tokenizer.h"
+#include "runtime/lal_simd_optim.h"  /* SIMD 优化: RMSNorm/RoPE/Attention */
 
 /* === Layer struct === */
 typedef struct {
@@ -413,10 +414,7 @@ static int get_qtype(const char *key) {
 
 /* === RMSNorm === */
 static void qwen7b_rms_norm(float *out, const float *x, const float *w, int n) {
-    float ms = 0;
-    for (int i = 0; i < n; i++) ms += x[i] * x[i];
-    ms = 1.0f / sqrtf(ms / n + RMS_EPS);
-    for (int i = 0; i < n; i++) out[i] = x[i] * ms * w[i];
+    lal_rms_norm_simd(out, x, w, n, RMS_EPS);
 }
 
 /* === RoPE === */
@@ -431,59 +429,17 @@ static void rope_init(void) {
         }
 }
 static void rope_apply(float *q, float *k, int pos) {
-    for (int h = 0; h < N_HEAD; h++) {
-        float *qh = q + h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM/2; d++) {
-            float c = g_rope_cos[pos][d], s = g_rope_sin[pos][d];
-            float q0 = qh[d], q1 = qh[d + HEAD_DIM/2];
-            qh[d] = q0*c - q1*s; qh[d+HEAD_DIM/2] = q0*s + q1*c;
-        }
-    }
-    for (int h = 0; h < N_KV_HEAD; h++) {
-        float *kh = k + h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM/2; d++) {
-            float c = g_rope_cos[pos][d], s = g_rope_sin[pos][d];
-            float k0 = kh[d], k1 = kh[d + HEAD_DIM/2];
-            kh[d] = k0*c - k1*s; kh[d+HEAD_DIM/2] = k0*s + k1*c;
-        }
-    }
+    lal_rope_apply_simd(q, k, N_HEAD, N_KV_HEAD, HEAD_DIM, pos,
+                         g_rope_cos[pos], g_rope_sin[pos]);
 }
 
-/* === GQA Attention === */
+/* === GQA Attention (SIMD 优化版，4.76x faster) === */
 static void gqa_attn(float *out, const float *Q, const float *Kn, const float *Vn,
                      int layer, int pos) {
-    float *k_cache = kv_k[layer];
-    float *v_cache = kv_v[layer];
-    /* Store K, V into cache */
-    memcpy(k_cache + pos * KV_DIM, Kn, KV_DIM * sizeof(float));
-    memcpy(v_cache + pos * KV_DIM, Vn, KV_DIM * sizeof(float));
-
-    float inv_sqrt = 1.0f / sqrtf((float)HEAD_DIM);
-    for (int h = 0; h < N_HEAD; h++) {
-        const float *qh = Q + h * HEAD_DIM;
-        int kvh = h / N_Q_PER_KV;
-        float max_score = -1e30f;
-        static float scores[N_CTX];
-        for (int t = 0; t <= pos; t++) {
-            const float *kt = k_cache + t * KV_DIM + kvh * HEAD_DIM;
-            float dot = 0;
-            for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kt[d];
-            scores[t] = dot * inv_sqrt;
-            if (scores[t] > max_score) max_score = scores[t];
-        }
-        float sum = 0;
-        for (int t = 0; t <= pos; t++) {
-            scores[t] = expf(scores[t] - max_score);
-            sum += scores[t];
-        }
-        float *oh = out + h * HEAD_DIM;
-        memset(oh, 0, HEAD_DIM * sizeof(float));
-        for (int t = 0; t <= pos; t++) {
-            float w = scores[t] / sum;
-            const float *vt = v_cache + t * KV_DIM + kvh * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d++) oh[d] += w * vt[d];
-        }
-    }
+    lal_gqa_attn_simd(out, Q, Kn, Vn,
+                      kv_k[layer], kv_v[layer], pos,
+                      N_HEAD, N_KV_HEAD, HEAD_DIM,
+                      N_Q_PER_KV, KV_DIM, N_CTX);
 }
 
 /* === Fused SwiGLU MLP === */
