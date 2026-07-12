@@ -750,6 +750,16 @@ static int *encode_text(const char *text, int *n_out) {
 /* === Main === */
 int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
+
+    /* === OpenMP 线程绑定优化 ===
+     * 在 2vCPU 云机器上, 不绑定时线程可能在两个 vCPU 间迁移, 导致 cache 抖动.
+     * OMP_PROC_BIND=spread 让线程分散到不同核心, 减少迁移.
+     * OMP_WAIT_POLICY=active 让等待线程 spin 而非 sleep, 减少唤醒延迟.
+     * 必须在 omp 并行区开始前设置 (setenv), 已设则不覆盖. */
+    if (!getenv("OMP_PROC_BIND")) setenv("OMP_PROC_BIND", "spread", 0);
+    if (!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "active", 0);
+    omp_set_dynamic(0);  /* 禁用动态线程数调整, 确保线程数固定 */
+
     const char *weights = "prebuilt/qwen7b_weights.bin";
     const char *tokdir = "prebuilt/qwen7b_tokenizer";
     const char *prompt = "The meaning of life is";
