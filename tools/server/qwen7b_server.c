@@ -524,10 +524,40 @@ static void fused_swiglu(const int8_t *q_gate, const float *s_gate,
         static int16_t bsums[XQ_MAX / 32] __attribute__((aligned(32)));
         static int8_t xq_arr[XQ_MAX] __attribute__((aligned(32)));
         float x_scale = lal_q4k_prepare_x(x, in_dim, xq, bsums, xq_arr);
-        parallel_matmul_q4_k_prepared(gate_buf, q4k_gate, x, NULL, in_dim, hid,
-                                       xq, bsums, xq_arr, x_scale);
-        parallel_matmul_q4_k_prepared(up_buf, q4k_up, x, NULL, in_dim, hid,
-                                       xq, bsums, xq_arr, x_scale);
+        /* 优化: gate 和 up 并行计算 (2vCPU: 线程0算gate, 线程1算up)
+         * 之前是串行: gate(2线程) → up(2线程), 现在并行: gate(1线程) || up(1线程)
+         * 在 2vCPU 上理论 2x 加速 (减少同步开销), 实测受限于带宽 */
+        if (g_n_threads >= 2 && hid >= 2048) {
+            #pragma omp parallel num_threads(2)
+            {
+                int tid = omp_get_thread_num();
+                int n = 2;
+                int chunk = (hid + n - 1) / n;
+                int start = tid * chunk;
+                int end = start + chunk;
+                if (end > hid) end = hid;
+                if (start < hid) {
+                    int n_super2 = in_dim / 256;
+                    int rs = n_super2 * 144;
+                    if (tid == 0) {
+                        lal_matmul_q4_k_prepared(gate_buf + start,
+                                                  q4k_gate + (size_t)start * rs,
+                                                  x, NULL, in_dim, end - start,
+                                                  xq, bsums, xq_arr, x_scale);
+                    } else {
+                        lal_matmul_q4_k_prepared(up_buf + start,
+                                                  q4k_up + (size_t)start * rs,
+                                                  x, NULL, in_dim, end - start,
+                                                  xq, bsums, xq_arr, x_scale);
+                    }
+                }
+            }
+        } else {
+            parallel_matmul_q4_k_prepared(gate_buf, q4k_gate, x, NULL, in_dim, hid,
+                                           xq, bsums, xq_arr, x_scale);
+            parallel_matmul_q4_k_prepared(up_buf, q4k_up, x, NULL, in_dim, hid,
+                                           xq, bsums, xq_arr, x_scale);
+        }
     } else if (qtype == 4) {
         parallel_matmul_q4_0a(gate_buf, q4a_gate, x, NULL, in_dim, hid);
         parallel_matmul_q4_0a(up_buf,   q4a_up,   x, NULL, in_dim, hid);
