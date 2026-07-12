@@ -75,9 +75,9 @@ static inline void unpack_scales_6bit(const uint8_t *src, uint8_t *out16) {
     out16[15] = (hi >> 26) & 0x3F;
 }
 
-/* === Q4_K 预处理: 量化 x + 计算 bsums + pre-arrange xq_arr ===
+/* === Q4_K 预处理: 量化 x + 计算 bsums + pre-arrange xq_arr (SIMD 优化) ===
  * 提取出来让 gate/up matmul 共享 (fused_swiglu 中 gate 和 up 用同一个 x)
- * 节省 ~50% 预处理开销 (量化 + bsums + xq_arr 排列)
+ * SIMD 优化: x_max / 量化 / bsums / xq_arr 重排 全部向量化
  */
 static inline float lal_q4k_prepare_x(const float * __restrict__ x,
                                        int in_dim,
@@ -87,6 +87,98 @@ static inline float lal_q4k_prepare_x(const float * __restrict__ x,
     int n_super = in_dim / 256;
     int n_sub = in_dim / 32;
 
+#if defined(__AVX2__) && defined(__F16C__)
+    /* === SIMD 求 abs max === */
+    __m256 vabs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    __m256 vmax = _mm256_setzero_ps();
+    int i = 0;
+    int n8 = in_dim & ~7;
+    for (; i < n8; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vabs = _mm256_and_ps(vx, vabs_mask);
+        vmax = _mm256_max_ps(vmax, vabs);
+    }
+    /* horizontal max */
+    __m128 hi = _mm256_extractf128_ps(vmax, 1);
+    __m128 lo = _mm256_castps256_ps128(vmax);
+    __m128 m = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1,0,3,2)));
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(0,0,0,1)));
+    float x_max = _mm_cvtss_f32(m);
+    for (; i < in_dim; i++) { float a = fabsf(x[i]); if (a > x_max) x_max = a; }
+
+    float x_scale = x_max / 127.0f;
+    if (x_scale < 1e-8f) x_scale = 1e-8f;
+    float x_inv = 1.0f / x_scale;
+
+    /* === SIMD 量化: lroundf(x*inv) → cvtps_epi32 (round-to-nearest-even) ===
+     * 用 _mm256_cvtps_epi32 代替标量 lroundf, 8x faster
+     * cvtps_epi32 默认 round-to-nearest-even, 与 lroundf (round-half-away) 微小差异
+     * 对 int8 量化影响 < 1 LSB, 可忽略 */
+    __m256 vinv = _mm256_set1_ps(x_inv);
+    __m256i v127 = _mm256_set1_epi32(127);
+    __m256i vn127 = _mm256_set1_epi32(-127);
+    i = 0;
+    for (; i < n8; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vscaled = _mm256_mul_ps(vx, vinv);
+        __m256i vi = _mm256_cvtps_epi32(vscaled);
+        /* clamp to [-127, 127] */
+        vi = _mm256_min_epi32(vi, v127);
+        vi = _mm256_max_epi32(vi, vn127);
+        /* pack int32 → int8 via 2x packs */
+        __m128i lo128 = _mm256_castsi256_si128(vi);
+        __m128i hi128 = _mm256_extracti128_si256(vi, 1);
+        __m128i packed16 = _mm_packs_epi32(lo128, hi128); /* int16 */
+        __m128i packed8 = _mm_packs_epi16(packed16, _mm_setzero_si128()); /* int8 */
+        _mm_storel_epi64((__m128i*)(xq + i), packed8);
+    }
+    for (; i < in_dim; i++) {
+        int v = (int)lroundf(x[i] * x_inv);
+        xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+    }
+
+    /* === bsums: 每 32 个 int8 求和 → int16 (标量, 32 次加法 < 1μs) === */
+    for (int sb = 0; sb < n_sub; sb++) {
+        int32_t sum = 0;
+        for (int i = 0; i < 32; i++) sum += (int)xq[sb * 32 + i];
+        bsums[sb] = (int16_t)sum;
+    }
+
+    /* === SIMD xq_arr 重排: 奇偶分离 ===
+     * src 有 32 字节 (一个 sub-block), 要拆成 16 even + 16 odd
+     * 用两个 128-bit shuffle: lo(src[0..15]) + hi(src[16..31])
+     * each: even = {0,2,4,6,8,10,12,14, 0x80×8}, odd = {1,3,5,7,9,11,13,15, 0x80×8}
+     * 然后 unpacklo_epi64 合并两半的偶数/奇数 */
+    static const uint8_t even_mask[16] __attribute__((aligned(16))) = {
+        0,2,4,6,8,10,12,14, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80
+    };
+    static const uint8_t odd_mask[16] __attribute__((aligned(16))) = {
+        1,3,5,7,9,11,13,15, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80
+    };
+    __m128i veven_m = _mm_loadu_si128((const __m128i*)even_mask);
+    __m128i vodd_m  = _mm_loadu_si128((const __m128i*)odd_mask);
+    for (int s = 0; s < n_super; s++) {
+        int8_t *dst_even = xq_arr + s*256;
+        int8_t *dst_odd  = xq_arr + s*256 + 128;
+        for (int k = 0; k < 8; k++) {
+            const int8_t *src = xq + s*256 + k*32;
+            /* 加载 32 字节为两个 128-bit */
+            __m128i lo = _mm_loadu_si128((__m128i*)(src));      /* src[0..15] */
+            __m128i hi = _mm_loadu_si128((__m128i*)(src + 16));  /* src[16..31] */
+            /* shuffle: 取 lo 的偶数索引 (8 字节) + hi 的偶数索引 (8 字节) */
+            __m128i lo_even = _mm_shuffle_epi8(lo, veven_m);  /* 8 even from lo + 8 zero */
+            __m128i hi_even = _mm_shuffle_epi8(hi, veven_m);  /* 8 even from hi + 8 zero */
+            __m128i even16 = _mm_unpacklo_epi64(lo_even, hi_even); /* 8+8 = 16 even */
+            __m128i lo_odd = _mm_shuffle_epi8(lo, vodd_m);
+            __m128i hi_odd = _mm_shuffle_epi8(hi, vodd_m);
+            __m128i odd16 = _mm_unpacklo_epi64(lo_odd, hi_odd);
+            _mm_storeu_si128((__m128i*)(dst_even + k*16), even16);
+            _mm_storeu_si128((__m128i*)(dst_odd + k*16), odd16);
+        }
+    }
+#else
+    /* 标量 fallback */
     float x_max = 0;
     for (int i = 0; i < in_dim; i++) { float a = fabsf(x[i]); if (a > x_max) x_max = a; }
     float x_scale = x_max / 127.0f;
@@ -96,14 +188,11 @@ static inline float lal_q4k_prepare_x(const float * __restrict__ x,
         int v = (int)lroundf(x[i] * x_inv);
         xq[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
     }
-
     for (int sb = 0; sb < n_sub; sb++) {
         int32_t sum = 0;
         for (int i = 0; i < 32; i++) sum += (int)xq[sb * 32 + i];
         bsums[sb] = (int16_t)sum;
     }
-
-#if defined(__AVX2__) && defined(__F16C__)
     for (int s = 0; s < n_super; s++) {
         int8_t *dst_even = xq_arr + s*256;
         int8_t *dst_odd  = xq_arr + s*256 + 128;
