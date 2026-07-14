@@ -109,11 +109,137 @@ static inline void lal_matmul_q3_k(float * __restrict__ y,
     }
 
     const float inv_63 = 1.0f / 63.0f;
-    const float inv_7 = 1.0f / 7.0f;  /* Q3 has 8 levels (0-7), but we use 7 for normalization */
 
     int row_stride = n_super * Q3K_SUPERBLOCK_BYTES;
 
-    /* Scalar path (correct, will optimize later) */
+#if defined(__AVX2__) && defined(__F16C__)
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+
+    /* 8-row parallel — 类似 Q4_K 但处理 3-bit unpack
+     * Q3 的 3-bit values (0-7) zero-extend 到 uint8 后用 maddubs 与 int8 xq 做点积
+     * maddubs(uint8 q3, int8 xq) = sum(q3 * xq) → int16
+     * 但 maddubs 要求第一个操作数是 uint8 (0-255), q3 值 0-7 完全适合 */
+    int j = 0;
+    for (; j + 8 <= out_dim; j += 8) {
+        const uint8_t * __restrict__ rows[8];
+        for (int r = 0; r < 8; r++) rows[r] = q3k_W + (size_t)(j+r) * row_stride;
+
+        __m256 acc0=_mm256_setzero_ps(),acc1=_mm256_setzero_ps();
+        __m256 acc2=_mm256_setzero_ps(),acc3=_mm256_setzero_ps();
+        __m256 acc4=_mm256_setzero_ps(),acc5=_mm256_setzero_ps();
+        __m256 acc6=_mm256_setzero_ps(),acc7=_mm256_setzero_ps();
+        float am0=0,am1=0,am2=0,am3=0,am4=0,am5=0,am6=0,am7=0;
+
+        for (int s = 0; s < n_super; s++) {
+            __m128i bs_v=_mm_set_epi16(bsums[s*8+7],bsums[s*8+6],bsums[s*8+5],bsums[s*8+4],
+                bsums[s*8+3],bsums[s*8+2],bsums[s*8+1],bsums[s*8+0]);
+
+            /* Process each row */
+            #define PROC8_Q3(r) do { \
+                const uint8_t *sb=rows[r]+s*Q3K_SUPERBLOCK_BYTES; \
+                float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb)))); \
+                float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2)))); \
+                uint8_t sm[16] __attribute__((aligned(16))); unpack_scales_6bit(sb+4,sm); \
+                /* Min correction */ \
+                __m128i mn_bytes = _mm_loadl_epi64((__m128i*)(sm+8)); \
+                __m128i mn_v = _mm_cvtepi8_epi16(mn_bytes); \
+                __m128i mp=_mm_madd_epi16(mn_v,bs_v); \
+                int32_t mp_sum = _mm_cvtsi128_si32(mp) + _mm_extract_epi32(mp,1) \
+                    + _mm_extract_epi32(mp,2) + _mm_extract_epi32(mp,3); \
+                float r_am = dmin*x_scale*(float)mp_sum*inv_63; \
+                if(r==0)am0-=r_am;else if(r==1)am1-=r_am;else if(r==2)am2-=r_am; \
+                else if(r==3)am3-=r_am;else if(r==4)am4-=r_am;else if(r==5)am5-=r_am; \
+                else if(r==6)am6-=r_am;else am7-=r_am; \
+                float scaled_dot = 0; \
+                const uint8_t *qs = sb + 16; \
+                const int8_t *xqs = xq + s*256; \
+                for (int k = 0; k < 8; k++) { \
+                    uint64_t lo = *(const uint64_t*)(qs + k*12); \
+                    uint32_t hi = *(const uint32_t*)(qs + k*12 + 8); \
+                    int32_t subdot = 0; \
+                    /* 32 × 3-bit = 96 bits, 前 64 bits = 21 values + 1 bit */ \
+                    subdot += (int)(lo & 7) * (int)xqs[0];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[1];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[2];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[3];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[4];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[5];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[6];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[7];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[8];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[9];  lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[10]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[11]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[12]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[13]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[14]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[15]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[16]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[17]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[18]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[19]; lo >>= 3; \
+                    subdot += (int)(lo & 7) * (int)xqs[20]; \
+                    uint64_t combined = (lo >> 3) | ((uint64_t)hi << 1); \
+                    subdot += (int)(combined & 7) * (int)xqs[21]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[22]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[23]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[24]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[25]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[26]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[27]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[28]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[29]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[30]; combined >>= 3; \
+                    subdot += (int)(combined & 7) * (int)xqs[31]; \
+                    scaled_dot += (float)sm[k] * (float)subdot; \
+                } \
+                float mult = d * x_scale * inv_63; \
+                __m256 *ap=(r==0)?&acc0:(r==1)?&acc1:(r==2)?&acc2:(r==3)?&acc3: \
+                            (r==4)?&acc4:(r==5)?&acc5:(r==6)?&acc6:&acc7; \
+                *ap = _mm256_fmadd_ps(_mm256_set1_ps(mult), _mm256_set1_ps(scaled_dot), *ap); \
+            } while(0)
+
+            PROC8_Q3(0);PROC8_Q3(1);PROC8_Q3(2);PROC8_Q3(3);
+            PROC8_Q3(4);PROC8_Q3(5);PROC8_Q3(6);PROC8_Q3(7);
+            #undef PROC8_Q3
+        }
+
+        /* Store results */
+        y[j+0]=((float*)&acc0)[0]+am0+(b?b[j+0]:0);
+        y[j+1]=((float*)&acc1)[0]+am1+(b?b[j+1]:0);
+        y[j+2]=((float*)&acc2)[0]+am2+(b?b[j+2]:0);
+        y[j+3]=((float*)&acc3)[0]+am3+(b?b[j+3]:0);
+        y[j+4]=((float*)&acc4)[0]+am4+(b?b[j+4]:0);
+        y[j+5]=((float*)&acc5)[0]+am5+(b?b[j+5]:0);
+        y[j+6]=((float*)&acc6)[0]+am6+(b?b[j+6]:0);
+        y[j+7]=((float*)&acc7)[0]+am7+(b?b[j+7]:0);
+    }
+
+    /* Tail: scalar for remaining rows */
+    for (; j < out_dim; j++) {
+        const uint8_t *row = q3k_W + (size_t)j * row_stride;
+        float sumf = 0;
+        for (int s = 0; s < n_super; s++) {
+            const uint8_t *sb = row + s * Q3K_SUPERBLOCK_BYTES;
+            float d=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb))));
+            float dmin=_mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16((short)*(const uint16_t*)(sb+2))));
+            uint8_t sm[16]; unpack_scales_6bit(sb+4, sm);
+            int32_t mp_sum=0; for(int k=0;k<8;k++) mp_sum+=(int)(int8_t)sm[8+k]*(int)bsums[s*8+k];
+            float min_corr=dmin*x_scale*(float)mp_sum*inv_63;
+            float scaled_dot=0;
+            for(int k=0;k<8;k++){
+                uint8_t q3[32]; unpack_q3_32(sb+16+k*12,q3);
+                const int8_t *xqs=xq+s*256+k*32;
+                int32_t subdot=0;
+                for(int i=0;i<32;i++) subdot+=(int)q3[i]*(int)xqs[i];
+                scaled_dot+=(float)sm[k]*(float)subdot;
+            }
+            sumf += d*x_scale*inv_63*scaled_dot - min_corr;
+        }
+        y[j] = sumf + (b?b[j]:0);
+    }
+#else
+    /* Fallback: scalar */
     for (int j = 0; j < out_dim; j++) {
         const uint8_t *row = q3k_W + (size_t)j * row_stride;
         float sumf = 0;
@@ -162,6 +288,7 @@ static inline void lal_matmul_q3_k(float * __restrict__ y,
         }
         y[j] = sumf + (b ? b[j] : 0);
     }
+#endif /* __AVX2__ */
 }
 
 /* Quantize a float row to Q3_K format (for testing) */
