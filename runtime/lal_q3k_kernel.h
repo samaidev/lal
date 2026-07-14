@@ -154,43 +154,11 @@ static inline void lal_matmul_q3_k(float * __restrict__ y,
                 const uint8_t *qs = sb + 16; \
                 const int8_t *xqs = xq + s*256; \
                 for (int k = 0; k < 8; k++) { \
-                    uint64_t lo = *(const uint64_t*)(qs + k*12); \
-                    uint32_t hi = *(const uint32_t*)(qs + k*12 + 8); \
+                    uint8_t q3[32] __attribute__((aligned(32))); \
+                    unpack_q3_32(qs + k*12, q3); \
                     int32_t subdot = 0; \
-                    /* 32 × 3-bit = 96 bits, 前 64 bits = 21 values + 1 bit */ \
-                    subdot += (int)(lo & 7) * (int)xqs[0];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[1];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[2];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[3];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[4];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[5];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[6];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[7];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[8];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[9];  lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[10]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[11]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[12]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[13]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[14]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[15]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[16]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[17]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[18]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[19]; lo >>= 3; \
-                    subdot += (int)(lo & 7) * (int)xqs[20]; \
-                    uint64_t combined = (lo >> 3) | ((uint64_t)hi << 1); \
-                    subdot += (int)(combined & 7) * (int)xqs[21]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[22]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[23]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[24]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[25]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[26]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[27]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[28]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[29]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[30]; combined >>= 3; \
-                    subdot += (int)(combined & 7) * (int)xqs[31]; \
+                    for (int i = 0; i < 32; i++) \
+                        subdot += (int)q3[i] * (int)xqs[i]; \
                     scaled_dot += (float)sm[k] * (float)subdot; \
                 } \
                 float mult = d * x_scale * inv_63; \
