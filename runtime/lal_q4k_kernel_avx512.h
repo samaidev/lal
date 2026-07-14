@@ -163,7 +163,14 @@ static inline void lal_matmul_q4_k_avx512(float * __restrict__ y,
                 else if(r==6)am6-=r_am;else am7-=r_am; \
                 __m512i sumi=_mm512_setzero_si512(); \
                 const uint8_t*qs=sb+16; \
-                /* iter 0: sub0+sub1+sub2+sub3 (64 packed bytes) */ \
+                /* 优化 sc_v: set1_epi16 broadcast (比 set_epi16 32立即数快) */ \
+                __m256i sc01 = _mm256_set_m128i(_mm_set1_epi16((short)sm[1]), _mm_set1_epi16((short)sm[0])); \
+                __m256i sc23 = _mm256_set_m128i(_mm_set1_epi16((short)sm[3]), _mm_set1_epi16((short)sm[2])); \
+                __m512i sc0123 = _mm512_inserti64x4(_mm512_castsi256_si512(sc01), sc23, 1); \
+                __m256i sc45 = _mm256_set_m128i(_mm_set1_epi16((short)sm[5]), _mm_set1_epi16((short)sm[4])); \
+                __m256i sc67 = _mm256_set_m128i(_mm_set1_epi16((short)sm[7]), _mm_set1_epi16((short)sm[6])); \
+                __m512i sc4567 = _mm512_inserti64x4(_mm512_castsi256_si512(sc45), sc67, 1); \
+                /* iter 0 */ \
                 { \
                     __m512i q4b=_mm512_loadu_si512(qs); \
                     __m512i q4l=_mm512_and_si512(q4b,m4); \
@@ -171,24 +178,9 @@ static inline void lal_matmul_q4_k_avx512(float * __restrict__ y,
                     __m512i p_lo=_mm512_maddubs_epi16(q4l, xv_even_lo); \
                     __m512i p_hi=_mm512_maddubs_epi16(q4h, xv_odd_lo); \
                     __m512i p16=_mm512_adds_epi16(p_lo, p_hi); \
-                    /* Build scale vector: [sc0×8, sc1×8, sc2×8, sc3×8] as 32 int16 */ \
-                    __m512i sc_v=_mm512_set_epi16( \
-                        (short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3], \
-                        (short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3], \
-                        (short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2], \
-                        (short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2]); \
-                    /* Actually need [sc0×8, sc1×8, sc2×8, sc3×8] but sm[1] is sub_b's scale */ \
-                    /* _mm512_set_epi16 goes from high to low: idx 31..0 */ \
-                    /* We want lanes 0-7=sc0, 8-15=sc1, 16-23=sc2, 24-31=sc3 */ \
-                    /* So set_epi16(sc3×8, sc2×8, sc1×8, sc0×8) */ \
-                    sc_v=_mm512_set_epi16( \
-                        (short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3],(short)sm[3], \
-                        (short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2],(short)sm[2], \
-                        (short)sm[1],(short)sm[1],(short)sm[1],(short)sm[1],(short)sm[1],(short)sm[1],(short)sm[1],(short)sm[1], \
-                        (short)sm[0],(short)sm[0],(short)sm[0],(short)sm[0],(short)sm[0],(short)sm[0],(short)sm[0],(short)sm[0]); \
-                    sumi=_mm512_add_epi32(sumi, _mm512_madd_epi16(sc_v, p16)); \
+                    sumi=_mm512_add_epi32(sumi, _mm512_madd_epi16(sc0123, p16)); \
                 } \
-                /* iter 1: sub4+sub5+sub6+sub7 (64 packed bytes) */ \
+                /* iter 1 */ \
                 { \
                     __m512i q4b=_mm512_loadu_si512(qs+64); \
                     __m512i q4l=_mm512_and_si512(q4b,m4); \
@@ -196,12 +188,7 @@ static inline void lal_matmul_q4_k_avx512(float * __restrict__ y,
                     __m512i p_lo=_mm512_maddubs_epi16(q4l, xv_even_hi); \
                     __m512i p_hi=_mm512_maddubs_epi16(q4h, xv_odd_hi); \
                     __m512i p16=_mm512_adds_epi16(p_lo, p_hi); \
-                    __m512i sc_v=_mm512_set_epi16( \
-                        (short)sm[7],(short)sm[7],(short)sm[7],(short)sm[7],(short)sm[7],(short)sm[7],(short)sm[7],(short)sm[7], \
-                        (short)sm[6],(short)sm[6],(short)sm[6],(short)sm[6],(short)sm[6],(short)sm[6],(short)sm[6],(short)sm[6], \
-                        (short)sm[5],(short)sm[5],(short)sm[5],(short)sm[5],(short)sm[5],(short)sm[5],(short)sm[5],(short)sm[5], \
-                        (short)sm[4],(short)sm[4],(short)sm[4],(short)sm[4],(short)sm[4],(short)sm[4],(short)sm[4],(short)sm[4]); \
-                    sumi=_mm512_add_epi32(sumi, _mm512_madd_epi16(sc_v, p16)); \
+                    sumi=_mm512_add_epi32(sumi, _mm512_madd_epi16(sc4567, p16)); \
                 } \
                 float mult=d*x_scale*inv_63; \
                 __m512 *ap=(r==0)?&acc0:(r==1)?&acc1:(r==2)?&acc2:(r==3)?&acc3: \
