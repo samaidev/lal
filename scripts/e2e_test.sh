@@ -140,5 +140,40 @@ both=$(run --n 30 --lal-steer prebuilt/mini_steer.so --lal-skip prebuilt/mini_sk
 echo "  $both"
 [ -n "$both" ] && check 1 "steering+skip combo runs" || check 0 "steering+skip combo runs"
 
+echo "=== E2E-5 LAL level-2 logic-layer filter (anti-repeat) ==="
+# The 2-layer toy model loves its own recent tokens; left alone, sampled output
+# can still drift into repeated-character runs ("aaaii..."). The LAL anti_repeat
+# filter (ban_last + ban_repeat(4)) constrains the top-k pool every step. Its
+# direct, stable effect is to SHORTEN the longest run of identical consecutive
+# characters — so we assert the FILTERED run's max run-length is <= the
+# no-filter run's over many seeds (distinct-char ratio is too noisy on <15 chars).
+maxrun=$(python3 - "$SRV" <<'PY'
+import subprocess, sys, statistics
+srv=sys.argv[1]
+def gen(a):
+    out=subprocess.run([srv,"--prompt","I feel"]+a,stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL).stdout.decode("utf-8","ignore")
+    p=out.split(">>"); return p[-1].replace("\n","").strip()
+def max_run(s):
+    best=0; cur=1
+    for i in range(1,len(s)):
+        if s[i]==s[i-1]: cur+=1
+        else: cur=1
+        best=max(best,cur)
+    return best
+base=["--n","40","--temp","0.9","--topk","8","--rep","1.15","--no-stop","1"]
+nof_runs=[max_run(gen(base)) for _ in range(8)]
+filt_runs=[max_run(gen(base+["--lal-filter","prebuilt/mini_antirepeat.so"])) for _ in range(8)]
+rn=max(nof_runs); rf=max(filt_runs)
+print(f"{rn} {rf}")
+PY
+)
+rn=$(echo "$maxrun" | awk '{print $1}'); rf=$(echo "$maxrun" | awk '{print $2}')
+echo "  max consecutive-repeat run-length (over 8 seeds): no-filter=${rn}  +LAL-filter=${rf}"
+[ -n "$rf" ] && check 1 "logic-layer filter generates text" || check 0 "logic-layer filter generates text"
+[ "$(python3 -c "print($rf <= $rn)")" = "True" ] \
+  && check 1 "LAL filter reduces repeat runs (maxrun <= no-filter)" \
+  || check 0 "LAL filter reduces repeat runs (maxrun <= no-filter)"
+
 echo "=== RESULT: $([ $ok = 1 ] && echo ALL PASSED || echo FAILED) ==="
 [ $ok = 1 ]

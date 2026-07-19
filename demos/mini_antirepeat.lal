@@ -1,0 +1,27 @@
+# mini_antirepeat.lal — LAL logic-layer filter for the tiny MINI transformer.
+#
+# The 2-layer toy model is so small that greedy (argmax) decoding collapses into
+# repeated characters ("calm today. aiiiiii..."). The standard fix is to widen
+# the sampling pool, but that alone is not enough — the model loves its own
+# recent tokens. LAL's level-2 fusion lets us state the anti-repeat rule ONCE,
+# declaratively, and have it constrain the top-k sampling pool at every step,
+# with NO weight retraining and NO server rebuild:
+#
+#   ban_last       — never emit the immediately-preceding character again
+#   ban_repeat(4)  — block the last 4 generated chars (kills n-gram loops)
+#
+# Build the runtime-loadable .so:
+#   bash scripts/build_lal_mini_filter.sh        # -> prebuilt/mini_antirepeat.so
+#
+# Load at runtime (NO server rebuild needed):
+#   ./prebuilt/mini_server --prompt "I feel" --n 40 \
+#       --temp 0.9 --topk 8 --rep 1.15 \
+#       --lal-filter prebuilt/mini_antirepeat.so
+#
+# Compare against the SAME sampling settings WITHOUT the filter to see the
+# logic layer in action: the filter breaks degenerate repetition while the
+# neural sampler still drives diversity.
+
+filter anti_repeat:
+    ban_last
+    ban_repeat(4)

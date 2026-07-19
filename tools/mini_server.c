@@ -3,17 +3,25 @@
  * exercise the LAL three-layer fusion LEVEL 1 (per-layer read + activation
  * steering) on a locally-trained model (no internet / no pretrained LLM here).
  *
- * It reuses the EXACT integration contract as qwen_server.c:
- *   forward loop:  for l in 0..L-1: x = layer(l, x); lal_layer_hook(l, x, D);
- * The hook is (a) the weak no-op fallback, or (b) a strong symbol from a
- * .lal-compiled .so loaded at runtime via --lal-steer (dlopen), mirroring
- * qwen_server --lal-steer.
+ * It reuses the EXACT integration contract as qwen_server.c, exercising ALL
+ * three LAL fusion levels on a tiny real transformer:
+ *   level 1: per-layer lal_layer_hook (steering) + lal_layer_skip (accel)
+ *   level 2: lal_filter_topk (logic-layer sampling constraint, no retraining)
+ *   level 3: real sampling (temperature + top-k + repetition penalty) so that
+ *            level-2 filters have a candidate pool to constrain.
+ * The hook/skip/filter are each (a) a weak no-op fallback, or (b) a strong
+ * symbol from a .lal-compiled .so loaded at runtime via --lal-steer /
+ * --lal-skip / --lal-filter (dlopen), mirroring qwen_server.
  *
  * This is a real model: weights are trained by tools/mini_train.py, real float
  * forward passes run, real sampling happens. It is NOT a mock.
  *
  * Build: make mini-server
- * Run:   ./prebuilt/mini_server --prompt "I feel" --n 16 [--lal-steer prebuilt/mini_steer.so]
+ * Run:   ./prebuilt/mini_server --prompt "I feel" --n 40 \
+ *          [--lal-steer prebuilt/mini_steer.so] \
+ *          [--lal-skip  prebuilt/mini_skip.so] \
+ *          [--lal-filter prebuilt/mini_antirepeat.so] \
+ *          [--temp 0.9 --topk 8 --rep 1.15]
  */
 #define _POSIX_C_SOURCE 199309L
 #define _GNU_SOURCE
@@ -71,6 +79,59 @@ static float g_skip_thr = -1.0f;
 static lal_layer_skip_fn g_skip = NULL;
 static void *g_hook_handle = NULL;
 
+/* ---- LAL three-layer fusion (level 2): logic-layer sampling filter bridge ----
+ * A .lal `filter` rule compiles to a strong `lal_filter_topk()` symbol that
+ * constrains the top-k sampling pool (drops tokens violating logic rules).
+ * Mirrors qwen_server.c's level-2 wiring. The weak fallback is a no-op so the
+ * server samples normally when no .lal filter is linked. */
+typedef int (*lal_token_decode_fn)(int token_id, char *out_buf, int max_len);
+/* Thin wrapper so a .lal filter can decode our char-level token ids to text. */
+static int mini_decode_for_filter(int token_id, char *out_buf, int max_len) {
+    if (token_id < 0 || token_id >= G_V || !G_CHARS) { out_buf[0] = 0; return 0; }
+    char c = G_CHARS[token_id];
+    if (max_len < 2) { out_buf[0] = 0; return 0; }
+    out_buf[0] = c; out_buf[1] = 0;
+    return 1;
+}
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn)
+    __attribute__((weak));
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn) {
+    (void)keep_mask; (void)n_vocab; (void)last_token;
+    (void)recent_tokens; (void)n_recent; (void)decode_fn;
+    return 0;
+}
+/* Runtime-loaded (dlopen) override; NULL when no --lal-filter was given. */
+static int (*g_lal_filter)(int *, int, int, const int *, int,
+                           lal_token_decode_fn) = NULL;
+static void *g_filter_handle = NULL;
+static int lal_filter_load(const char *path) {
+    if (!path) return -1;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { fprintf(stderr, "[lal] dlopen %s: %s\n", path, dlerror()); return -1; }
+    int (*f)(int *, int, int, const int *, int, lal_token_decode_fn) =
+        (int (*)(int *, int, int, const int *, int, lal_token_decode_fn))
+            dlsym(h, "lal_filter_topk");
+    if (!f) { fprintf(stderr, "[lal] dlsym lal_filter_topk failed: %s\n", dlerror()); dlclose(h); return -1; }
+    g_filter_handle = h;
+    g_lal_filter = f;
+    printf("[*] LAL logic-layer filter loaded: %s\n", path);
+    return 0;
+}
+
+/* ---- LAL three-layer fusion (level 3): sampling knobs ----
+ * Giving the engine a real distribution (temperature + top-k + repetition
+ * penalty) is what makes level-2 logic filters meaningful: a filter only has
+ * something to *drop* when the pool is wider than a single argmax winner. */
+static float g_temperature = 0.9f;
+static int   g_top_k = 8;
+static float g_rep_penalty = 1.15f;
+static int   g_recent[256];
+static int   g_n_recent = 0;
+
 /* Load a .lal-compiled .so (steering and/or layer-skip). Probes BOTH optional
  * symbols; the .so may define either or both. */
 static int lal_load(const char *path) {
@@ -123,6 +184,8 @@ static char *g_prompt = "I feel";
 static int   g_n = 16;
 static int   g_bench = 0;   /* if >0: run exactly this many forward passes, no
                                output / no early-stop, so timing is deterministic. */
+static int   g_no_stop = 0;  /* if >0: never early-stop on '.' — generate the full
+                               --n tokens, so repetition behavior is observable. */
 
 /* ---- KV-cache forward of a SINGLE token at sequence position `pos` ----
  * Writes this token's K/V into the per-layer cache (Kc/Vc) at [layer][pos],
@@ -198,6 +261,104 @@ static void lal_forward_token(float *x, int pos, int eff_L,
     }
 }
 
+/* Sample next token from lm[] using temperature + top-k + repetition penalty,
+ * with an optional LAL logic-layer filter constraining the candidate pool.
+ * Returns token id (mirrors qwen_server.c / gpt2_server.c sampling path). */
+static int sample_next_token(const float *lm, int last_tok) {
+    int n_vocab = G_V;
+    /* repetition penalty on recent tokens */
+    float *logits = malloc(sizeof(float) * n_vocab);
+    for (int v = 0; v < n_vocab; v++) logits[v] = lm[v];
+    if (g_rep_penalty > 1.0f) {
+        for (int i = 0; i < g_n_recent; i++) {
+            int t = g_recent[i];
+            if (t >= 0 && t < n_vocab) {
+                if (logits[t] > 0) logits[t] /= g_rep_penalty;
+                else logits[t] *= g_rep_penalty;
+            }
+        }
+    }
+
+    if (g_temperature <= 0.0f || g_top_k <= 0) {
+        /* argmax (greedy) — still passes through the LAL filter so logic rules
+         * can steer even a deterministic decode. */
+        int best = 0; for (int v = 1; v < n_vocab; v++) if (logits[v] > logits[best]) best = v;
+        int km = best;
+        if (g_lal_filter) g_lal_filter(&km, n_vocab, last_tok, g_recent, g_n_recent, mini_decode_for_filter);
+        else lal_filter_topk(&km, n_vocab, last_tok, g_recent, g_n_recent, mini_decode_for_filter);
+        free(logits);
+        return km;
+    }
+
+    /* top-k threshold via min-heap of size k */
+    int top_k = g_top_k; if (top_k > n_vocab) top_k = n_vocab;
+    float threshold = -1e30f;
+    {
+        static float heap_val[256];
+        static int   heap_idx[256];
+        int heap_n = 0;
+        for (int v = 0; v < n_vocab; v++) {
+            float val = logits[v];
+            if (heap_n < top_k) {
+                int c = heap_n++; heap_val[c] = val; heap_idx[c] = v;
+                while (c > 0) { int p = (c-1)>>1; if (heap_val[p] <= heap_val[c]) break;
+                    float tv = heap_val[p]; heap_val[p] = heap_val[c]; heap_val[c] = tv;
+                    int ti = heap_idx[p]; heap_idx[p] = heap_idx[c]; heap_idx[c] = ti; c = p; }
+            } else if (val > heap_val[0]) {
+                heap_val[0] = val; heap_idx[0] = v; int p = 0;
+                for (;;) { int l = 2*p+1, r = 2*p+2, s = p;
+                    if (l < heap_n && heap_val[l] < heap_val[s]) s = l;
+                    if (r < heap_n && heap_val[r] < heap_val[s]) s = r;
+                    if (s == p) break;
+                    float tv = heap_val[p]; heap_val[p] = heap_val[s]; heap_val[s] = tv;
+                    int ti = heap_idx[p]; heap_idx[p] = heap_idx[s]; heap_idx[s] = ti; p = s; }
+            }
+        }
+        threshold = heap_val[0];
+    }
+
+    /* === LAL fusion level 2: logic-layer sampling filter ===
+     * Seed keep_mask from the top-k pool, hand it to the .lal filter (if any),
+     * keep only tokens surviving BOTH top-k and the logic rules, so banned
+     * tokens get zero probability. */
+    int *keep_mask = malloc(sizeof(int) * n_vocab);
+    for (int v = 0; v < n_vocab; v++) keep_mask[v] = (logits[v] >= threshold) ? 1 : 0;
+    {
+        int last = last_tok;
+        if (g_lal_filter)
+            g_lal_filter(keep_mask, n_vocab, last, g_recent, g_n_recent, mini_decode_for_filter);
+        else
+            lal_filter_topk(keep_mask, n_vocab, last, g_recent, g_n_recent, mini_decode_for_filter);
+        int any_kept = 0;
+        for (int v = 0; v < n_vocab; v++) if (keep_mask[v]) { any_kept = 1; break; }
+        if (!any_kept) for (int v = 0; v < n_vocab; v++) if (logits[v] >= threshold) keep_mask[v] = 1;
+    }
+
+    /* softmax over kept tokens, then sample */
+    float max_l = -1e30f;
+    for (int v = 0; v < n_vocab; v++)
+        if (keep_mask[v] && logits[v] >= threshold && logits[v] > max_l) max_l = logits[v];
+    float sum = 0;
+    float *probs = malloc(sizeof(float) * n_vocab);
+    for (int v = 0; v < n_vocab; v++) {
+        if (keep_mask[v] && logits[v] >= threshold) {
+            probs[v] = expf((logits[v] - max_l) / g_temperature);
+            sum += probs[v];
+        } else probs[v] = 0;
+    }
+    int out = 0;
+    if (sum <= 0) { /* safety: fall back to argmax over the kept pool */
+        float bv = -1e30f;
+        for (int v = 0; v < n_vocab; v++) if (keep_mask[v] && logits[v] > bv) { bv = logits[v]; out = v; }
+    } else {
+        float r = (float)rand() / (float)RAND_MAX * sum;
+        float acc = 0;
+        for (int v = 0; v < n_vocab; v++) { acc += probs[v]; if (r <= acc) { out = v; break; } }
+    }
+    free(logits); free(keep_mask); free(probs);
+    return out;
+}
+
 static void generate(void) {
     int cap = G_T + g_n + 8;
     int *ids = malloc(sizeof(int) * cap);
@@ -228,6 +389,12 @@ static void generate(void) {
         lal_forward_token(x, pos, eff_L, Kc, Vc, kcached);
     }
 
+    /* seed recent-token memory from the prompt so the LAL filter / rep-penalty
+     * see the full context, not just the generated suffix. */
+    g_n_recent = 0;
+    for (int p = 0; p < len && g_n_recent < (int)(sizeof(g_recent)/sizeof(g_recent[0])); p++)
+        g_recent[g_n_recent++] = ids[p];
+
     printf(">> ");
     fflush(stdout);
 
@@ -240,13 +407,13 @@ static void generate(void) {
             for (int i = 0; i < G_D; i++) s += ln[i] * e[i];
             lm[vv] = s;
         }
-        int best = 0; float bv = lm[0];
-        for (int vv = 1; vv < G_V; vv++) if (lm[vv] > bv) { bv = lm[vv]; best = vv; }
+        int best = sample_next_token(lm, len > 0 ? ids[len-1] : -1);
         char c = G_CHARS[best];
         if (!g_bench) { putchar(c); fflush(stdout); }
         generated++;
         ids[len++] = best;
-        if (c == '.' && !g_bench) break;
+        if (g_n_recent < (int)(sizeof(g_recent)/sizeof(g_recent[0]))) g_recent[g_n_recent++] = best;
+        if (c == '.' && !g_bench && !g_no_stop) break;
         if (generated >= g_n) break;
         /* forward the just-emitted token to get the hidden state for the next step */
         int pos = (len - 1) % G_T;
@@ -328,6 +495,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--lal-skip") && i+1<argc) {
             if (lal_load(argv[++i]) != 0) fprintf(stderr, "[lal] warning: skip .so load failed\n");
         }
+        else if (!strcmp(argv[i], "--lal-filter") && i+1<argc) {
+            if (lal_filter_load(argv[++i]) != 0) fprintf(stderr, "[lal] warning: filter .so load failed\n");
+        }
+        else if (!strcmp(argv[i], "--temp") && i+1<argc) {
+            g_temperature = (float)atof(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--topk") && i+1<argc) {
+            g_top_k = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rep") && i+1<argc) {
+            g_rep_penalty = (float)atof(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--stress-layers") && i+1<argc) {
             G_STRESS = atoi(argv[++i]);
         }
@@ -342,6 +521,9 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--bench") && i+1<argc) {
             g_bench = atoi(argv[++i]); g_n = g_bench;
+        }
+        else if (!strcmp(argv[i], "--no-stop") && i+1<argc) {
+            g_no_stop = atoi(argv[++i]);
         }
     }
     load_cfg(cfg);

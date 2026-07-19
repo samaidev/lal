@@ -115,8 +115,15 @@ build/verify_skip_uncond: tests/verify_skip_uncond.c
 	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip_uncond.c -ldl
 
 # === End-to-end: real generation through the mini server (.lal .so hot-loaded) ===
-e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so prebuilt/mini_skip_cond.so
+e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so prebuilt/mini_skip_cond.so prebuilt/mini_antirepeat.so
 	bash scripts/e2e_test.sh
+
+# Build the LAL logic-layer sampling filter .so (level-2 fusion: constraints the
+# top-k sampling pool via declarative ban_* rules — no retraining, no rebuild).
+mini-filter: prebuilt/mini_antirepeat.so
+
+prebuilt/mini_antirepeat.so: demos/mini_antirepeat.lal compiler/lal.py
+	bash scripts/build_lal_mini_filter.sh
 
 clean:
 	rm -rf build/ prebuilt/demos/*.c prebuilt/gpt2_server prebuilt/qwen_server
