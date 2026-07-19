@@ -108,6 +108,10 @@ verify-skip: build/verify_skip
 build/verify_skip: tests/verify_skip.c
 	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip.c -ldl
 
+# === End-to-end: real generation through the mini server (.lal .so hot-loaded) ===
+e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so
+	bash scripts/e2e_test.sh
+
 clean:
 	rm -rf build/ prebuilt/demos/*.c prebuilt/gpt2_server prebuilt/qwen_server
 
