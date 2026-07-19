@@ -22,6 +22,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 #include "runtime/lal_runtime.h"
 
@@ -303,6 +304,100 @@ static float g_rep_penalty = 1.1f;
 static int   g_recent_tokens[256];
 static int   g_n_recent = 0;
 
+/* ========================================================================
+ * LAL three-layer fusion (level 2): logic-layer sampling filter bridge
+ *
+ * A .lal `filter` rule compiles to a strong `lal_filter_topk()` symbol that
+ * constrains the server's top-k sampling pool (drops tokens violating
+ * semantic rules). Two wiring options:
+ *   1. Compile-time link: `gcc ... qwen_server.c filter.o` — the strong
+ *      symbol overrides the weak fallback below (no --lal-filter needed).
+ *   2. Runtime load (hot-reload rules without rebuilding the server):
+ *      `./qwen_server --lal-filter path/to/filter.so` — dlopen'd and called
+ *      through a function pointer.
+ * ===================================================================== */
+typedef int (*lal_token_decode_fn)(int token_id, char *out_buf, int max_len);
+/* Defined later in this file; forward-declared so the wrapper below compiles. */
+static void decode_token(int id, char *out, int maxlen);
+
+/* Weak fallback: no .lal filter linked -> sampling unchanged. */
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn)
+    __attribute__((weak));
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn) {
+    (void)keep_mask; (void)n_vocab; (void)last_token;
+    (void)recent_tokens; (void)n_recent; (void)decode_fn;
+    return 0;
+}
+
+/* Runtime-loaded (dlopen) override; NULL when no --lal-filter was given. */
+static int (*g_lal_filter)(int *, int, int, const int *, int,
+                           lal_token_decode_fn) = NULL;
+static void *g_lal_handle = NULL;
+
+/* Thin wrapper so a .lal filter can decode token ids via our tokenizer. */
+static int _qwen_decode_for_filter(int token_id, char *out_buf, int max_len) {
+    decode_token(token_id, out_buf, max_len);
+    return (int)strlen(out_buf);
+}
+
+/* Load a .lal-compiled filter shared object at runtime. */
+static int lal_filter_load(const char *path) {
+    if (!path) return -1;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { fprintf(stderr, "[lal] dlopen %s failed: %s\n", path, dlerror()); return -1; }
+    int (*f)(int *, int, int, const int *, int, lal_token_decode_fn) =
+        (int (*)(int *, int, int, const int *, int, lal_token_decode_fn))
+            dlsym(h, "lal_filter_topk");
+    if (!f) { fprintf(stderr, "[lal] dlsym lal_filter_topk failed: %s\n", dlerror()); dlclose(h); return -1; }
+    g_lal_handle = h;
+    g_lal_filter = f;
+    printf("[*] LAL filter loaded: %s\n", path);
+    return 0;
+}
+
+/* ========================================================================
+ * LAL three-layer fusion (level 1): per-layer runtime hook bridge
+ *
+ * A .lal program can subscribe to any transformer layer's hidden state and
+ * either READ it (copy into a concept vector for symbolic probing) or WRITE
+ * it back (activation steering: add a concept vector into the hidden state).
+ * Two wiring options, symmetric to the level-2 filter:
+ *   1. Compile-time link: `gcc ... qwen_server.c steer.o` — the strong
+ *      lal_layer_hook symbol overrides the weak fallback below.
+ *   2. Runtime load (hot-reload rules without rebuilding the server):
+ *      `./qwen_server --lal-steer path/to/steer.so` — dlopen'd via function
+ *      pointer. The hook is invoked once per layer, right after that layer's
+ *      MLP output/residual is written into g_x.
+ * ===================================================================== */
+typedef void (*lal_layer_hook_fn)(int layer, float *hidden, int dim);
+
+/* Weak fallback: no .lal layer hook linked -> no-op per layer. */
+void lal_layer_hook(int layer, float *hidden, int dim) __attribute__((weak));
+void lal_layer_hook(int layer, float *hidden, int dim) {
+    (void)layer; (void)hidden; (void)dim;
+}
+
+/* Runtime-loaded (dlopen) override; NULL when no --lal-steer was given. */
+static lal_layer_hook_fn g_lal_layer_hook = NULL;
+static void *g_lal_hook_handle = NULL;
+
+/* Load a .lal-compiled per-layer hook shared object at runtime. */
+static int lal_hook_load(const char *path) {
+    if (!path) return -1;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { fprintf(stderr, "[lal] dlopen %s failed: %s\n", path, dlerror()); return -1; }
+    lal_layer_hook_fn f = (lal_layer_hook_fn)dlsym(h, "lal_layer_hook");
+    if (!f) { fprintf(stderr, "[lal] dlsym lal_layer_hook failed: %s\n", dlerror()); dlclose(h); return -1; }
+    g_lal_hook_handle = h;
+    g_lal_layer_hook = f;
+    printf("[*] LAL layer hook loaded: %s\n", path);
+    return 0;
+}
+
 /* Sample next token from g_logits using temperature + top-k + rep_penalty.
  * Returns token id. If temperature==0, falls back to argmax. */
 static int sample_next_token(void) {
@@ -369,14 +464,38 @@ static int sample_next_token(void) {
         threshold = heap_val[0];
     }
 
-    /* Softmax over top-k tokens (those >= threshold), with temperature */
+    /* === LAL fusion level 2: logic-layer sampling filter ===
+     * Seed keep_mask from the top-k pool, hand it to the .lal filter (if any),
+     * then keep only tokens surviving BOTH top-k and the logic rules. Called
+     * before softmax+sample so banned tokens receive zero probability. */
+    static int keep_mask[VOCAB_SIZE];
+    for (int v = 0; v < VOCAB_SIZE; v++)
+        keep_mask[v] = (g_logits[v] >= threshold) ? 1 : 0;
+    {
+        int last = (g_n_recent > 0) ? g_recent_tokens[g_n_recent - 1] : -1;
+        if (g_lal_filter)
+            g_lal_filter(keep_mask, VOCAB_SIZE, last,
+                         g_recent_tokens, g_n_recent, _qwen_decode_for_filter);
+        else
+            lal_filter_topk(keep_mask, VOCAB_SIZE, last,
+                            g_recent_tokens, g_n_recent, _qwen_decode_for_filter);
+        /* Safety: never drop the entire pool (avoids empty-sample crash). */
+        int any_kept = 0;
+        for (int v = 0; v < VOCAB_SIZE; v++) if (keep_mask[v]) { any_kept = 1; break; }
+        if (!any_kept) {
+            for (int v = 0; v < VOCAB_SIZE; v++)
+                if (g_logits[v] >= threshold) keep_mask[v] = 1;
+        }
+    }
+
+    /* Softmax over kept tokens (top-k ∩ rules), with temperature */
     float max_l = -1e30f;
     for (int v = 0; v < VOCAB_SIZE; v++)
-        if (g_logits[v] >= threshold && g_logits[v] > max_l) max_l = g_logits[v];
+        if (keep_mask[v] && g_logits[v] >= threshold && g_logits[v] > max_l) max_l = g_logits[v];
     float sum = 0;
     static float probs[151936 + 200];
     for (int v = 0; v < VOCAB_SIZE; v++) {
-        if (g_logits[v] >= threshold) {
+        if (keep_mask[v] && g_logits[v] >= threshold) {
             probs[v] = expf((g_logits[v] - max_l) / g_temperature);
             sum += probs[v];
         } else probs[v] = 0;
@@ -992,6 +1111,9 @@ static int forward(int tok, int pos) {
                           L->q8_up,   L->s_up,   L->ws_up,
                           L->q8_down, L->s_down, L->ws_down,
                           g_ln, g_x, N_EMBD, MLP_DIM, N_EMBD);
+        /* === LAL fusion level 1: per-layer hook (read hidden state / steering write) === */
+        if (g_lal_layer_hook) g_lal_layer_hook(l, g_x, N_EMBD);
+        else lal_layer_hook(l, g_x, N_EMBD);
     }
 
     /* Final RMSNorm */
@@ -1079,6 +1201,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--temp") && i+1<argc) g_temperature=atof(argv[++i]);
         else if (!strcmp(argv[i],"--top-k") && i+1<argc) g_top_k=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rep-penalty") && i+1<argc) g_rep_penalty=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--lal-filter") && i+1<argc) {
+            if (lal_filter_load(argv[++i]) != 0)
+                fprintf(stderr, "[lal] warning: could not load LAL filter\n");
+        }
+        else if (!strcmp(argv[i],"--lal-steer") && i+1<argc) {
+            if (lal_hook_load(argv[++i]) != 0)
+                fprintf(stderr, "[lal] warning: could not load LAL layer hook\n");
+        }
     }
     if (g_n_threads < 1) g_n_threads = 1;
 

@@ -1,0 +1,6 @@
+# mini_steer.lal — REAL steering direction from the trained mini transformer.
+# Direction = mean(residual@layer1 | positive seeds)
+#            - mean(residual@layer1 | negative seeds),
+# then L2-normalized. Steering with +w should push generation toward positive mood.
+concept pos = [0.056836, 0.205793, -0.151734, -0.122527, -0.363153, 0.019934, -0.007454, 0.074990, 0.284696, -0.038110, -0.010927, 0.144315, -0.264575, -0.115098, -0.045968, -0.063118, 0.026763, 0.011241, -0.046916, -0.349319, -0.137569, 0.068424, 0.095320, 0.251174, -0.055017, -0.014030, 0.100253, -0.329539, 0.212238, -0.208090, 0.264150, 0.291188]
+concept steered = runtime_context(dim=32, layer=1, add=pos, weight=4.0)

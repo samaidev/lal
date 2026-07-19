@@ -1,0 +1,35 @@
+# qwen_filter.lal — LAL sampling-constraint filter for Qwen2.5-0.5B
+#
+# A `filter` rule compiles to a strong `lal_filter_topk()` C symbol that the
+# inference engine calls inside its top-k sampling path, dropping tokens that
+# violate the declared logic rules. This is the "logic layer" sitting on top
+# of the neural LM head — no weight retraining, pure rule constraints.
+#
+# Build the runtime-loadable .so:
+#   bash scripts/build_lal_filter.sh            # -> prebuilt/qwen_filter.so
+# (or: make qwen-lal-filter, if the target exists)
+#
+# Load at runtime (NO server rebuild needed):
+#   ./prebuilt/qwen_server --weights prebuilt/qwen_weights.bin \
+#       --tokenizer prebuilt/qwen_tokenizer --prompt "..." \
+#       --lal-filter prebuilt/qwen_filter.so
+#
+# Compile-time link alternative (strong symbol overrides the weak fallback):
+#   python3 compiler/lal.py demos/qwen_filter.lal _ build/qwen_filter.c --filter-only
+#   gcc -O3 -mavx2 -mfma tools/server/qwen_server.c runtime/lal_runtime.c \
+#       build/qwen_filter.c -lm -lpthread -ldl -o prebuilt/qwen_server_filtered
+#
+# Supported ban actions (see compiler/lal.py emit_filter_rule):
+#   ban_last       — hard-ban the immediately-preceding token (anti-repeat)
+#   ban_repeat(n)  — ban the last n generated tokens (blocks n-gram loops)
+#   ban_token(id)  — ban a specific token id
+#   ban_relation(trigger, allow1, allow2, ...)
+#                    — if the recent text contains `trigger`, only keep
+#                      candidates decoding to one of the allow-words
+#                      (world-knowledge constraint, no training)
+
+filter no_repeat:
+    ban_last
+    ban_repeat(6)
+    ban_relation("capital of France", "Paris")
+    ban_relation("capital of Japan", "Tokyo")

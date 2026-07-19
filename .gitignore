@@ -21,7 +21,11 @@ prebuilt/gpt2
 prebuilt/qwen_server
 prebuilt/qwen_train
 prebuilt/qwen7b_server
+prebuilt/mini_server
 prebuilt/demos/
+
+# LAL steering/filter compiled shared objects (regenerate via scripts/build_lal_*.sh)
+prebuilt/*.so
 
 # Compiled test/bench binaries
 scripts/extract_float_subset
@@ -51,6 +55,8 @@ prebuilt/gpt2_binary_logic.bin
 prebuilt/gpt2_binary.bin
 prebuilt/gpt2_synthetic.bin
 prebuilt/qwen_weights.bin
+prebuilt/mini_model.bin
+prebuilt/mini_model.json
 prebuilt/qwen7b_weights.bin
 prebuilt/qwen7b_q4k_weights.bin
 prebuilt/qwen7b_q4_weights.bin

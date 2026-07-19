@@ -56,6 +56,16 @@ class Concept:
     name: str
     vec: List[float]
     is_runtime: bool = False  # runtime_context(): filled from DNN hidden state at startup
+    # v0.8 three-layer fusion level 1: per-layer subscription + steering.
+    # runtime_layer == -1  -> final hidden state, filled via lal_server_get_hidden() at startup.
+    # runtime_layer >= 0   -> that transformer layer's hidden state, delivered by the
+    #                         server's per-layer lal_layer_hook() (read into this concept
+    #                         and/or written back as activation steering).
+    runtime_layer: int = -1
+    # When set, the server adds `steer_weight * concept[steer_name]` into the hidden
+    # state at runtime_layer (activation steering). steer_name must be a defined concept.
+    steer_name: Optional[str] = None
+    steer_weight: float = 0.0
 
 @dataclass
 class Bound:
@@ -690,11 +700,25 @@ def parse(source: str, source_path: Optional[str] = None):
         # The emitted C declares a mutable array + an extern getter, and main() fills
         # it before any rule runs. This lets .lal memory recall operate on the model's
         # *current* contextualized representation rather than a dead word vector.
-        m = re.match(r'concept\s+(\w+)\s*=\s*runtime_context\s*\(\s*(?:dim\s*=\s*(\d+))?\s*\)\s*$', line)
+        m = re.match(
+            r'concept\s+(\w+)\s*=\s*runtime_context\s*\(\s*'
+            r'(?:dim\s*=\s*(\d+))?\s*'
+            r'(?:,\s*layer\s*=\s*(-?\d+))?\s*'
+            r'(?:,\s*add\s*=\s*(\w+))?\s*'
+            r'(?:,\s*weight\s*=\s*([\d.eE+-]+))?\s*'
+            r'\)\s*$', line)
         if m:
             cname = m.group(1)
             dim = int(m.group(2)) if m.group(2) else 768  # default: GPT-2 n_embd
-            concepts.append(Concept(cname, [0.0] * dim, is_runtime=True))
+            layer = int(m.group(3)) if m.group(3) is not None else -1
+            steer = m.group(4)
+            weight = float(m.group(5)) if m.group(5) is not None else 0.0
+            if steer and layer < 0:
+                raise ParseError(f"concept '{cname}': add= requires a per-layer subscription (layer>=0)")
+            if steer and weight == 0.0:
+                raise ParseError(f"concept '{cname}': add={steer} requires weight!=0")
+            concepts.append(Concept(cname, [0.0] * dim, is_runtime=True,
+                                    runtime_layer=layer, steer_name=steer, steer_weight=weight))
             i += 1
             continue
 
@@ -1323,22 +1347,42 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             concepts_needing_full.add(key_name)
             concepts_needing_full.add(val_name)
 
+    # Steering sources must have full-dim arrays available (they are added back into
+    # the hidden state). Force them into concepts_needing_full so they get emitted.
+    for c in concepts:
+        if c.steer_name:
+            if c.steer_name not in concept_names:
+                raise ParseError(f"concept '{c.name}': steer source '{c.steer_name}' is not a defined concept")
+            concepts_needing_full.add(c.steer_name)
+
+    # Runtime (DNN-bound) concepts: declare mutable arrays for ALL of them, since
+    # per-layer (layer>=0) concepts are delivered by lal_layer_hook at inference
+    # time and may not be referenced by any VSA op. Emitted unconditionally so a
+    # .lal that ONLY subscribes to layers still produces the lal_layer_hook symbol.
+    runtime_concepts = [c for c in concepts if c.is_runtime]
+    # Per-layer hook (level 1): concepts subscribed to a specific transformer layer.
+    # Computed up-front; the STRONG lal_layer_hook() symbol is emitted AFTER all
+    # concept arrays below so it can legally reference steer-source concepts.
+    layer_hook_concepts = [c for c in runtime_concepts if c.runtime_layer >= 0]
+    if runtime_concepts:
+        lines.append("/* === Runtime concept bridge (three-layer fusion level 1) ===")
+        lines.append(" * These concepts are filled from the live DNN model's hidden state:")
+        lines.append(" *   - layer == -1: final hidden state via lal_server_get_hidden()")
+        lines.append(" *   - layer >= 0 : that transformer layer's hidden via lal_layer_hook()")
+        lines.append(" * They are mutable (non-const) and bypass int8/int4 quantization. */")
+        lines.append("/* Weak fallback for lal_server_get_hidden (final-hidden path): when the .lal")
+        lines.append(" * program is compiled standalone, the getter returns NULL and final-hidden")
+        lines.append(" * concepts stay zero-filled — graceful degradation. */")
+        lines.append("float *lal_server_get_hidden(void) __attribute__((weak));")
+        lines.append("float *lal_server_get_hidden(void) { return (float*)0; }")
+        for c in sorted(runtime_concepts, key=lambda x: x.name):
+            tag = "final hidden" if c.runtime_layer < 0 else f"layer {c.runtime_layer} hook"
+            lines.append(f"static float concept_{c.name}[{len(c.vec)}] = {{0}};  /* filled from live DNN: {tag} */")
+        lines.append("")
+        if layer_hook_concepts:
+            lines.append("/* Per-layer hook (level 1): lal_layer_hook() emitted after concept arrays. */")
+
     if concepts_needing_full:
-        runtime_concepts = [c for c in concepts if c.is_runtime and c.name in concepts_needing_full]
-        if runtime_concepts:
-            lines.append("/* === Runtime concept bridge (three-layer fusion level 1) ===")
-            lines.append(" * These concepts are filled at startup from the live DNN model's hidden state")
-            lines.append(" * via lal_server_get_hidden() (defined in gpt2_server.c). They are mutable")
-            lines.append(" * (non-const) and therefore bypass int8/int4 quantization. */")
-            lines.append("/* Weak fallback: when the .lal program is compiled standalone (not linked")
-            lines.append(" * against gpt2_server.c), the getter returns NULL and runtime concepts stay")
-            lines.append(" * zero-filled — graceful degradation. Link with gpt2_server.o to get the real")
-            lines.append(" * hidden state from a live GPT-2/Qwen forward pass. */")
-            lines.append("float *lal_server_get_hidden(void) __attribute__((weak));")
-            lines.append("float *lal_server_get_hidden(void) { return (float*)0; }")
-            for c in sorted(runtime_concepts, key=lambda x: x.name):
-                lines.append(f"static float concept_{c.name}[{len(c.vec)}] = {{0}};  /* filled at startup from live DNN */")
-            lines.append("")
         lines.append("/* === Concept vectors (full dim, used by VSA ops and MEMORY recall) ===")
         lines.append(" * Only concepts referenced by bind/bundle/permute/recall/unbounded-dot are emitted. */")
         for c in sorted(concepts, key=lambda x: x.name):
@@ -1368,6 +1412,12 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
             else:
                 arr = ", ".join(f"{v:.6f}f" for v in c.vec)
                 lines.append(f"static const float concept_{c.name}[{len(c.vec)}] = {{{arr}}};")
+        lines.append("")
+
+    # Emit the per-layer hook AFTER all concept arrays are declared, so it can
+    # legally reference (possibly static) steer-source concepts like concept_pos.
+    if layer_hook_concepts:
+        lines.extend(_emit_layer_hook(layer_hook_concepts, concept_map))
         lines.append("")
 
     # Emit masked concept arrays for bounded dot products.
@@ -1496,10 +1546,14 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # server (which has its own main), so we emit only lal_filter_topk + any
     # supporting concept/relate data it references.
     if filter_only:
-        # Validate that at least one filter rule was emitted.
-        if not any(getattr(rule_map[rn], "kind", "rule") == "filter" for rn in rules_to_emit):
-            raise ParseError("--filter-only: no filter rule found in the .lal source. "
-                             "Declare a `filter name:` block with ban_* actions.")
+        # Validate that at least one filter rule OR one per-layer hook was emitted.
+        has_filter = any(getattr(rule_map[rn], "kind", "rule") == "filter" for rn in rules_to_emit)
+        has_layer_hook = any(c.is_runtime and c.runtime_layer >= 0 for c in concepts)
+        if not has_filter and not has_layer_hook:
+            raise ParseError("--filter-only: no filter rule and no per-layer "
+                             "runtime_context(layer>=0) found in the .lal source. "
+                             "Declare a `filter name:` block with ban_* actions, or a "
+                             "`concept x = runtime_context(layer=L, ...)` subscription.")
         return "\n".join(lines) + "\n"
 
     if _TRAIN_MODE:
@@ -1568,9 +1622,9 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # DNN model's hidden state before any rule executes. If no model is linked
     # (standalone .lal program without gpt2_server), the getter returns NULL and
     # the concept stays zero-filled — graceful degradation.
-    runtime_concepts_for_main = [c for c in concepts if c.is_runtime]
+    runtime_concepts_for_main = [c for c in concepts if c.is_runtime and c.runtime_layer < 0]
     if runtime_concepts_for_main:
-        lines.append("    /* === Bind runtime concepts to live DNN hidden state === */")
+        lines.append("    /* === Bind final-hidden runtime concepts (layer==-1) to live DNN hidden state === */")
         lines.append("    float *_lal_hidden = lal_server_get_hidden();")
         for c in sorted(runtime_concepts_for_main, key=lambda x: x.name):
             lines.append(f"    if (_lal_hidden) memcpy(concept_{c.name}, _lal_hidden, {len(c.vec)} * sizeof(float));")
@@ -2196,6 +2250,46 @@ def _emit_filter_rule(variants):
             raise ParseError(f"filter rule '{rule.name}': unknown ban action '{action}' "
                              f"(expected ban_last / ban_repeat(n) / ban_token(id) / ban_relation(...))")
     L.append("    return dropped;")
+    L.append("}")
+    return L
+
+
+def _emit_layer_hook(concepts_with_layer, concept_map):
+    """Emit the .lal per-layer hook as a strong lal_layer_hook() C definition.
+
+    Compiler half of three-layer fusion level 1. For each concept subscribed to
+    a transformer layer (runtime_context(layer=L [, add=Z, weight=w])):
+      - READ:  at layer==L, copy that layer's hidden state into concept_X.
+      - WRITE (steering): at layer==L with add=Z, add w*concept_Z into hidden
+        (a symbolic concept steers the network's representation).
+
+    The server invokes this once per layer, right after the layer's output is in
+    `hidden` (g_x for qwen_server.c). At link/load time this STRONG symbol is
+    used by the server's per-layer call (overriding the weak no-op).
+    """
+    L: List[str] = []
+    L.append("/* === LAL three-layer fusion (level 1): per-layer hook ===")
+    L.append(" * Generated from .lal runtime_context(layer=...) subscriptions. STRONG symbol")
+    L.append(" * used by the server's per-layer call (overrides the weak no-op in the server). */")
+    L.append("void lal_layer_hook(int layer, float *hidden, int dim) {")
+    L.append("    if (!hidden || dim <= 0) return;")
+    L.append("    (void)dim;")
+    for c in sorted(concepts_with_layer, key=lambda x: (x.runtime_layer, x.name)):
+        cdim = len(c.vec)
+        if c.steer_name:
+            w = c.steer_weight
+            steer_dim = len(concept_map.get(c.steer_name, []))
+            limit = min(cdim, steer_dim)
+            L.append(f"    /* layer {c.runtime_layer}: read hidden into concept_{c.name} AND steer via concept_{c.steer_name} (w={w}) */")
+            L.append(f"    if (layer == {c.runtime_layer}) {{")
+            L.append(f"        memcpy(concept_{c.name}, hidden, {cdim} * sizeof(float));")
+            L.append(f"        for (int _i = 0; _i < {limit}; _i++)")
+            L.append(f"            hidden[_i] += ({w}f) * concept_{c.steer_name}[_i];")
+            L.append("    }")
+        else:
+            L.append(f"    /* layer {c.runtime_layer}: read hidden state into concept_{c.name} */")
+            L.append(f"    if (layer == {c.runtime_layer})")
+            L.append(f"        memcpy(concept_{c.name}, hidden, {cdim} * sizeof(float));")
     L.append("}")
     return L
 

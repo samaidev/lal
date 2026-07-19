@@ -1,0 +1,36 @@
+# qwen_steer.lal — LAL activation steering + per-layer read for Qwen2.5-0.5B
+#
+# This demonstrates three-layer fusion LEVEL 1: the .lal program hooks the
+# engine's transformer layers via lal_layer_hook(), which the server calls once
+# per layer (right after that layer's MLP output/residual is in g_x).
+#
+#   concept mid = runtime_context(layer=8)              -> READ layer 8's hidden
+#                                                          state into a concept.
+#   concept s   = runtime_context(layer=12, add=pos,    -> WRITE (steering): at
+#                   weight=0.3)                             layer 12, add 0.3*pos
+#                                                          into the hidden state.
+#
+# So LAL can both (a) observe internal representations and (b) steer them —
+# the "symbolic concept layer" nudges the neural net, no retraining.
+#
+# Build + load (NO server rebuild — dlopen hot-load):
+#   bash scripts/build_lal_steer.sh            # -> prebuilt/qwen_steer.so
+#   ./prebuilt/qwen_server --weights prebuilt/qwen_weights.bin \
+#       --tokenizer prebuilt/qwen_tokenizer --prompt "..." \
+#       --lal-steer prebuilt/qwen_steer.so
+#
+# >>> IMPORTANT (production): `dim` MUST equal the model's n_embd (896 for
+#     Qwen2.5-0.5B), and `pos` should be a real 896-dim concept DIRECTION
+#     (e.g. a probing-estimated "positive"/"refusal" direction), not the tiny
+#     placeholder vector below. We use dim=16 here only so the demo is readable;
+#     the generated hook is correct for any dim and only the first 16 dims are
+#     touched in this placeholder form.
+
+# A symbolic concept we steer INTO the network (placeholder 16-dim direction).
+concept pos = [0.05, -0.03, 0.07, 0.02, -0.01, 0.04, -0.02, 0.06, 0.01, -0.04, 0.03, 0.05, -0.06, 0.02, 0.07, -0.03]
+
+# READ: capture layer 8's hidden state into a concept for downstream use.
+concept mid = runtime_context(dim=16, layer=8)
+
+# STEER: at layer 12, add 0.3 * pos into the hidden state (activation steering).
+concept steered = runtime_context(dim=16, layer=12, add=pos, weight=0.3)

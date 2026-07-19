@@ -27,7 +27,7 @@ else
   SIMD_FLAGS ?=
 endif
 
-CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall
+CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall -ldl
 LALC ?= $(PYTHON) compiler/lal.py
 
 .PHONY: all train server qwen-server float-subset demos verify clean
@@ -115,3 +115,21 @@ prebuilt/qwen7b_server: tools/server/qwen7b_server.c runtime/lal_runtime.c runti
 	$(CC) $(CFLAGS) -fopenmp -Wno-unused-function -Wno-unused-variable -I. \
 	        -o $@ tools/server/qwen7b_server.c runtime/lal_runtime.c -lm -lpthread -lgomp
 	@echo "[*] built qwen7b_server (Qwen2.5-7B, Q8, GPQ8, OpenMP)"
+
+# === Mini local transformer (real model, no internet) for LAL level-1 live test ===
+# Trains a tiny char-LM, exports C-loadable weights + a REAL steering direction.
+mini-train: prebuilt/mini_model.bin
+
+prebuilt/mini_model.bin: tools/mini_train.py
+	$(PYTHON) tools/mini_train.py
+
+prebuilt/mini_server: tools/mini_server.c
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I. \
+	        -o $@ tools/mini_server.c -lm -ldl
+	@echo "[*] built mini_server (tiny real transformer, level-1 hook enabled)"
+
+# Build the real-direction steering .so for mini_server (and qwen_server).
+mini-steer: prebuilt/mini_steer.so
+
+prebuilt/mini_steer.so: demos/mini_steer.lal compiler/lal.py
+	bash scripts/build_lal_mini_steer.sh
