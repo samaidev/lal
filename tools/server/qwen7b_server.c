@@ -232,11 +232,11 @@ static int lal_sample_token_filtered(float *logits, int vocab_size,
         int best = 0; for (int v = 1; v < vocab_size; v++) if (logits[v] > logits[best]) best = v;
         return best;
     }
-    /* top-k threshold via min-heap */
-    int k = top_k; if (k > vocab_size) k = vocab_size;
+    /* top-k threshold via min-heap (safe: k capped to [1, VOCAB_SIZE]) */
+    int k = top_k; if (k < 1) k = 1; if (k > vocab_size) k = vocab_size;
     float threshold = -1e30f;
     {
-        static float heap_val[256]; static int heap_idx[256]; int heap_n = 0;
+        static float heap_val[512]; static int heap_idx[512]; int heap_n = 0;
         for (int v = 0; v < vocab_size; v++) {
             float val = logits[v];
             if (heap_n < k) { int c = heap_n++; heap_val[c]=val; heap_idx[c]=v;
@@ -268,21 +268,29 @@ static int lal_sample_token_filtered(float *logits, int vocab_size,
         int any = 0; for (int v = 0; v < vocab_size; v++) if (keep_mask[v]) { any=1; break; }
         if (!any) for (int v = 0; v < vocab_size; v++) if (logits[v] >= threshold) keep_mask[v] = 1;
     }
-    /* softmax over kept ∩ top-k, then sample */
-    float max_l = -1e30f;
-    for (int v = 0; v < vocab_size; v++)
-        if (keep_mask[v] && logits[v] >= threshold && logits[v] > max_l) max_l = logits[v];
-    float sum = 0;
-    for (int v = 0; v < vocab_size; v++)
-        if (keep_mask[v] && logits[v] >= threshold) sum += expf((logits[v]-max_l)/temperature);
+    /* softmax over kept ∩ top-k, then sample.
+     * Optimized: a SINGLE pass computes max_l + sum simultaneously, then a
+     * SECOND pass samples — replacing the previous 3 full O(V) scans over the
+     * 152064-vocab with 2. (The heap pass already happened above.) */
+    float max_l = -1e30f, sum = 0;
+    for (int v = 0; v < vocab_size; v++) {
+        if (keep_mask[v] && logits[v] >= threshold) {
+            if (logits[v] > max_l) max_l = logits[v];
+        }
+    }
+    for (int v = 0; v < vocab_size; v++) {
+        if (keep_mask[v] && logits[v] >= threshold)
+            sum += expf((logits[v]-max_l)/temperature);
+    }
     if (sum <= 0) { int best=0; float bv=-1e30f;
         for (int v=0;v<vocab_size;v++) if (keep_mask[v]&&logits[v]>bv){bv=logits[v];best=v;} return best; }
     float r = (float)rand()/(float)RAND_MAX*sum, acc = 0;
-    for (int v = 0; v < vocab_size; v++)
+    for (int v = 0; v < vocab_size; v++) {
         if (keep_mask[v] && logits[v] >= threshold) {
             acc += expf((logits[v]-max_l)/temperature);
             if (r <= acc) return v;
         }
+    }
     return vocab_size - 1;
 }
 

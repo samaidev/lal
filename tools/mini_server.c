@@ -291,11 +291,11 @@ static int sample_next_token(const float *lm, int last_tok) {
     }
 
     /* top-k threshold via min-heap of size k */
-    int top_k = g_top_k; if (top_k > n_vocab) top_k = n_vocab;
+    int top_k = g_top_k; if (top_k < 1) top_k = 1; if (top_k > n_vocab) top_k = n_vocab;
     float threshold = -1e30f;
     {
-        static float heap_val[256];
-        static int   heap_idx[256];
+        static float heap_val[512];
+        static int   heap_idx[512];
         int heap_n = 0;
         for (int v = 0; v < n_vocab; v++) {
             float val = logits[v];
@@ -334,18 +334,16 @@ static int sample_next_token(const float *lm, int last_tok) {
         if (!any_kept) for (int v = 0; v < n_vocab; v++) if (logits[v] >= threshold) keep_mask[v] = 1;
     }
 
-    /* softmax over kept tokens, then sample */
+    /* softmax over kept tokens, then sample.
+     * Optimized: a single pass computes max_l, the SECOND pass samples —
+     * sqrtf/expf only run on the kept ∩ top-k set, no O(V) probs[] buffer. */
     float max_l = -1e30f;
     for (int v = 0; v < n_vocab; v++)
         if (keep_mask[v] && logits[v] >= threshold && logits[v] > max_l) max_l = logits[v];
     float sum = 0;
-    float *probs = malloc(sizeof(float) * n_vocab);
-    for (int v = 0; v < n_vocab; v++) {
-        if (keep_mask[v] && logits[v] >= threshold) {
-            probs[v] = expf((logits[v] - max_l) / g_temperature);
-            sum += probs[v];
-        } else probs[v] = 0;
-    }
+    for (int v = 0; v < n_vocab; v++)
+        if (keep_mask[v] && logits[v] >= threshold)
+            sum += expf((logits[v] - max_l) / g_temperature);
     int out = 0;
     if (sum <= 0) { /* safety: fall back to argmax over the kept pool */
         float bv = -1e30f;
@@ -353,9 +351,14 @@ static int sample_next_token(const float *lm, int last_tok) {
     } else {
         float r = (float)rand() / (float)RAND_MAX * sum;
         float acc = 0;
-        for (int v = 0; v < n_vocab; v++) { acc += probs[v]; if (r <= acc) { out = v; break; } }
+        for (int v = 0; v < n_vocab; v++) {
+            if (keep_mask[v] && logits[v] >= threshold) {
+                acc += expf((logits[v] - max_l) / g_temperature);
+                if (r <= acc) { out = v; break; }
+            }
+        }
     }
-    free(logits); free(keep_mask); free(probs);
+    free(logits); free(keep_mask);
     return out;
 }
 

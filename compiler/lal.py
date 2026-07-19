@@ -2266,18 +2266,50 @@ def _emit_filter_rule(variants):
             L.append("            }")
             L.append("        }")
             L.append("        _recent[_rl] = 0;")
-            # Check if _recent contains the trigger substring.
-            L.append(f'        if (strstr(_recent, "{trig_escaped}")) {{')
+            # Check if _recent ENDS WITH the trigger (word-boundary aware: the
+            # trigger must be a suffix of _recent, not a stray interior substring,
+            # so "capital" in "the capital" triggers but "cap" in "escape" does not).
+            L.append(f'        int _trig_len = (int)strlen("{trig_escaped}");')
+            L.append("        int _trig_hit = 0;")
+            L.append("        if (_trig_len > 0 && _rl >= _trig_len) {")
+            L.append("            if (memcmp(_recent + _rl - _trig_len, "
+                     f'"{trig_escaped}", _trig_len) == 0) {{')
+            L.append("                /* require a boundary before the trigger: start of")
+            L.append("                 * string, or a space/punctuation right before it */")
+            L.append("                char _c = (_rl == _trig_len) ? ' ' : _recent[_rl - _trig_len - 1];")
+            L.append("                if (_c == ' ' || _c == '\\n' || _c == '\\t' ||")
+            L.append("                    _c == '.' || _c == ',' || _c == '!' || _c == '?' ||")
+            L.append("                    _c == ':' || _c == ';' || _c == '(' || _c == '\"')")
+            L.append("                    _trig_hit = 1;")
+            L.append("            }")
+            L.append("        }")
+            L.append("        if (_trig_hit) {")
             L.append("            /* trigger matched — scan surviving candidates, drop non-allowed */")
             L.append("            for (int v = 0; v < n_vocab; v++) {")
             L.append("                if (!keep_mask[v]) continue;")
             L.append("                int dn = decode_fn(v, _buf, sizeof(_buf) - 1);")
             L.append("                if (dn <= 0) { keep_mask[v] = 0; dropped++; continue; }")
             L.append("                _buf[dn] = 0;")
+            # Word-boundary match for allow words: an allow word matches a decoded
+            # candidate token iff it equals the candidate, or the candidate is the
+            # allow word followed by a boundary (space/punct/end). This avoids the
+            # old strstr() false-positive ("art" matching "start"/"part").
             L.append("                int _ok = 0;")
+            L.append("                for (int _aw = 0; _aw < "
+                     + str(len(allow_words)) + "; _aw++) {")
             for w in allow_words:
                 w_escaped = w.replace('\\', '\\\\').replace('"', '\\"')
-                L.append(f'                if (strstr(_buf, "{w_escaped}")) _ok = 1;')
+                L.append(f'                    if (strcmp(_buf, "{w_escaped}") == 0) {{ _ok = 1; break; }}')
+                L.append(f'                    int _al = (int)strlen("{w_escaped}");')
+                L.append(f'                    if (_al > 0 && (int)strlen(_buf) >= _al &&')
+                L.append(f'                        memcmp(_buf, "{w_escaped}", _al) == 0) {{')
+                L.append("                        char _e = _buf[_al];")
+                L.append("                        if (_e == 0 || _e == ' ' || _e == '\\n' || _e == '\\t' ||")
+                L.append("                            _e == '.' || _e == ',' || _e == '!' || _e == '?' ||")
+                L.append("                            _e == ':' || _e == ';' || _e == '(' || _e == '\"')")
+                L.append("                            { _ok = 1; break; }")
+                L.append("                    }")
+            L.append("                }")
             L.append("                if (!_ok) { keep_mask[v] = 0; dropped++; }")
             L.append("            }")
             L.append("        }")
