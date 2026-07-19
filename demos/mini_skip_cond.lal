@@ -6,12 +6,18 @@
 # is safe to drop (the standard early-exit / skip criterion). On "hard" tokens
 # where each layer still moves the hidden state a lot, we keep all layers.
 #
-# `skip 1 every 2 layers when 0.08`  -> at every even layer, jump 1 layer ONLY
-# if delta = ||h - prev_h|| / ||h|| < 0.08. The .so keeps prev_h internally, so
+# `skip 1 every 4 layers when 0.05`  -> at every 4th layer, jump 1 layer ONLY
+# if delta = ||h - prev_h|| / ||h|| < 0.05. The .so keeps prev_h internally, so
 # the server contract is unchanged. Tune the threshold: higher = more skips
 # (more speed, less quality); lower = fewer skips (more quality, less speed).
+#
+# Runtime override (no recompile): the compiled .so exports an optional
+# `lal_skip_set_params` symbol the server calls from these CLI flags:
+#   --lal-skip-n N        override skip count
+#   --lal-skip-every P    override layer period
+#   --lal-skip-thr T      override residual-delta threshold (e.g. 0.03..0.12)
 #
 # Compile:  bash scripts/build_lal_skip_cond.sh
 # Run:      ./prebuilt/mini_server --prompt "I feel" --n 20 \
 #             --stress-layers 64 --lal-skip prebuilt/mini_skip_cond.so
-skip 1 every 2 layers when 0.08
+skip 1 every 4 layers when 0.05

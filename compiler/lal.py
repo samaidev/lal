@@ -2308,12 +2308,33 @@ def _emit_skip_symbol(skip_directives):
     `when <thr>` therefore means: skip only when delta < thr (stable layers skip).
     """
     L: List[str] = []
+    # Runtime-overridable defaults. A host server may call the optional
+    # lal_skip_set_params() symbol (exported below) to override these without
+    # recompiling the .so. Defaults come straight from the .lal directive.
+    # n_override/every_override == -1 means "use the directive default".
+    n_def = skip_directives[0][0]
+    ev_def = skip_directives[0][1][1]
     L.append("/* === LAL three-layer fusion (level 1, acceleration): logic-driven layer skip === */")
     L.append("/* Generated from .lal `skip` directives. Strong symbol overrides the")
     L.append(" * server's weak lal_layer_skip fallback (no-op when no .lal skip linked).")
     L.append(" * Skip criterion: per-layer residual delta ||h - prev_h|| / ||h||. Small")
     L.append(" * delta => this layer barely changed the representation => safe to skip. */")
+    L.append("/* Runtime overrides (set via the optional lal_skip_set_params symbol). */")
+    L.append(f"static int g_skip_n = {n_def};")
+    L.append(f"static int g_skip_every = {ev_def};")
+    L.append("static int g_skip_n_ovr = -1;")
+    L.append("static int g_skip_every_ovr = -1;")
+    L.append("static float g_skip_thr = -1.0f;  /* -1 => use directive default */")
+    L.append("/* Optional: host calls this to override skip count / period / threshold")
+    L.append(" * at runtime (e.g. server CLI --lal-skip-thr). Passing -1 keeps default. */")
+    L.append("void lal_skip_set_params(int n_ovr, int every_ovr, float thr) {")
+    L.append("    if (n_ovr >= 0) g_skip_n_ovr = n_ovr;")
+    L.append("    if (every_ovr >= 0) g_skip_every_ovr = every_ovr;")
+    L.append("    if (thr >= 0.0f) g_skip_thr = thr;")
+    L.append("}")
     L.append("int lal_layer_skip(int layer, float *hidden, int dim) {")
+    L.append("    int n = g_skip_n_ovr >= 0 ? g_skip_n_ovr : g_skip_n;")
+    L.append("    int every = g_skip_every_ovr >= 0 ? g_skip_every_ovr : g_skip_every;")
     L.append("    static float prev[4096];")
     L.append("    static int prev_dim = 0;")
     L.append("    static int have_prev = 0;")
@@ -2335,18 +2356,19 @@ def _emit_skip_symbol(skip_directives):
     L.append("        for (int i = 0; i < cap; i++) prev[i] = hidden[i];")
     L.append("        prev_dim = dim; have_prev = 1;")
     L.append("    }")
+    # Use the per-directive threshold if present; otherwise fall back to the
+    # runtime-overridable g_skip_thr (or the directive default when no override).
     for n, (kind, val), thr in skip_directives:
-        if thr is None:
-            if kind == "at":
-                L.append(f"    if (layer == {val}) return {n};")
+        if kind == "at":
+            if thr is None:
+                L.append(f"    if (layer == {val}) return n;")
             else:
-                L.append(f"    if (layer % {val} == 0) return {n};")
-        else:
-            # conditional: skip only when residual delta is SMALL (stable layer)
-            if kind == "at":
-                L.append(f"    if (layer == {val} && delta < {thr:.4f}f) return {n};")
+                L.append(f"    if (layer == {val} && delta < (g_skip_thr >= 0.0f ? g_skip_thr : {thr:.4f}f)) return n;")
+        else:  # "every"
+            if thr is None:
+                L.append(f"    if (layer % every == 0) return n;")
             else:
-                L.append(f"    if (layer % {val} == 0 && delta < {thr:.4f}f) return {n};")
+                L.append(f"    if (layer % every == 0 && delta < (g_skip_thr >= 0.0f ? g_skip_thr : {thr:.4f}f)) return n;")
     L.append("    return 0;")
     L.append("}")
     return L

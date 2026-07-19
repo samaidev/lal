@@ -62,6 +62,12 @@ int lal_layer_skip(int layer, float *hidden, int dim) __attribute__((weak));
 int lal_layer_skip(int layer, float *hidden, int dim) {
     (void)layer; (void)hidden; (void)dim; return 0;
 }
+/* Optional runtime param override, exported by skip .so compiled from a
+ * `skip ... when <thr>` directive. NULL if the loaded .so doesn't define it. */
+typedef void (*lal_skip_set_params_fn)(int n_ovr, int every_ovr, float thr);
+static lal_skip_set_params_fn g_skip_set = NULL;
+static int g_skip_n_ovr = -1, g_skip_every_ovr = -1;
+static float g_skip_thr = -1.0f;
 static lal_layer_skip_fn g_skip = NULL;
 static void *g_hook_handle = NULL;
 
@@ -73,7 +79,19 @@ static int lal_load(const char *path) {
     lal_layer_hook_fn f = (lal_layer_hook_fn)dlsym(h, "lal_layer_hook");
     if (f) { g_hook = f; printf("[*] LAL layer hook (steering) loaded: %s\n", path); }
     lal_layer_skip_fn sk = (lal_layer_skip_fn)dlsym(h, "lal_layer_skip");
-    if (sk) { g_skip = sk; printf("[*] LAL layer-skip control loaded: %s\n", path); }
+    if (sk) {
+        g_skip = sk;
+        printf("[*] LAL layer-skip control loaded: %s\n", path);
+        /* optional runtime override of skip n / period / threshold */
+        lal_skip_set_params_fn setp = (lal_skip_set_params_fn)dlsym(h, "lal_skip_set_params");
+        g_skip_set = setp;
+        if (setp) {
+            setp(g_skip_n_ovr, g_skip_every_ovr, g_skip_thr);
+            if (g_skip_n_ovr >= 0 || g_skip_every_ovr >= 0 || g_skip_thr >= 0.0f)
+                printf("[*]   skip override: n=%d every=%d thr=%.3f (runtime)\n",
+                       g_skip_n_ovr, g_skip_every_ovr, g_skip_thr);
+        }
+    }
     if (!f && !sk) { fprintf(stderr, "[lal] %s defines neither lal_layer_hook nor lal_layer_skip\n", path); dlclose(h); return -1; }
     g_hook_handle = h;
     return 0;
@@ -308,6 +326,15 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--stress-layers") && i+1<argc) {
             G_STRESS = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--lal-skip-n") && i+1<argc) {
+            g_skip_n_ovr = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--lal-skip-every") && i+1<argc) {
+            g_skip_every_ovr = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--lal-skip-thr") && i+1<argc) {
+            g_skip_thr = (float)atof(argv[++i]);
         }
         else if (!strcmp(argv[i], "--bench") && i+1<argc) {
             g_bench = atoi(argv[++i]); g_n = g_bench;
