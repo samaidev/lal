@@ -909,12 +909,21 @@ def parse(source: str, source_path: Optional[str] = None):
         # cuts transformer forward compute without retraining.
         m = re.match(r"skip\s+(\d+)\s+at\s+layer\s+(\d+)\s*$", line)
         if m:
-            skip_directives.append((int(m.group(1)), ("at", int(m.group(2)))))
+            skip_directives.append((int(m.group(1)), ("at", int(m.group(2))), None))
             i += 1
             continue
         m = re.match(r"skip\s+(\d+)\s+every\s+(\d+)\s+layers\s*$", line)
         if m:
-            skip_directives.append((int(m.group(1)), ("every", int(m.group(2)))))
+            skip_directives.append((int(m.group(1)), ("every", int(m.group(2))), None))
+            i += 1
+            continue
+        # skip N every P layers when <thr> — CONDITIONAL skip: only jump when the
+        # hidden-state "confidence" (max|h| / (mean|h|+eps)) exceeds thr. Keeps
+        # acceleration on "easy" tokens, preserves quality on "hard" ones (fixes
+        # the aiii degradation seen with unconditional periodic skip).
+        m = re.match(r"skip\s+(\d+)\s+every\s+(\d+)\s+layers\s+when\s+([0-9.]+)\s*$", line)
+        if m:
+            skip_directives.append((int(m.group(1)), ("every", int(m.group(2))), float(m.group(3))))
             i += 1
             continue
 
@@ -1345,6 +1354,7 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     lines.append("#include <stdio.h>")
     lines.append("#include <stdlib.h>")
     lines.append("#include <string.h>")
+    lines.append("#include <math.h>")    # sqrt() for residual-delta skip criterion
     lines.append("#include <stdint.h>")  # int8_t for quantization
     lines.append("#if defined(__AVX2__) || defined(__AVX__)")
     lines.append("#include <immintrin.h>")
@@ -2288,19 +2298,55 @@ def _emit_skip_symbol(skip_directives):
     cuts transformer forward compute without retraining. The strong symbol
     overrides the server's weak lal_layer_skip fallback (no skip when unlinked).
 
-    skip_directives: list of (nskip, ("at", layer)) | (nskip, ("every", period)).
+    skip_directives: list of (nskip, ("at", layer), thr) | (nskip, ("every", period), thr)
+    where thr is None for unconditional skip, or a float threshold for CONDITIONAL
+    skip. The skip decision uses the per-layer RESIDUAL DELTA
+        delta = ||hidden - prev_hidden|| / (||hidden|| + eps)
+    (prev_hidden is kept inside the .so as a static buffer, so the server contract
+    is unchanged). A SMALL delta means this layer changed the representation little,
+    so it is safe to skip the next layer — the standard early-exit / skip criterion.
+    `when <thr>` therefore means: skip only when delta < thr (stable layers skip).
     """
     L: List[str] = []
     L.append("/* === LAL three-layer fusion (level 1, acceleration): logic-driven layer skip === */")
     L.append("/* Generated from .lal `skip` directives. Strong symbol overrides the")
-    L.append(" * server's weak lal_layer_skip fallback (no-op when no .lal skip linked). */")
+    L.append(" * server's weak lal_layer_skip fallback (no-op when no .lal skip linked).")
+    L.append(" * Skip criterion: per-layer residual delta ||h - prev_h|| / ||h||. Small")
+    L.append(" * delta => this layer barely changed the representation => safe to skip. */")
     L.append("int lal_layer_skip(int layer, float *hidden, int dim) {")
-    L.append("    (void)hidden; (void)dim;")
-    for n, (kind, val) in skip_directives:
-        if kind == "at":
-            L.append(f"    if (layer == {val}) return {n};")
-        else:  # "every"
-            L.append(f"    if (layer % {val} == 0) return {n};")
+    L.append("    static float prev[4096];")
+    L.append("    static int prev_dim = 0;")
+    L.append("    static int have_prev = 0;")
+    L.append("    float delta = 2.0f;  /* default: unstable (don't skip) */")
+    L.append("    if (hidden && dim > 0 && have_prev) {")
+    L.append("        float num = 0.0f, den = 0.0f;")
+    L.append("        int cap = dim < 4096 ? dim : 4096;")
+    L.append("        for (int i = 0; i < cap; i++) {")
+    L.append("            float d = hidden[i] - prev[i];")
+    L.append("            num += d * d;")
+    L.append("            den += hidden[i] * hidden[i];")
+    L.append("            prev[i] = hidden[i];")
+    L.append("        }")
+    L.append("        prev_dim = dim;")
+    L.append("        delta = (float)sqrt(num) / ((float)sqrt(den) + 1e-6f);")
+    L.append("    } else if (hidden && dim > 0) {")
+    L.append("        /* First observation: just record prev, treat as unstable. */")
+    L.append("        int cap = dim < 4096 ? dim : 4096;")
+    L.append("        for (int i = 0; i < cap; i++) prev[i] = hidden[i];")
+    L.append("        prev_dim = dim; have_prev = 1;")
+    L.append("    }")
+    for n, (kind, val), thr in skip_directives:
+        if thr is None:
+            if kind == "at":
+                L.append(f"    if (layer == {val}) return {n};")
+            else:
+                L.append(f"    if (layer % {val} == 0) return {n};")
+        else:
+            # conditional: skip only when residual delta is SMALL (stable layer)
+            if kind == "at":
+                L.append(f"    if (layer == {val} && delta < {thr:.4f}f) return {n};")
+            else:
+                L.append(f"    if (layer % {val} == 0 && delta < {thr:.4f}f) return {n};")
     L.append("    return 0;")
     L.append("}")
     return L

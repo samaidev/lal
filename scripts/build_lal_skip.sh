@@ -5,5 +5,5 @@
 set -e
 cd "$(dirname "$0")/.."
 python3 compiler/lal.py demos/mini_skip.lal _ build/mini_skip.c --skip-only
-gcc -O3 -fPIC -shared -I. -o prebuilt/mini_skip.so build/mini_skip.c
+gcc -O3 -fPIC -shared -I. -o prebuilt/mini_skip.so build/mini_skip.c -lm
 echo "[*] built prebuilt/mini_skip.so (logic-driven layer skip)"

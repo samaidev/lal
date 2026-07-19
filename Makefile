@@ -102,14 +102,20 @@ verify-steer: build/verify_steer
 build/verify_steer: tests/verify_steer.c compiler/lal.py
 	$(CC) $(CFLAGS) -I. -o $@ tests/verify_steer.c -lm
 
-verify-skip: build/verify_skip
+verify-skip: build/verify_skip build/verify_skip_cond build/verify_skip_uncond prebuilt/mini_skip.so prebuilt/mini_skip_cond.so
 	./build/verify_skip
 
 build/verify_skip: tests/verify_skip.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip.c -ldl
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip.c
+
+build/verify_skip_cond: tests/verify_skip_cond.c
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip_cond.c -ldl
+
+build/verify_skip_uncond: tests/verify_skip_uncond.c
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip_uncond.c -ldl
 
 # === End-to-end: real generation through the mini server (.lal .so hot-loaded) ===
-e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so
+e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so prebuilt/mini_skip_cond.so
 	bash scripts/e2e_test.sh
 
 clean:
@@ -154,3 +160,10 @@ mini-skip: prebuilt/mini_skip.so
 
 prebuilt/mini_skip.so: demos/mini_skip.lal compiler/lal.py
 	bash scripts/build_lal_skip.sh
+
+# Build the CONDITIONAL layer-skip .so (only skips when hidden-state confidence
+# exceeds the .lal `when` threshold — preserves quality on hard tokens).
+mini-skip-cond: prebuilt/mini_skip_cond.so
+
+prebuilt/mini_skip_cond.so: demos/mini_skip_cond.lal compiler/lal.py
+	bash scripts/build_lal_skip_cond.sh

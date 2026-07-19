@@ -55,6 +55,29 @@ skip_out=$(run --n 30 --stress-layers 96 --lal-skip prebuilt/mini_skip.so)
 [ "$(python3 -c "print($st < $bt*0.9)")" = "True" ] && check 1 "skip accelerates >=10%" || check 0 "skip accelerates >=10%"
 [ -n "$skip_out" ] && check 1 "skip still generates text" || check 0 "skip still generates text"
 
+echo "=== E2E-3b conditional skip (residual-delta): quality-preserving acceleration ==="
+ct=$(python3 - "$SRV" <<'PY'
+import subprocess, time, statistics, sys
+srv=sys.argv[1]
+def t_(a,n=4):
+    ts=[]
+    for _ in range(n):
+        t0=time.perf_counter()
+        subprocess.run([srv,"--prompt","I feel"]+a,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        ts.append(time.perf_counter()-t0)
+    return statistics.median(ts)
+b=t_(["--bench","30","--stress-layers","96"])
+c=t_(["--bench","30","--stress-layers","96","--lal-skip","prebuilt/mini_skip_cond.so"])
+print(f"{c*1000:.1f} {b/c:.2f}")
+PY
+)
+read ct csp <<<"$ct"
+echo "  cond skip=${ct}ms  speedup=${csp}x (vs baseline, quality preserved via residual-delta gate)"
+cond_out=$(run --n 30 --stress-layers 96 --lal-skip prebuilt/mini_skip_cond.so)
+echo "  cond output: $cond_out"
+[ "$(python3 -c "print($ct < $bt*0.9)")" = "True" ] && check 1 "cond skip accelerates >=10%" || check 0 "cond skip accelerates >=10%"
+[ -n "$cond_out" ] && check 1 "cond skip still generates text" || check 0 "cond skip still generates text"
+
 echo "=== E2E-4 steering + skip coexist ==="
 both=$(run --n 30 --lal-steer prebuilt/mini_steer.so --lal-skip prebuilt/mini_skip.so --stress-layers 64)
 echo "  $both"

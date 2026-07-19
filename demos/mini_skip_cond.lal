@@ -1,0 +1,17 @@
+# LAL level-1 acceleration demo: CONDITIONAL logic-driven layer skip.
+#
+# Unlike `mini_skip.lal` (which skips blindly every 2 layers and degrades the
+# toy model to "aiii.."), this only skips when the per-layer RESIDUAL DELTA is
+# small — i.e. when this layer barely changed the representation, the next layer
+# is safe to drop (the standard early-exit / skip criterion). On "hard" tokens
+# where each layer still moves the hidden state a lot, we keep all layers.
+#
+# `skip 1 every 2 layers when 0.08`  -> at every even layer, jump 1 layer ONLY
+# if delta = ||h - prev_h|| / ||h|| < 0.08. The .so keeps prev_h internally, so
+# the server contract is unchanged. Tune the threshold: higher = more skips
+# (more speed, less quality); lower = fewer skips (more quality, less speed).
+#
+# Compile:  bash scripts/build_lal_skip_cond.sh
+# Run:      ./prebuilt/mini_server --prompt "I feel" --n 20 \
+#             --stress-layers 64 --lal-skip prebuilt/mini_skip_cond.so
+skip 1 every 2 layers when 0.08
