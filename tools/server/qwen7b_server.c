@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 /* === Architecture constants === */
 #define N_EMBD       3584
@@ -145,6 +146,145 @@ static float g_temperature = 0.8f;
 static int g_top_k = 40;
 static float g_rep_penalty = 1.1f;
 static int g_recent[256], g_n_recent = 0;
+
+/* ========================================================================
+ * LAL three-layer fusion bridge for the 7B flagship (mirrors qwen_server.c).
+ *   level 1: lal_layer_hook  (per-layer read / activation steering)
+ *   level 1: lal_layer_skip  (logic-driven early-exit / layer skip = accel)
+ *   level 2: lal_filter_topk (logic-layer sampling constraint, no retraining)
+ * Each is (a) a weak no-op fallback, or (b) a strong symbol from a
+ * .lal-compiled .so hot-loaded via --lal-steer / --lal-skip / --lal-filter.
+ * ===================================================================== */
+static void decode_token(int id, char *out, int maxlen);  /* fwd decl */
+
+/* --- level 1: per-layer hook (steering) --- */
+typedef void (*lal_layer_hook_fn)(int layer, float *hidden, int dim);
+void lal_layer_hook(int layer, float *hidden, int dim) __attribute__((weak));
+void lal_layer_hook(int layer, float *hidden, int dim) { (void)layer;(void)hidden;(void)dim; }
+static lal_layer_hook_fn g_lal_layer_hook = NULL;
+
+/* --- level 1: logic-driven layer skip (acceleration) --- */
+typedef int (*lal_layer_skip_fn)(int layer, float *hidden, int dim);
+int lal_layer_skip(int layer, float *hidden, int dim) __attribute__((weak));
+int lal_layer_skip(int layer, float *hidden, int dim) { (void)layer;(void)hidden;(void)dim; return 0; }
+static lal_layer_skip_fn g_lal_layer_skip = NULL;
+typedef void (*lal_skip_set_params_fn)(int n_ovr, int every_ovr, float thr);
+static int g_skip_n_ovr = -1, g_skip_every_ovr = -1;
+static float g_skip_thr = -1.0f;
+
+/* --- level 2: logic-layer sampling filter --- */
+typedef int (*lal_token_decode_fn)(int token_id, char *out_buf, int max_len);
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn) __attribute__((weak));
+int lal_filter_topk(int *keep_mask, int n_vocab, int last_token,
+                    const int *recent_tokens, int n_recent,
+                    lal_token_decode_fn decode_fn) {
+    (void)keep_mask;(void)n_vocab;(void)last_token;
+    (void)recent_tokens;(void)n_recent;(void)decode_fn; return 0;
+}
+static int (*g_lal_filter)(int *, int, int, const int *, int, lal_token_decode_fn) = NULL;
+
+/* decode wrapper so a .lal filter can map token id -> text via our tokenizer */
+static int qwen7b_decode_for_filter(int token_id, char *out_buf, int max_len) {
+    decode_token(token_id, out_buf, max_len);
+    return (int)strlen(out_buf);
+}
+
+/* Load a .lal-compiled .so probing all three optional symbols. */
+static int lal_load_so(const char *path) {
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { fprintf(stderr, "[lal] dlopen %s: %s\n", path, dlerror()); return -1; }
+    int got = 0;
+    lal_layer_hook_fn f = (lal_layer_hook_fn)dlsym(h, "lal_layer_hook");
+    if (f) { g_lal_layer_hook = f; printf("[*] LAL layer hook (steering) loaded: %s\n", path); got=1; }
+    lal_layer_skip_fn sk = (lal_layer_skip_fn)dlsym(h, "lal_layer_skip");
+    if (sk) {
+        g_lal_layer_skip = sk; printf("[*] LAL layer-skip control loaded: %s\n", path); got=1;
+        lal_skip_set_params_fn setp = (lal_skip_set_params_fn)dlsym(h, "lal_skip_set_params");
+        if (setp && (g_skip_n_ovr>=0 || g_skip_every_ovr>=0 || g_skip_thr>=0.0f)) {
+            setp(g_skip_n_ovr, g_skip_every_ovr, g_skip_thr);
+            printf("[*]   skip override: n=%d every=%d thr=%.3f\n", g_skip_n_ovr, g_skip_every_ovr, g_skip_thr);
+        }
+    }
+    int (*flt)(int*,int,int,const int*,int,lal_token_decode_fn) =
+        (int(*)(int*,int,int,const int*,int,lal_token_decode_fn))dlsym(h, "lal_filter_topk");
+    if (flt) { g_lal_filter = flt; printf("[*] LAL logic-layer filter loaded: %s\n", path); got=1; }
+    if (!got) { fprintf(stderr, "[lal] %s defines no LAL symbol\n", path); dlclose(h); return -1; }
+    return 0;
+}
+
+/* Sampling with an optional level-2 logic filter on the top-k pool.
+ * When no filter is active this is identical to lal_sample_token. */
+static int lal_sample_token_filtered(float *logits, int vocab_size,
+                                     float temperature, int top_k, float rep_penalty,
+                                     const int *recent, int n_recent) {
+    /* Repetition penalty (same as lal_sample_token) */
+    if (rep_penalty > 1.0f && recent && n_recent > 0) {
+        for (int i = 0; i < n_recent; i++) {
+            int t = recent[i];
+            if (t >= 0 && t < vocab_size) {
+                if (logits[t] > 0) logits[t] /= rep_penalty; else logits[t] *= rep_penalty;
+            }
+        }
+    }
+    if (temperature <= 0.0f || top_k <= 0) {
+        int best = 0; for (int v = 1; v < vocab_size; v++) if (logits[v] > logits[best]) best = v;
+        return best;
+    }
+    /* top-k threshold via min-heap */
+    int k = top_k; if (k > vocab_size) k = vocab_size;
+    float threshold = -1e30f;
+    {
+        static float heap_val[256]; static int heap_idx[256]; int heap_n = 0;
+        for (int v = 0; v < vocab_size; v++) {
+            float val = logits[v];
+            if (heap_n < k) { int c = heap_n++; heap_val[c]=val; heap_idx[c]=v;
+                while (c>0){int p=(c-1)>>1; if(heap_val[p]<=heap_val[c])break;
+                    float tv=heap_val[p];heap_val[p]=heap_val[c];heap_val[c]=tv;
+                    int ti=heap_idx[p];heap_idx[p]=heap_idx[c];heap_idx[c]=ti;c=p;}
+            } else if (val>heap_val[0]) { heap_val[0]=val; heap_idx[0]=v; int p=0;
+                for(;;){int l=2*p+1,r=2*p+2,s=p;
+                    if(l<heap_n&&heap_val[l]<heap_val[s])s=l;
+                    if(r<heap_n&&heap_val[r]<heap_val[s])s=r;
+                    if(s==p)break;
+                    float tv=heap_val[p];heap_val[p]=heap_val[s];heap_val[s]=tv;
+                    int ti=heap_idx[p];heap_idx[p]=heap_idx[s];heap_idx[s]=ti;p=s;}
+            }
+        }
+        threshold = heap_val[0];
+    }
+    /* === level-2 logic filter over the top-k pool === */
+    static int keep_mask[VOCAB_SIZE];
+    for (int v = 0; v < vocab_size; v++) keep_mask[v] = (logits[v] >= threshold) ? 1 : 0;
+    {
+        int last = (n_recent > 0) ? recent[n_recent-1] : -1;
+        int dropped;
+        if (g_lal_filter)
+            dropped = g_lal_filter(keep_mask, vocab_size, last, recent, n_recent, qwen7b_decode_for_filter);
+        else
+            dropped = lal_filter_topk(keep_mask, vocab_size, last, recent, n_recent, qwen7b_decode_for_filter);
+        (void)dropped;
+        int any = 0; for (int v = 0; v < vocab_size; v++) if (keep_mask[v]) { any=1; break; }
+        if (!any) for (int v = 0; v < vocab_size; v++) if (logits[v] >= threshold) keep_mask[v] = 1;
+    }
+    /* softmax over kept ∩ top-k, then sample */
+    float max_l = -1e30f;
+    for (int v = 0; v < vocab_size; v++)
+        if (keep_mask[v] && logits[v] >= threshold && logits[v] > max_l) max_l = logits[v];
+    float sum = 0;
+    for (int v = 0; v < vocab_size; v++)
+        if (keep_mask[v] && logits[v] >= threshold) sum += expf((logits[v]-max_l)/temperature);
+    if (sum <= 0) { int best=0; float bv=-1e30f;
+        for (int v=0;v<vocab_size;v++) if (keep_mask[v]&&logits[v]>bv){bv=logits[v];best=v;} return best; }
+    float r = (float)rand()/(float)RAND_MAX*sum, acc = 0;
+    for (int v = 0; v < vocab_size; v++)
+        if (keep_mask[v] && logits[v] >= threshold) {
+            acc += expf((logits[v]-max_l)/temperature);
+            if (r <= acc) return v;
+        }
+    return vocab_size - 1;
+}
 
 /* === Thread pool for parallel matmul (OpenMP) ===
  * Splits each matmul's output dimension across g_n_threads threads.
@@ -612,6 +752,17 @@ static int forward(int tok, int pos) {
 
     for (int l = 0; l < N_LAYER; l++) {
         Layer *L = &g_layers[l];
+
+        /* === LAL level-1 ACCELERATION: logic-driven layer skip (early-exit) ===
+         * Ask the .lal skip logic (if any) whether the residual stream is stable
+         * enough to jump ahead. On a 28-layer model this saves real compute. */
+        int _skip = g_lal_layer_skip ? g_lal_layer_skip(l, g_x, N_EMBD)
+                                     : lal_layer_skip(l, g_x, N_EMBD);
+        if (_skip > 0) {
+            if (l + 1 + _skip > N_LAYER) _skip = N_LAYER - 1 - l;
+            if (_skip > 0) { l += _skip; continue; }
+        }
+
         /* Pre-attn RMSNorm */
         qwen7b_rms_norm(g_ln, g_x, L->norm1_w, N_EMBD);
         /* Q/K/V projections (Q8 or Q4 or Q8_0 from GPQ8 file)
@@ -651,6 +802,10 @@ static int forward(int tok, int pos) {
                      L->q4k_gate, L->q4k_up, L->q4k_down, L->qtype,
                      g_ln, g_mlp_out, N_EMBD, MLP_DIM, N_EMBD);
         lal_residual_add_simd(g_x, g_mlp_out, N_EMBD);
+
+        /* === LAL level-1: per-layer hook (read / activation steering) === */
+        if (g_lal_layer_hook) g_lal_layer_hook(l, g_x, N_EMBD);
+        else lal_layer_hook(l, g_x, N_EMBD);
     }
 
     /* Final RMSNorm */
@@ -681,8 +836,8 @@ static int forward(int tok, int pos) {
                                        v_start, v_end, N_EMBD);
     }
 
-    /* Sample */
-    int next = lal_sample_token(g_logits, VOCAB_SIZE, g_temperature, g_top_k, g_rep_penalty, g_recent, g_n_recent);
+    /* Sample (with optional LAL level-2 logic-layer filter on the top-k pool) */
+    int next = lal_sample_token_filtered(g_logits, VOCAB_SIZE, g_temperature, g_top_k, g_rep_penalty, g_recent, g_n_recent);
     if (g_n_recent < 256) g_recent[g_n_recent++] = next;
     else { memmove(g_recent, g_recent+1, 255*sizeof(int)); g_recent[255] = next; }
     return next;
@@ -715,6 +870,13 @@ static int tok_find(const char *key) {
         h = (h + 1) & (TOK_HASH_SIZE - 1);
     }
     return -1;
+}
+
+/* Decode a token id to its text (for the LAL level-2 filter's decode_fn).
+ * Wraps the BPE byte-decoder over the vocab strings. */
+static void decode_token(int id, char *out, int maxlen) {
+    if (id < 0 || id >= g_vocab_str_n || !g_vocab_str[id]) { out[0] = 0; return; }
+    lal_decode_bpe_token(g_vocab_str[id], out, maxlen);
 }
 
 static void load_tokenizer(const char *dir) {
@@ -834,6 +996,7 @@ int main(int argc, char **argv) {
     const char *tokdir = "prebuilt/qwen7b_tokenizer";
     const char *prompt = "The meaning of life is";
     int n_gen = 30;
+    const char *lal_paths[8]; int n_lal = 0;  /* deferred: load after tokenizer */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i],"--weights") && i+1<argc) weights=argv[++i];
         else if (!strcmp(argv[i],"--tokenizer") && i+1<argc) tokdir=argv[++i];
@@ -843,6 +1006,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--temp") && i+1<argc) g_temperature=atof(argv[++i]);
         else if (!strcmp(argv[i],"--top-k") && i+1<argc) g_top_k=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rep-penalty") && i+1<argc) g_rep_penalty=atof(argv[++i]);
+        /* LAL three-layer fusion: steering / skip / filter .so (hot-loaded) */
+        else if ((!strcmp(argv[i],"--lal-steer")||!strcmp(argv[i],"--lal-skip")||
+                  !strcmp(argv[i],"--lal-filter")) && i+1<argc) {
+            if (n_lal < 8) lal_paths[n_lal++] = argv[++i]; else i++;
+        }
+        else if (!strcmp(argv[i],"--lal-skip-n") && i+1<argc) g_skip_n_ovr=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--lal-skip-every") && i+1<argc) g_skip_every_ovr=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--lal-skip-thr") && i+1<argc) g_skip_thr=(float)atof(argv[++i]);
     }
 
     printf("=== Qwen2.5-7B-Instruct (LAL, Q8, GQA, GPQ8) ===\n");
@@ -963,6 +1134,13 @@ int main(int argc, char **argv) {
 
     /* Tokenizer */
     load_tokenizer(tokdir);
+
+    /* LAL three-layer fusion: load hot .so(s) AFTER the tokenizer so a filter's
+     * decode_fn (level-2 ban_relation) can resolve token text. Each .so may
+     * carry any of lal_layer_hook / lal_layer_skip / lal_filter_topk. */
+    for (int i = 0; i < n_lal; i++)
+        if (lal_load_so(lal_paths[i]) != 0)
+            fprintf(stderr, "[lal] warning: failed to load %s\n", lal_paths[i]);
 
     /* Generate */
     printf("\n[*] prompt: \"%s\" (temp=%.2f top_k=%d rep_penalty=%.2f)\n",

@@ -30,7 +30,7 @@ endif
 CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall -ldl
 LALC ?= $(PYTHON) compiler/lal.py
 
-.PHONY: all train server qwen-server float-subset demos verify clean
+.PHONY: all train server qwen-server qwen7b-server float-subset demos verify verify-qwen7b-lal mini-filter clean
 
 all: demos train
 
@@ -94,7 +94,7 @@ prebuilt/demos/demo: demos/basic/demo.lal compiler/lal.py
 	$(CC) $(CFLAGS) -o $@ prebuilt/demos/demo.c -lm
 
 # === Verify ===
-verify: verify-steer verify-skip
+verify: verify-steer verify-skip verify-qwen7b-lal
 
 verify-steer: build/verify_steer
 	./build/verify_steer
@@ -113,6 +113,15 @@ build/verify_skip_cond: tests/verify_skip_cond.c
 
 build/verify_skip_uncond: tests/verify_skip_uncond.c
 	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip_uncond.c -ldl
+
+# Contract test for the 7B flagship's LAL three-layer fusion bridge (no 7.5GB
+# weights needed — exercises the same generic .so through the server's contracts).
+verify-qwen7b-lal: build/verify_qwen7b_lal prebuilt/mini_antirepeat.so prebuilt/mini_skip.so
+	./build/verify_qwen7b_lal
+
+build/verify_qwen7b_lal: tests/verify_qwen7b_lal.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_qwen7b_lal.c -ldl
 
 # === End-to-end: real generation through the mini server (.lal .so hot-loaded) ===
 e2e: prebuilt/mini_server prebuilt/mini_steer.so prebuilt/mini_steer_neg.so prebuilt/mini_skip.so prebuilt/mini_skip_cond.so prebuilt/mini_antirepeat.so
