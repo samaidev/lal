@@ -383,18 +383,33 @@ void lal_layer_hook(int layer, float *hidden, int dim) {
 
 /* Runtime-loaded (dlopen) override; NULL when no --lal-steer was given. */
 static lal_layer_hook_fn g_lal_layer_hook = NULL;
+
+/* LAL level-1 ACCELERATION: logic-driven layer skip (early-exit). Optional strong
+ * symbol; if it returns s>0 the engine jumps s layers ahead, cutting forward
+ * compute. Weak fallback (no .so linked) returns 0. */
+typedef int (*lal_layer_skip_fn)(int layer, float *hidden, int dim);
+int lal_layer_skip(int layer, float *hidden, int dim) __attribute__((weak));
+int lal_layer_skip(int layer, float *hidden, int dim) {
+    (void)layer; (void)hidden; (void)dim; return 0;
+}
+static lal_layer_skip_fn g_lal_layer_skip = NULL;
+
 static void *g_lal_hook_handle = NULL;
 
-/* Load a .lal-compiled per-layer hook shared object at runtime. */
+/* Load a .lal-compiled per-layer shared object at runtime. Probes BOTH optional
+ * symbols (lal_layer_hook for steering, lal_layer_skip for acceleration); the
+ * .so may define either or both. A --lal-steer / --lal-skip flag loads the same
+ * way. */
 static int lal_hook_load(const char *path) {
     if (!path) return -1;
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "[lal] dlopen %s failed: %s\n", path, dlerror()); return -1; }
     lal_layer_hook_fn f = (lal_layer_hook_fn)dlsym(h, "lal_layer_hook");
-    if (!f) { fprintf(stderr, "[lal] dlsym lal_layer_hook failed: %s\n", dlerror()); dlclose(h); return -1; }
+    lal_layer_skip_fn sk = (lal_layer_skip_fn)dlsym(h, "lal_layer_skip");
+    if (!f && !sk) { fprintf(stderr, "[lal] dlsym: %s defines neither lal_layer_hook nor lal_layer_skip\n", path); dlclose(h); return -1; }
+    if (f)  { g_lal_layer_hook = f;  printf("[*] LAL layer hook (steering) loaded: %s\n", path); }
+    if (sk) { g_lal_layer_skip = sk; printf("[*] LAL layer-skip control loaded: %s\n", path); }
     g_lal_hook_handle = h;
-    g_lal_layer_hook = f;
-    printf("[*] LAL layer hook loaded: %s\n", path);
     return 0;
 }
 
@@ -1087,7 +1102,8 @@ static int forward(int tok, int pos) {
 #endif
     }
 
-    for (int l = 0; l < N_LAYER; l++) {
+    int l = 0;
+    while (l < N_LAYER) {
         QwenLayer *L = &g_layers[l];
 
         /* Pre-attn RMSNorm */
@@ -1114,6 +1130,12 @@ static int forward(int tok, int pos) {
         /* === LAL fusion level 1: per-layer hook (read hidden state / steering write) === */
         if (g_lal_layer_hook) g_lal_layer_hook(l, g_x, N_EMBD);
         else lal_layer_hook(l, g_x, N_EMBD);
+
+        /* === LAL level-1 ACCELERATION: logic-driven layer skip (early-exit) === */
+        int s = g_lal_layer_skip ? g_lal_layer_skip(l, g_x, N_EMBD) : 0;
+        if (s < 0) s = 0;
+        if (l + 1 + s > N_LAYER) s = N_LAYER - 1 - l;   /* clamp so we don't skip past the end */
+        l += 1 + s;
     }
 
     /* Final RMSNorm */

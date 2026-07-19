@@ -94,8 +94,19 @@ prebuilt/demos/demo: demos/basic/demo.lal compiler/lal.py
 	$(CC) $(CFLAGS) -o $@ prebuilt/demos/demo.c -lm
 
 # === Verify ===
-verify:
-	$(PYTHON) tools/verify.py
+verify: verify-steer verify-skip
+
+verify-steer: build/verify_steer
+	./build/verify_steer
+
+build/verify_steer: tests/verify_steer.c compiler/lal.py
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_steer.c -lm
+
+verify-skip: build/verify_skip
+	./build/verify_skip
+
+build/verify_skip: tests/verify_skip.c
+	$(CC) $(CFLAGS) -I. -o $@ tests/verify_skip.c -ldl
 
 clean:
 	rm -rf build/ prebuilt/demos/*.c prebuilt/gpt2_server prebuilt/qwen_server
@@ -133,3 +144,9 @@ mini-steer: prebuilt/mini_steer.so
 
 prebuilt/mini_steer.so: demos/mini_steer.lal compiler/lal.py
 	bash scripts/build_lal_mini_steer.sh
+
+# Build the logic-driven layer-skip .so (level-1 acceleration: early-exit / skip).
+mini-skip: prebuilt/mini_skip.so
+
+prebuilt/mini_skip.so: demos/mini_skip.lal compiler/lal.py
+	bash scripts/build_lal_skip.sh

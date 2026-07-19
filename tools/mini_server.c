@@ -28,6 +28,9 @@
 /* ---- config (must match tools/mini_train.py) ---- */
 static int G_D = 64, G_L = 4, G_H = 4, G_T = 32, G_V = 0;
 static int G_STEER_LAYER = 2;
+static int G_STRESS = 0;   /* if >0, run this many transformer layers (reusing
+                              real weights cyclically) to make layer-skip
+                              acceleration measurable on the tiny local model. */
 static char *G_CHARS = NULL;          /* V entries */
 static int  *G_CHAR2I = NULL;         /* 256 -> idx */
 
@@ -50,15 +53,29 @@ void lal_layer_hook(int layer, float *hidden, int dim) {
     (void)layer; (void)hidden; (void)dim;
 }
 static lal_layer_hook_fn g_hook = NULL;
+
+/* ---- LAL level-1 ACCELERATION: logic-driven layer skip (early-exit) ---- */
+/* Optional strong symbol; server calls it once per layer; returning s>0 makes it
+ * jump s layers ahead, cutting transformer forward compute. Weak fallback returns 0. */
+typedef int (*lal_layer_skip_fn)(int layer, float *hidden, int dim);
+int lal_layer_skip(int layer, float *hidden, int dim) __attribute__((weak));
+int lal_layer_skip(int layer, float *hidden, int dim) {
+    (void)layer; (void)hidden; (void)dim; return 0;
+}
+static lal_layer_skip_fn g_skip = NULL;
 static void *g_hook_handle = NULL;
 
-static int hook_load(const char *path) {
+/* Load a .lal-compiled .so (steering and/or layer-skip). Probes BOTH optional
+ * symbols; the .so may define either or both. */
+static int lal_load(const char *path) {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "[lal] dlopen %s: %s\n", path, dlerror()); return -1; }
     lal_layer_hook_fn f = (lal_layer_hook_fn)dlsym(h, "lal_layer_hook");
-    if (!f) { fprintf(stderr, "[lal] dlsym lal_layer_hook: %s\n", dlerror()); dlclose(h); return -1; }
-    g_hook_handle = h; g_hook = f;
-    printf("[*] LAL layer hook loaded: %s\n", path);
+    if (f) { g_hook = f; printf("[*] LAL layer hook (steering) loaded: %s\n", path); }
+    lal_layer_skip_fn sk = (lal_layer_skip_fn)dlsym(h, "lal_layer_skip");
+    if (sk) { g_skip = sk; printf("[*] LAL layer-skip control loaded: %s\n", path); }
+    if (!f && !sk) { fprintf(stderr, "[lal] %s defines neither lal_layer_hook nor lal_layer_skip\n", path); dlclose(h); return -1; }
+    g_hook_handle = h;
     return 0;
 }
 
@@ -86,6 +103,8 @@ static void matmul(const float *x, const float *W, float *out, int n, int m) {
 /* ---- generation ---- */
 static char *g_prompt = "I feel";
 static int   g_n = 16;
+static int   g_bench = 0;   /* if >0: run exactly this many forward passes, no
+                               output / no early-stop, so timing is deterministic. */
 
 static void generate(void) {
     int cap = G_T + g_n + 8;
@@ -125,9 +144,12 @@ static void generate(void) {
                 x[t*G_D + i] = tok_emb[tok*G_D + i] + pos_emb[t*G_D + i];
         }
 
-        for (int l = 0; l < G_L; l++) {
+        int eff_L = G_STRESS > 0 ? G_STRESS : G_L;
+        int l = 0;
+        while (l < eff_L) {
+            int lw = l % G_L;   /* real weight index (cyclic reuse under --stress-layers) */
             char kb[80];
-            #define LK(name) (snprintf(kb, sizeof(kb), "h.%d." name, l), T2(kb))
+            #define LK(name) (snprintf(kb, sizeof(kb), "h.%d." name, lw), T2(kb))
             const float *ln1_w = LK("ln1_w"), *ln1_b = LK("ln1_b");
             const float *attn_q = LK("attn_q"), *attn_k = LK("attn_k"), *attn_v = LK("attn_v"), *attn_o = LK("attn_o");
             const float *ln2_w = LK("ln2_w"), *ln2_b = LK("ln2_b");
@@ -185,6 +207,12 @@ static void generate(void) {
             /* === LAL level-1: per-layer hook (read / steering write) === */
             if (g_hook) g_hook(l, x + (ctx-1)*G_D, G_D);
             else lal_layer_hook(l, x + (ctx-1)*G_D, G_D);
+
+            /* === LAL level-1 ACCELERATION: logic-driven layer skip === */
+            int s = g_skip ? g_skip(l, x + (ctx-1)*G_D, G_D) : 0;
+            if (s < 0) s = 0;
+            if (l + 1 + s > eff_L) s = eff_L - 1 - l;   /* clamp so we don't skip past the end */
+            l += 1 + s;
         }
 
         /* final LN + tied lm head on last position */
@@ -199,9 +227,9 @@ static void generate(void) {
         int best = 0; float bv = lm[0];
         for (int vv = 1; vv < G_V; vv++) if (lm[vv] > bv) { bv = lm[vv]; best = vv; }
         char c = G_CHARS[best];
-        putchar(c); fflush(stdout);
+        if (!g_bench) { putchar(c); fflush(stdout); }
         ids[len++] = best;
-        if (c == '.') break;
+        if (c == '.' && !g_bench) break;
     }
     printf("\n");
 
@@ -273,7 +301,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--prompt") && i+1<argc) g_prompt = argv[++i];
         else if (!strcmp(argv[i], "--n") && i+1<argc) g_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lal-steer") && i+1<argc) {
-            if (hook_load(argv[++i]) != 0) fprintf(stderr, "[lal] warning: hook load failed\n");
+            if (lal_load(argv[++i]) != 0) fprintf(stderr, "[lal] warning: hook load failed\n");
+        }
+        else if (!strcmp(argv[i], "--lal-skip") && i+1<argc) {
+            if (lal_load(argv[++i]) != 0) fprintf(stderr, "[lal] warning: skip .so load failed\n");
+        }
+        else if (!strcmp(argv[i], "--stress-layers") && i+1<argc) {
+            G_STRESS = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--bench") && i+1<argc) {
+            g_bench = atoi(argv[++i]); g_n = g_bench;
         }
     }
     load_cfg(cfg);

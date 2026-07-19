@@ -641,6 +641,9 @@ def parse(source: str, source_path: Optional[str] = None):
     memories: List[Memory] = []
     relates: List[Relate] = []
     rules: List[Rule] = []
+    # v0.12: level-1 acceleration — logic-driven layer skip / early-exit.
+    # Each entry is (nskip, ("at", layer)) or (nskip, ("every", period)).
+    skip_directives: List[Tuple[int, Tuple[str, int]]] = []
 
     lines = source.split("\n")
     i = 0
@@ -898,6 +901,23 @@ def parse(source: str, source_path: Optional[str] = None):
             rules.append(Rule(name, [], body, outputs, None, kind="filter"))
             continue
 
+        # skip N at layer L          — skip the next N layers right after layer L
+        # skip N every P layers      — skip N layers at every layer index % P == 0
+        # Compiles to an OPTIONAL strong `lal_layer_skip()` symbol (level-1 fusion
+        # acceleration). The server calls it once per layer; if it returns s>0 the
+        # engine jumps s layers ahead — a logic-driven early-exit / layer-skip that
+        # cuts transformer forward compute without retraining.
+        m = re.match(r"skip\s+(\d+)\s+at\s+layer\s+(\d+)\s*$", line)
+        if m:
+            skip_directives.append((int(m.group(1)), ("at", int(m.group(2)))))
+            i += 1
+            continue
+        m = re.match(r"skip\s+(\d+)\s+every\s+(\d+)\s+layers\s*$", line)
+        if m:
+            skip_directives.append((int(m.group(1)), ("every", int(m.group(2)))))
+            i += 1
+            continue
+
         # rule name(params):                    (no guard)
         # rule name(params) | guard_expr:       (with guard — v0.5)
         m = re.match(r"rule\s+(\w+)\s*\(([^)]*)\)\s*(?:\|\s*(.+?)\s*)?:\s*$", line)
@@ -970,7 +990,7 @@ def parse(source: str, source_path: Optional[str] = None):
         if rule.guard is not None:
             rule.guard = _rewrite_calls(rule.guard, relate_names, rule_names)
 
-    return concepts, bounds, memories, relates, rules
+    return concepts, bounds, memories, relates, rules, skip_directives
 
 
 def _rewrite_calls(expr, relate_names, rule_names):
@@ -1253,7 +1273,7 @@ _PARALLEL_MODE = False
 _BINARY_MODE = False
 # v0.11: train mode — compile forward + backward + update (no PyTorch needed)
 _TRAIN_MODE = False
-def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False, train=False, filter_only=False) -> str:
+def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recursion_depth=2, quantize=None, parallel=False, binarize=False, train=False, filter_only=False, skip_directives=None, skip_only=False) -> str:
     """Compile a rule (and any rules it calls) to specialized C.
 
     quantize: None for float32, or "int8"/"int4" for quantized concept data.
@@ -1290,7 +1310,7 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # In filter_only mode the entry rule is irrelevant (we emit only filter
     # rules), so skip the reachability walk — a filter-only .lal may declare
     # no normal rule at all, in which case rule_name wouldn't be in rule_map.
-    if filter_only:
+    if filter_only or skip_only:
         rules_to_emit = set()
     else:
         rules_to_emit = _collect_called_rules(rule_map[rule_name], rule_map, relate_map, max_recursion_depth)
@@ -1545,15 +1565,21 @@ def compile_to_c(concepts, bounds, memories, relates, rules, rule_name, max_recu
     # filter_only mode skips main() entirely: the output .o is linked into the
     # server (which has its own main), so we emit only lal_filter_topk + any
     # supporting concept/relate data it references.
-    if filter_only:
-        # Validate that at least one filter rule OR one per-layer hook was emitted.
+    # Emit optional level-1 acceleration symbol (logic-driven layer skip / early-exit).
+    if skip_directives:
+        lines.extend(_emit_skip_symbol(skip_directives))
+        lines.append("")
+
+    if filter_only or skip_only:
+        # Validate that at least one fusion symbol was actually emitted.
         has_filter = any(getattr(rule_map[rn], "kind", "rule") == "filter" for rn in rules_to_emit)
         has_layer_hook = any(c.is_runtime and c.runtime_layer >= 0 for c in concepts)
-        if not has_filter and not has_layer_hook:
-            raise ParseError("--filter-only: no filter rule and no per-layer "
-                             "runtime_context(layer>=0) found in the .lal source. "
-                             "Declare a `filter name:` block with ban_* actions, or a "
-                             "`concept x = runtime_context(layer=L, ...)` subscription.")
+        if skip_only and not skip_directives:
+            raise ParseError("--skip-only: no `skip` directive found in the .lal source. "
+                             "Declare e.g. `skip 1 every 2 layers` to compile a layer-skip .so.")
+        if not has_filter and not has_layer_hook and not skip_directives:
+            raise ParseError("--filter-only: no filter rule, no per-layer hook, and no "
+                             "skip directive found in the .lal source.")
         return "\n".join(lines) + "\n"
 
     if _TRAIN_MODE:
@@ -2250,6 +2276,32 @@ def _emit_filter_rule(variants):
             raise ParseError(f"filter rule '{rule.name}': unknown ban action '{action}' "
                              f"(expected ban_last / ban_repeat(n) / ban_token(id) / ban_relation(...))")
     L.append("    return dropped;")
+    L.append("}")
+    return L
+
+
+def _emit_skip_symbol(skip_directives):
+    """Emit an OPTIONAL strong `lal_layer_skip()` symbol (level-1 fusion accel).
+
+    The server calls this once per transformer layer. Returning s>0 tells the
+    engine to jump s layers ahead — a logic-driven early-exit / layer-skip that
+    cuts transformer forward compute without retraining. The strong symbol
+    overrides the server's weak lal_layer_skip fallback (no skip when unlinked).
+
+    skip_directives: list of (nskip, ("at", layer)) | (nskip, ("every", period)).
+    """
+    L: List[str] = []
+    L.append("/* === LAL three-layer fusion (level 1, acceleration): logic-driven layer skip === */")
+    L.append("/* Generated from .lal `skip` directives. Strong symbol overrides the")
+    L.append(" * server's weak lal_layer_skip fallback (no-op when no .lal skip linked). */")
+    L.append("int lal_layer_skip(int layer, float *hidden, int dim) {")
+    L.append("    (void)hidden; (void)dim;")
+    for n, (kind, val) in skip_directives:
+        if kind == "at":
+            L.append(f"    if (layer == {val}) return {n};")
+        else:  # "every"
+            L.append(f"    if (layer % {val} == 0) return {n};")
+    L.append("    return 0;")
     L.append("}")
     return L
 
@@ -3208,6 +3260,10 @@ def main():
                     help="emit ONLY the lal_filter_topk strong symbol (no main). "
                          "Used when linking a .lal filter into the server to avoid "
                          "a main() symbol conflict with gpt2_server.c.")
+    ap.add_argument("--skip-only", action="store_true",
+                    help="emit ONLY the lal_layer_skip strong symbol (no main). "
+                         "Compiles .lal `skip` directives into a layer-skip .so that "
+                         "lets the engine jump layers at inference time (acceleration).")
     args = ap.parse_args()
 
     with open(args.input) as f:
@@ -3217,11 +3273,12 @@ def main():
     global _BINARY_MODE
     _BINARY_MODE = args.binarize
 
-    concepts, bounds, memories, relates, rules = parse(source, args.input)
+    concepts, bounds, memories, relates, rules, skip_directives = parse(source, args.input)
     c_code = compile_to_c(concepts, bounds, memories, relates, rules, args.rule,
                           quantize=args.quantize, parallel=args.parallel,
                           binarize=args.binarize, train=args.train,
-                          filter_only=args.filter_only)
+                          filter_only=args.filter_only,
+                          skip_directives=skip_directives, skip_only=args.skip_only)
 
     if args.output:
         with open(args.output, "w") as f:

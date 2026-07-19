@@ -24,7 +24,7 @@ prebuilt/qwen7b_server
 prebuilt/mini_server
 prebuilt/demos/
 
-# LAL steering/filter compiled shared objects (regenerate via scripts/build_lal_*.sh)
+# LAL steering/filter/skip compiled shared objects (regenerate via scripts/build_lal_*.sh)
 prebuilt/*.so
 
 # Compiled test/bench binaries

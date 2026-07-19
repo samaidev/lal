@@ -1,0 +1,17 @@
+# LAL level-1 acceleration demo: logic-driven layer skip / early-exit.
+#
+# `skip 1 every 2 layers` tells the engine, at every even layer index, to jump
+# the next 1 layer. On a model with N transformer layers this drops ~50% of the
+# forward compute (the skipped layers are simply not executed) — inference
+# acceleration WITHOUT retraining or changing any weights.
+#
+# The server calls the compiled `lal_layer_skip(layer, hidden, dim)` once per
+# layer; returning s>0 makes it jump s layers ahead. This is an OPTIONAL strong
+# symbol: when no .so is loaded, the weak fallback returns 0 (no skip).
+#
+# Compile:  bash scripts/build_lal_skip.sh
+# Run:      ./prebuilt/mini_server --prompt "I feel" --n 20 \
+#             --stress-layers 64 --lal-skip prebuilt/mini_skip.so
+# (--stress-layers inflates the forward pass so the speedup is measurable on the
+#  tiny local model; a real engine measures it directly.)
+skip 1 every 2 layers
