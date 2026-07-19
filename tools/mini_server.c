@@ -124,6 +124,80 @@ static int   g_n = 16;
 static int   g_bench = 0;   /* if >0: run exactly this many forward passes, no
                                output / no early-stop, so timing is deterministic. */
 
+/* ---- KV-cache forward of a SINGLE token at sequence position `pos` ----
+ * Writes this token's K/V into the per-layer cache (Kc/Vc) at [layer][pos],
+ * reads the already-cached K/V of all earlier positions for attention, and
+ * leaves `x` holding this token's final-layer hidden state. This is the
+ * standard transformer KV-cache: each autoregressive step only computes ONE
+ * token's worth of matmuls instead of re-computing the whole context, so
+ * generation cost grows O(seq) instead of O(seq^2) in the number of layers.
+ * Mathematically identical to the full-context recompute (causal mask is
+ * implicit: we only ever read cache[0..pos]). */
+static void lal_forward_token(float *x, int pos, int eff_L,
+                              float *Kc, float *Vc, unsigned char *kcached) {
+    int D = G_D, hd = D / G_H;
+    /* per-token scratch (sized for max dim; toy D is tiny) */
+    static float h[4096], q[4096], att[4096], m[16384], out[4096], scores[4096];
+    int l = 0;
+    while (l < eff_L) {
+        int lw = l % G_L;   /* real weight index (cyclic reuse under --stress-layers) */
+        char kb[80];
+        #define LK(name) (snprintf(kb, sizeof(kb), "h.%d." name, lw), T2(kb))
+        const float *ln1_w = LK("ln1_w"), *ln1_b = LK("ln1_b");
+        const float *attn_q = LK("attn_q"), *attn_k = LK("attn_k"), *attn_v = LK("attn_v"), *attn_o = LK("attn_o");
+        const float *ln2_w = LK("ln2_w"), *ln2_b = LK("ln2_b");
+        const float *mlp_fc_w = LK("mlp_fc_w"), *mlp_fc_b = LK("mlp_fc_b");
+        const float *mlp_proj_w = LK("mlp_proj_w"), *mlp_proj_b = LK("mlp_proj_b");
+        #undef LK
+
+        layernorm(x, ln1_w, ln1_b, h, D);
+        matmul(h, attn_q, q, D, D);
+        const float *kbase = Kc + (size_t)l * G_T * D;
+        const float *vbase = Vc + (size_t)l * G_T * D;
+        float *kt = (float*)kbase + (size_t)pos * D;
+        float *vt = (float*)vbase + (size_t)pos * D;
+        matmul(h, attn_k, kt, D, D);
+        matmul(h, attn_v, vt, D, D);
+        kcached[l * G_T + pos] = 1;
+
+        /* attention: single query q over cached keys [0..pos] (causal by construction) */
+        for (int hh = 0; hh < G_H; hh++) {
+            for (int ki = 0; ki <= pos; ki++) {
+                float s = 0;
+                for (int d = 0; d < hd; d++)
+                    s += q[hh*hd + d] * kbase[ki*D + hh*hd + d];
+                s /= sqrtf((float)hd);
+                scores[ki] = s;
+            }
+            float mx = -1e30f; for (int ki = 0; ki <= pos; ki++) mx = fmaxf(mx, scores[ki]);
+            float sum = 0; for (int ki = 0; ki <= pos; ki++) { float e = expf(scores[ki]-mx); scores[ki]=e; sum+=e; }
+            for (int ki = 0; ki <= pos; ki++) scores[ki] /= sum;
+            for (int d = 0; d < hd; d++) {
+                float acc = 0;
+                for (int ki = 0; ki <= pos; ki++) acc += scores[ki] * vbase[ki*D + hh*hd + d];
+                att[hh*hd + d] = acc;
+            }
+        }
+        matmul(att, attn_o, out, D, D);
+        for (int i = 0; i < D; i++) x[i] += out[i];
+        layernorm(x, ln2_w, ln2_b, h, D);
+        matmul(h, mlp_fc_w, m, D, 4*G_D);
+        for (int i = 0; i < 4*G_D; i++) m[i] = gelu(m[i] + mlp_fc_b[i]);
+        matmul(m, mlp_proj_w, out, 4*G_D, D);
+        for (int i = 0; i < D; i++) x[i] += out[i] + mlp_proj_b[i];
+
+        /* === LAL level-1: per-layer hook (read / steering write) === */
+        if (g_hook) g_hook(l, x, D);
+        else lal_layer_hook(l, x, D);
+
+        /* === LAL level-1 ACCELERATION: logic-driven layer skip === */
+        int s = g_skip ? g_skip(l, x, D) : 0;
+        if (s < 0) s = 0;
+        if (l + 1 + s > eff_L) s = eff_L - 1 - l;   /* clamp so we don't skip past the end */
+        l += 1 + s;
+    }
+}
+
 static void generate(void) {
     int cap = G_T + g_n + 8;
     int *ids = malloc(sizeof(int) * cap);
@@ -134,125 +208,55 @@ static void generate(void) {
     }
     if (len == 0) { fprintf(stderr, "[!] prompt has no known chars\n"); free(ids); return; }
 
-    float *x = malloc(sizeof(float) * G_T * G_D);
-    float *h = malloc(sizeof(float) * G_T * G_D);
-    float *q = malloc(sizeof(float) * G_T * G_D);
-    float *k = malloc(sizeof(float) * G_T * G_D);
-    float *v = malloc(sizeof(float) * G_T * G_D);
-    float *att = malloc(sizeof(float) * G_T * G_D);
-    float *scores = malloc(sizeof(float) * G_T * G_T);
-    float *m = malloc(sizeof(float) * G_T * (4*G_D));
+    int eff_L = G_STRESS > 0 ? G_STRESS : G_L;
+    float *Kc = malloc(sizeof(float) * (size_t)eff_L * G_T * G_D);
+    float *Vc = malloc(sizeof(float) * (size_t)eff_L * G_T * G_D);
+    unsigned char *kcached = calloc((size_t)eff_L * G_T, 1);
+    float *x = malloc(sizeof(float) * G_D);
+    float *ln = malloc(sizeof(float) * G_D);
     float *lm = malloc(sizeof(float) * G_V);
     const float *tok_emb = T2("tok_emb");
     const float *pos_emb = T2("pos_emb");
     const float *ln_f_w = T2("ln_f_w");
     const float *ln_f_b = T2("ln_f_b");
-    int hd = G_D / G_H;
+
+    /* prefill: forward the prompt tokens one by one, filling the KV cache */
+    for (int p = 0; p < len; p++) {
+        int pos = p % G_T;
+        for (int i = 0; i < G_D; i++)
+            x[i] = tok_emb[ids[p]*G_D + i] + pos_emb[pos*G_D + i];
+        lal_forward_token(x, pos, eff_L, Kc, Vc, kcached);
+    }
 
     printf(">> ");
     fflush(stdout);
 
-    for (int step = 0; step < g_n; step++) {
-        int ctx = len < G_T ? len : G_T;
-        int start = len - ctx;
-        /* embed */
-        for (int t = 0; t < ctx; t++) {
-            int tok = ids[start + t];
-            for (int i = 0; i < G_D; i++)
-                x[t*G_D + i] = tok_emb[tok*G_D + i] + pos_emb[t*G_D + i];
-        }
-
-        int eff_L = G_STRESS > 0 ? G_STRESS : G_L;
-        int l = 0;
-        while (l < eff_L) {
-            int lw = l % G_L;   /* real weight index (cyclic reuse under --stress-layers) */
-            char kb[80];
-            #define LK(name) (snprintf(kb, sizeof(kb), "h.%d." name, lw), T2(kb))
-            const float *ln1_w = LK("ln1_w"), *ln1_b = LK("ln1_b");
-            const float *attn_q = LK("attn_q"), *attn_k = LK("attn_k"), *attn_v = LK("attn_v"), *attn_o = LK("attn_o");
-            const float *ln2_w = LK("ln2_w"), *ln2_b = LK("ln2_b");
-            const float *mlp_fc_w = LK("mlp_fc_w"), *mlp_fc_b = LK("mlp_fc_b");
-            const float *mlp_proj_w = LK("mlp_proj_w"), *mlp_proj_b = LK("mlp_proj_b");
-            #undef LK
-
-            /* LN1 */
-            for (int t = 0; t < ctx; t++) layernorm(x + t*G_D, ln1_w, ln1_b, h + t*G_D, G_D);
-            /* Q,K,V */
-            for (int t = 0; t < ctx; t++) {
-                matmul(h + t*G_D, attn_q, q + t*G_D, G_D, G_D);
-                matmul(h + t*G_D, attn_k, k + t*G_D, G_D, G_D);
-                matmul(h + t*G_D, attn_v, v + t*G_D, G_D, G_D);
-            }
-            /* attention per head */
-            for (int hh = 0; hh < G_H; hh++) {
-                for (int qi = 0; qi < ctx; qi++) {
-                    for (int ki = 0; ki < ctx; ki++) {
-                        float s = 0;
-                        for (int d = 0; d < hd; d++)
-                            s += q[qi*G_D + hh*hd + d] * k[ki*G_D + hh*hd + d];
-                        s /= sqrtf((float)hd);
-                        if (ki > qi) s = -1e30f;   /* causal mask */
-                        scores[qi*G_T + ki] = s;
-                    }
-                    /* softmax over ki */
-                    float mx = -1e30f; for (int ki = 0; ki < ctx; ki++) mx = fmaxf(mx, scores[qi*G_T+ki]);
-                    float sum = 0; for (int ki = 0; ki < ctx; ki++) { float e = expf(scores[qi*G_T+ki]-mx); scores[qi*G_T+ki]=e; sum+=e; }
-                    for (int ki = 0; ki < ctx; ki++) scores[qi*G_T+ki] /= sum;
-                    /* weighted sum of v */
-                    for (int d = 0; d < hd; d++) {
-                        float acc = 0;
-                        for (int ki = 0; ki < ctx; ki++) acc += scores[qi*G_T+ki] * v[ki*G_D + hh*hd + d];
-                        att[qi*G_D + hh*hd + d] = acc;
-                    }
-                }
-            }
-            /* attn_o + residual */
-            for (int t = 0; t < ctx; t++) {
-                float out[G_D];
-                matmul(att + t*G_D, attn_o, out, G_D, G_D);
-                for (int i = 0; i < G_D; i++) x[t*G_D + i] += out[i];
-            }
-            /* LN2 + MLP(gelu) */
-            for (int t = 0; t < ctx; t++) layernorm(x + t*G_D, ln2_w, ln2_b, h + t*G_D, G_D);
-            for (int t = 0; t < ctx; t++) {
-                matmul(h + t*G_D, mlp_fc_w, m + t*(4*G_D), G_D, 4*G_D);
-                for (int i = 0; i < 4*G_D; i++) m[t*(4*G_D)+i] = gelu(m[t*(4*G_D)+i] + mlp_fc_b[i]);
-                float out[G_D];
-                matmul(m + t*(4*G_D), mlp_proj_w, out, 4*G_D, G_D);
-                for (int i = 0; i < G_D; i++) x[t*G_D + i] += out[i] + mlp_proj_b[i];
-            }
-
-            /* === LAL level-1: per-layer hook (read / steering write) === */
-            if (g_hook) g_hook(l, x + (ctx-1)*G_D, G_D);
-            else lal_layer_hook(l, x + (ctx-1)*G_D, G_D);
-
-            /* === LAL level-1 ACCELERATION: logic-driven layer skip === */
-            int s = g_skip ? g_skip(l, x + (ctx-1)*G_D, G_D) : 0;
-            if (s < 0) s = 0;
-            if (l + 1 + s > eff_L) s = eff_L - 1 - l;   /* clamp so we don't skip past the end */
-            l += 1 + s;
-        }
-
-        /* final LN + tied lm head on last position */
-        float ln[G_D];
-        layernorm(x + (ctx-1)*G_D, ln_f_w, ln_f_b, ln, G_D);
+    int generated = 0;
+    while (generated < g_n) {
+        /* final LN + tied lm head on the current last token's hidden state */
+        layernorm(x, ln_f_w, ln_f_b, ln, G_D);
         for (int vv = 0; vv < G_V; vv++) {
             float s = 0; const float *e = tok_emb + (size_t)vv * G_D;
             for (int i = 0; i < G_D; i++) s += ln[i] * e[i];
             lm[vv] = s;
         }
-        /* greedy argmax */
         int best = 0; float bv = lm[0];
         for (int vv = 1; vv < G_V; vv++) if (lm[vv] > bv) { bv = lm[vv]; best = vv; }
         char c = G_CHARS[best];
         if (!g_bench) { putchar(c); fflush(stdout); }
+        generated++;
         ids[len++] = best;
         if (c == '.' && !g_bench) break;
+        if (generated >= g_n) break;
+        /* forward the just-emitted token to get the hidden state for the next step */
+        int pos = (len - 1) % G_T;
+        for (int i = 0; i < G_D; i++)
+            x[i] = tok_emb[best*G_D + i] + pos_emb[pos*G_D + i];
+        lal_forward_token(x, pos, eff_L, Kc, Vc, kcached);
     }
     printf("\n");
 
-    free(ids); free(x); free(h); free(q); free(k); free(v); free(att);
-    free(scores); free(m); free(lm);
+    free(ids); free(Kc); free(Vc); free(kcached); free(x); free(ln); free(lm);
 }
 
 /* ---- load MINI weights ---- */
